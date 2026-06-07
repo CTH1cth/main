@@ -2,8 +2,8 @@ EXP_NAME = "dinov1_s8_clean"
 BACKBONE_KEY = "dinov1-s8"
 
 DATA_ROOT = "/home/dell01/CTH/MY-baseline/datasets/COD"
-CACHE_ROOT = "/home/dell01/CTH/MY-baseline/datasets/cache"
-WORK_ROOT = "/home/dell01/CTH/MY-baseline/workdir"
+CACHE_ROOT = "../datasets/cache"
+WORK_ROOT = "../workdir"
 
 TRAIN_DATASETS = ["TR-CAMO", "TR-COD10K"]
 VAL_DATASETS = ["TE-CAMO"]
@@ -27,7 +27,7 @@ THRESHOLD = 0.5
 DINO_CONFIGS = {
     "dinov1-s8": {
         "model_name": "facebook/dino-vits8",
-        "model_path": "/home/dell01/CTH/workspace/weights/huggingface/facebook-dino-vits8",
+        "model_path": "../../workspace/weights/huggingface/facebook-dino-vits8",
         "patch_size": 8,
         "pseudo_input_size": 224,
         "feature_input_size": 296,
@@ -36,7 +36,7 @@ DINO_CONFIGS = {
     },
     "dinov1-b8": {
         "model_name": "facebook/dino-vitb8",
-        "model_path": "/home/dell01/CTH/workspace/weights/huggingface/facebook-dino-vitb8",
+        "model_path": "../../workspace/weights/huggingface/facebook-dino-vitb8",
         "patch_size": 8,
         "pseudo_input_size": 224,
         "feature_input_size": 296,
@@ -45,7 +45,7 @@ DINO_CONFIGS = {
     },
     "dinov2-b14": {
         "model_name": "facebook/dinov2-base",
-        "model_path": "/home/dell01/CTH/workspace/weights/huggingface/models--facebook--dinov2-base/snapshots/f9e44c814b77203eaa57a6bdbbd535f21ede1415",
+        "model_path": "../../workspace/weights/huggingface/facebook-dinov2-vitb14",
         "patch_size": 14,
         "pseudo_input_size": 224,
         "feature_input_size": 518,
