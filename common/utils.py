@@ -244,6 +244,22 @@ def pseudo_manifest_path(cfg):
     return Path(cfg.CACHE_ROOT) / "pseudo_label_cache" / cfg.BACKBONE_KEY / "manifest_train.jsonl"
 
 
+def qra_cache_dir(cfg):
+    return Path(cfg.QRA_CACHE_ROOT) / cfg.BACKBONE_KEY
+
+
+def qra_manifest_path(cfg):
+    return qra_cache_dir(cfg) / "manifest_train.jsonl"
+
+
+def ccr_cache_dir(cfg):
+    return Path(cfg.CCR_CACHE_ROOT) / cfg.BACKBONE_KEY
+
+
+def ccr_manifest_path(cfg):
+    return ccr_cache_dir(cfg) / "manifest_train.jsonl"
+
+
 def split_dataset_names(cfg, split):
     # 根据 split 选择配置里的数据集列表。
     if split == "train":
@@ -264,6 +280,167 @@ def _cache_shape_ok(kind, shape):
     if kind == "pseudo":
         return len(shape) == 3 and shape[0] == 1 and all(isinstance(x, int) and x > 0 for x in shape)
     raise ValueError(f"Unknown cache kind: {kind}")
+
+
+def _qra_required_shapes(cfg):
+    size = int(cfg.LOSS_SIZE)
+    return {
+        "p_fixed": [1, size, size],
+        "p_despl": [1, size, size],
+        "p_fused": [1, size, size],
+        "anchor_fg": [1, size, size],
+        "anchor_bg": [1, size, size],
+        "pixel_weight": [1, size, size],
+    }
+
+
+def _qra_error(reason):
+    return (
+        f"QRA cache missing or incomplete: {reason}\n"
+        "Please run:\n"
+        "python common/cache_qra_pseudo.py --config configs/dinov1_s8_qra.py --overwrite"
+    )
+
+
+def check_qra_cache(cfg, max_samples=None):
+    manifest_path = qra_manifest_path(cfg)
+    if not manifest_path.exists():
+        raise RuntimeError(_qra_error(f"missing manifest: {manifest_path}"))
+
+    expected_items = build_image_items(cfg.DATA_ROOT, cfg.TRAIN_DATASETS, require_gt=False)
+    if max_samples is not None and int(max_samples) >= 0:
+        expected_items = expected_items[: int(max_samples)]
+    expected_keys = [(item["dataset"], item["stem"]) for item in expected_items]
+    expected_key_set = set(expected_keys)
+
+    rows = read_jsonl(manifest_path)
+    row_map = {}
+    for row in rows:
+        if "dataset" not in row or "stem" not in row:
+            raise RuntimeError(_qra_error(f"bad manifest row without dataset/stem in {manifest_path}"))
+        key = (row["dataset"], row["stem"])
+        if key in row_map:
+            raise RuntimeError(_qra_error(f"duplicate manifest key in {manifest_path}: {key}"))
+        row_map[key] = row
+
+    actual_key_set = set(row_map)
+    if max_samples is None or int(max_samples) < 0:
+        extra = sorted(actual_key_set - expected_key_set)
+        if extra:
+            raise RuntimeError(_qra_error(f"manifest has unexpected keys first 10: {extra[:10]}"))
+    missing = sorted(expected_key_set - actual_key_set)
+    if missing:
+        raise RuntimeError(_qra_error(f"missing manifest rows first 10: {missing[:10]}"))
+
+    required_shapes = _qra_required_shapes(cfg)
+    for key in expected_keys:
+        row = row_map[key]
+        if row.get("backbone_key", cfg.BACKBONE_KEY) != cfg.BACKBONE_KEY:
+            raise RuntimeError(
+                _qra_error(
+                    f"backbone mismatch for {key}: {row.get('backbone_key')} != {cfg.BACKBONE_KEY}"
+                )
+            )
+        cache_path = row.get("cache_path")
+        if not cache_path:
+            raise RuntimeError(_qra_error(f"missing cache_path for {key}"))
+        if not Path(cache_path).exists():
+            raise RuntimeError(_qra_error(f"missing cache file: {cache_path}"))
+        shape = row.get("shape")
+        if not isinstance(shape, dict):
+            raise RuntimeError(_qra_error(f"missing or invalid shape dict for {key}"))
+        for name, expected_shape in required_shapes.items():
+            if shape.get(name) != expected_shape:
+                raise RuntimeError(
+                    _qra_error(
+                        f"invalid shape for {key} {name}: {shape.get(name)} != {expected_shape}"
+                    )
+                )
+
+    return True, f"complete: {manifest_path}"
+
+
+def _ccr_required_shapes(cfg):
+    size = int(getattr(cfg, "CCR_LOSS_SIZE", cfg.LOSS_SIZE))
+    return {
+        "p_fixed": [1, size, size],
+        "p_despl": [1, size, size],
+        "p_corr": [1, size, size],
+        "agree_fg": [1, size, size],
+        "agree_bg": [1, size, size],
+        "raw_expand": [1, size, size],
+        "raw_shrink": [1, size, size],
+        "trusted_expand": [1, size, size],
+        "trusted_shrink": [1, size, size],
+        "anchor_fg": [1, size, size],
+        "anchor_bg": [1, size, size],
+    }
+
+
+def _ccr_error(reason):
+    return (
+        f"CCR cache missing or incomplete: {reason}\n"
+        "Please run:\n"
+        "python common/cache_ccr_pseudo.py --config configs/dinov1_s8_ccr.py --overwrite"
+    )
+
+
+def check_ccr_cache(cfg, max_samples=None):
+    manifest_path = ccr_manifest_path(cfg)
+    if not manifest_path.exists():
+        raise RuntimeError(_ccr_error(f"missing manifest: {manifest_path}"))
+
+    expected_items = build_image_items(cfg.DATA_ROOT, cfg.TRAIN_DATASETS, require_gt=False)
+    if max_samples is not None and int(max_samples) >= 0:
+        expected_items = expected_items[: int(max_samples)]
+    expected_keys = [(item["dataset"], item["stem"]) for item in expected_items]
+    expected_key_set = set(expected_keys)
+
+    rows = read_jsonl(manifest_path)
+    row_map = {}
+    for row in rows:
+        if "dataset" not in row or "stem" not in row:
+            raise RuntimeError(_ccr_error(f"bad manifest row without dataset/stem in {manifest_path}"))
+        key = (row["dataset"], row["stem"])
+        if key in row_map:
+            raise RuntimeError(_ccr_error(f"duplicate manifest key in {manifest_path}: {key}"))
+        row_map[key] = row
+
+    actual_key_set = set(row_map)
+    if max_samples is None or int(max_samples) < 0:
+        extra = sorted(actual_key_set - expected_key_set)
+        if extra:
+            raise RuntimeError(_ccr_error(f"manifest has unexpected keys first 10: {extra[:10]}"))
+    missing = sorted(expected_key_set - actual_key_set)
+    if missing:
+        raise RuntimeError(_ccr_error(f"missing manifest rows first 10: {missing[:10]}"))
+
+    required_shapes = _ccr_required_shapes(cfg)
+    for key in expected_keys:
+        row = row_map[key]
+        if row.get("backbone_key", cfg.BACKBONE_KEY) != cfg.BACKBONE_KEY:
+            raise RuntimeError(
+                _ccr_error(
+                    f"backbone mismatch for {key}: {row.get('backbone_key')} != {cfg.BACKBONE_KEY}"
+                )
+            )
+        cache_path = row.get("cache_path")
+        if not cache_path:
+            raise RuntimeError(_ccr_error(f"missing cache_path for {key}"))
+        if not Path(cache_path).exists():
+            raise RuntimeError(_ccr_error(f"missing cache file: {cache_path}"))
+        shape = row.get("shape")
+        if not isinstance(shape, dict):
+            raise RuntimeError(_ccr_error(f"missing or invalid shape dict for {key}"))
+        for name, expected_shape in required_shapes.items():
+            if shape.get(name) != expected_shape:
+                raise RuntimeError(
+                    _ccr_error(
+                        f"invalid shape for {key} {name}: {shape.get(name)} != {expected_shape}"
+                    )
+                )
+
+    return True, f"complete: {manifest_path}"
 
 
 def cache_status(cfg, kind, split=None):

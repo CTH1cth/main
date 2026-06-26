@@ -19,12 +19,17 @@ from common.utils import (
     torch_load,
     write_yaml,
 )
-from model import SimpleConvSegHead
+from model import build_seg_head
 
 
 def infer_in_channels(student_state):
-    # 从 checkpoint 的 1x1 conv 权重反推 feature channel 数。
-    weight = student_state["proj.weight"]
+    # 从 checkpoint 的 head 权重反推 feature channel 数，兼容 simple/context_residual。
+    if "proj.weight" in student_state:
+        weight = student_state["proj.weight"]
+    elif "base.weight" in student_state:
+        weight = student_state["base.weight"]
+    else:
+        raise KeyError("Cannot infer in_channels from checkpoint student state.")
     return int(weight.shape[1])
 
 
@@ -86,7 +91,7 @@ def main():
             f"Checkpoint backbone mismatch: {checkpoint.get('backbone_key')} != {cfg.BACKBONE_KEY}"
         )
     student_state = checkpoint["student"]
-    student = SimpleConvSegHead(infer_in_channels(student_state)).to(device)
+    student = build_seg_head(infer_in_channels(student_state), cfg).to(device)
     student.load_state_dict(student_state)
 
     with Logger(out_dir / "eval.log") as logger:
