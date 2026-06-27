@@ -9,7 +9,10 @@ from common.dataset import CachedEvalDataset, CachedTrainDataset
 from common.metrics import CODMetrics
 from common.utils import (
     Logger,
+    cache_status,
     check_ccr_cache,
+    check_despl_light_cache,
+    check_despl_pseudo_bank,
     check_qra_cache,
     config_to_dict,
     current_lr,
@@ -150,6 +153,17 @@ def log_cache_summary(logger, cfg, train_dataset):
         logger.log(f"first CCR quality = {train_dataset.ccr_first_quality}")
         logger.log(f"first CCR IoU = {train_dataset.ccr_first_iou:.6f}")
         logger.log(f"first CCR anchor ratio = {train_dataset.ccr_first_anchor_ratio:.6f}")
+    if getattr(cfg, "USE_DESPL_PSEUDO", False):
+        logger.log(f"DESPL pseudo cache path = {train_dataset.despl_cache_root}")
+        logger.log(f"first DESPL pseudo file = {train_dataset.despl_first_cache_path}")
+        logger.log(f"use_despl_pseudo = true")
+        logger.log(f"use_despl_light_cache = {bool(getattr(cfg, 'USE_DESPL_LIGHT_CACHE', False))}")
+        logger.log(f"p_init_mode = {getattr(cfg, 'P_INIT_MODE', 'despl_fixed_blend')}")
+        logger.log(
+            "p_init_formula = "
+            f"{float(getattr(cfg, 'P_INIT_DESPL_WEIGHT', 0.8)):.3f}*p_despl + "
+            f"{float(getattr(cfg, 'P_INIT_FIXED_WEIGHT', 0.2)):.3f}*p_fixed"
+        )
     logger.log(f"loss size = {cfg.LOSS_SIZE}x{cfg.LOSS_SIZE}")
 
 
@@ -189,6 +203,21 @@ def log_first_batch_pseudo(logger, cfg, train_dataset):
         logger.log(
             "first batch CCR IoU = "
             + ",".join(f"{float(value):.4f}" for value in batch["ccr_iou_fixed_despl"])
+        )
+    if getattr(cfg, "USE_DESPL_PSEUDO", False):
+        logger.log(f"first batch pseudo_fixed tensor shape = {list(batch['pseudo_fixed'].shape)}")
+        logger.log(f"first batch pseudo_despl tensor shape = {list(batch['pseudo_despl'].shape)}")
+        logger.log(
+            "first batch p_init_area = "
+            + ",".join(f"{float(value):.6f}" for value in batch["p_init_area"])
+        )
+        logger.log(
+            "first batch p_fixed_area = "
+            + ",".join(f"{float(value):.6f}" for value in batch["p_fixed_area"])
+        )
+        logger.log(
+            "first batch p_despl_area = "
+            + ",".join(f"{float(value):.6f}" for value in batch["p_despl_area"])
         )
 
 
@@ -336,10 +365,16 @@ def main():
     cfg = load_config(args.config)
     if bool(getattr(cfg, "USE_QRA", False)) and bool(getattr(cfg, "USE_CCR", False)):
         raise RuntimeError("USE_QRA=True and USE_CCR=True cannot be combined.")
+    if bool(getattr(cfg, "USE_DESPL_PSEUDO", False)) and (
+        bool(getattr(cfg, "USE_QRA", False)) or bool(getattr(cfg, "USE_CCR", False))
+    ):
+        raise RuntimeError("USE_DESPL_PSEUDO=True cannot be combined with USE_QRA=True or USE_CCR=True.")
     if bool(getattr(cfg, "USE_QRA", False)) and args.pseudo_cache_override:
         raise RuntimeError("USE_QRA=True cannot be combined with --pseudo_cache_override.")
     if bool(getattr(cfg, "USE_CCR", False)) and args.pseudo_cache_override:
         raise RuntimeError("USE_CCR=True cannot be combined with --pseudo_cache_override.")
+    if bool(getattr(cfg, "USE_DESPL_PSEUDO", False)) and args.pseudo_cache_override:
+        raise RuntimeError("USE_DESPL_PSEUDO=True cannot be combined with --pseudo_cache_override.")
     cfg.PSEUDO_CACHE_OVERRIDE = args.pseudo_cache_override
     max_epoch = int(args.max_epochs) if args.max_epochs is not None else int(cfg.MAX_EPOCH)
     set_seed(int(cfg.SEED))
@@ -372,18 +407,46 @@ def main():
         logger.log("DINO_in_training_loop = false")
         logger.log("train_gt_in_train = false")
         logger.log(f"head_type = {getattr(cfg, 'HEAD_TYPE', 'simple')}")
+        logger.log(f"use_despl_pseudo = {bool(getattr(cfg, 'USE_DESPL_PSEUDO', False))}")
+        logger.log(f"use_despl_light_cache = {bool(getattr(cfg, 'USE_DESPL_LIGHT_CACHE', False))}")
+        logger.log(f"p_init_mode = {getattr(cfg, 'P_INIT_MODE', 'original_fixed')}")
 
-        # 训练前只补齐 cache；正式训练循环不加载 DINO，也不读训练集 GT。
-        ensure_cache_available(cfg, "feature", split="train", logger=logger.log)
-        if not args.debug_loader_only:
-            ensure_cache_available(cfg, "feature", split="val", logger=logger.log)
         use_qra = bool(getattr(cfg, "USE_QRA", False))
         use_ccr = bool(getattr(cfg, "USE_CCR", False))
+        use_despl = bool(getattr(cfg, "USE_DESPL_PSEUDO", False))
+        use_despl_light = use_despl and bool(getattr(cfg, "USE_DESPL_LIGHT_CACHE", False))
+
+        # 正式训练循环不加载 DINO，也不读训练集 GT。DESPL 实验只检查现有 cache，不自动生成。
+        if use_despl:
+            for split in ("train", "val"):
+                if split == "val" and args.debug_loader_only:
+                    continue
+                complete, reason = cache_status(cfg, "feature", split=split)
+                if not complete:
+                    raise RuntimeError(f"feature {split} cache missing or incomplete: {reason}")
+                logger.log(f"[Cache] feature:{split} ready | {reason}")
+        else:
+            ensure_cache_available(cfg, "feature", split="train", logger=logger.log)
+            if not args.debug_loader_only:
+                ensure_cache_available(cfg, "feature", split="val", logger=logger.log)
         if cfg.PSEUDO_CACHE_OVERRIDE:
             logger.log(
                 "[Cache] pseudo override enabled | "
                 "skip original pseudo cache generation/check"
             )
+        elif use_despl:
+            if use_despl_light:
+                _, despl_reason = check_despl_light_cache(
+                    cfg,
+                    max_samples=sample_limit if sample_limit >= 0 else None,
+                )
+                logger.log(f"[Cache] DESPL light cache ready | {despl_reason}")
+            else:
+                _, despl_reason = check_despl_pseudo_bank(
+                    cfg,
+                    max_samples=sample_limit if sample_limit >= 0 else None,
+                )
+                logger.log(f"[Cache] DESPL pseudo bank ready | {despl_reason}")
         else:
             ensure_cache_available(cfg, "pseudo", logger=logger.log)
         if use_qra:
@@ -465,6 +528,10 @@ def main():
             ccr_shrink_area_sum = 0.0
             ccr_anchor_ratio_sum = 0.0
             ccr_late_override_sum = 0.0
+            despl_num_samples = 0
+            despl_p_init_area_sum = 0.0
+            despl_p_fixed_area_sum = 0.0
+            despl_p_despl_area_sum = 0.0
 
             for batch in train_loader:
                 feature = batch["feature"].to(device, non_blocking=True).float()
@@ -558,6 +625,11 @@ def main():
                     ccr_shrink_area_sum += float(batch["ccr_trusted_shrink_area"].sum().item())
                     ccr_anchor_ratio_sum += float(batch["ccr_anchor_ratio"].sum().item())
                     ccr_late_override_sum += late_override_ratio
+                if use_despl:
+                    despl_num_samples += int(batch["p_init_area"].numel())
+                    despl_p_init_area_sum += float(batch["p_init_area"].sum().item())
+                    despl_p_fixed_area_sum += float(batch["p_fixed_area"].sum().item())
+                    despl_p_despl_area_sum += float(batch["p_despl_area"].sum().item())
 
             avg_loss = total_loss / max(num_batches, 1)
             logger.log(
@@ -590,6 +662,18 @@ def main():
                     f"loss_base={total_base_loss / max(num_batches, 1):.6f} | "
                     f"loss_anchor={total_anchor_loss / max(num_batches, 1):.6f} | "
                     f"head_gamma={gamma_text}"
+                )
+            if use_despl:
+                logger.log(
+                    f"[DESPL] epoch={epoch:03d} | "
+                    "use_despl_pseudo=True | "
+                    f"use_despl_light_cache={use_despl_light} | "
+                    f"p_init_mode={getattr(cfg, 'P_INIT_MODE', 'despl_fixed_blend')} | "
+                    f"p_init_area_mean={despl_p_init_area_sum / max(despl_num_samples, 1):.6f} | "
+                    f"p_fixed_area_mean={despl_p_fixed_area_sum / max(despl_num_samples, 1):.6f} | "
+                    f"p_despl_area_mean={despl_p_despl_area_sum / max(despl_num_samples, 1):.6f} | "
+                    f"fixed_weight={fixed_weight:.2f} | "
+                    f"teacher_weight={teacher_weight:.2f}"
                 )
 
             val_results = {}

@@ -2,6 +2,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import Dataset
 
@@ -9,6 +10,8 @@ from common.utils import (
     build_image_items,
     ccr_manifest_path,
     check_exact_keys,
+    despl_light_cache_manifest_path,
+    despl_pseudo_bank_manifest_path,
     manifest_to_map,
     qra_manifest_path,
     read_jsonl,
@@ -91,6 +94,103 @@ def _load_pseudo(row, expected_dataset, expected_stem):
     if tensor.ndim != 3 or tensor.shape[0] != 1:
         raise RuntimeError(f"Pseudo tensor must be [1,H,W], got {list(tensor.shape)}")
     return tensor, payload
+
+
+def _as_single_channel_tensor(payload, name, cache_path, required=True):
+    if name not in payload:
+        if required:
+            raise KeyError(f"DESPL pseudo bank missing {name}: {cache_path}")
+        return None
+    tensor = payload[name]
+    if not torch.is_tensor(tensor):
+        raise TypeError(f"DESPL pseudo bank {name} must be tensor: {cache_path}")
+    tensor = tensor.float()
+    if tensor.ndim != 3 or tensor.shape[0] != 1:
+        raise RuntimeError(
+            f"DESPL pseudo bank {name} must be [1,H,W], got {list(tensor.shape)}: {cache_path}"
+        )
+    return tensor
+
+
+def _load_despl_pseudo(row, expected_dataset, expected_stem, cfg):
+    payload = torch_load(row["cache_path"], map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(f"DESPL pseudo bank payload must be a dict: {row['cache_path']}")
+    if payload.get("dataset") != expected_dataset:
+        raise RuntimeError(
+            f"DESPL pseudo bank dataset mismatch for {row['cache_path']}: "
+            f"{payload.get('dataset')} != {expected_dataset}"
+        )
+    if payload.get("stem") != expected_stem:
+        raise RuntimeError(
+            f"DESPL pseudo bank stem mismatch for {row['cache_path']}: "
+            f"{payload.get('stem')} != {expected_stem}"
+        )
+    if payload.get("backbone_key") != cfg.BACKBONE_KEY:
+        raise RuntimeError(
+            f"DESPL pseudo bank backbone mismatch for {row['cache_path']}: "
+            f"{payload.get('backbone_key')} != {cfg.BACKBONE_KEY}"
+        )
+    return {
+        "p_despl": _as_single_channel_tensor(payload, "p_despl", row["cache_path"], required=True),
+        "p_fixed": _as_single_channel_tensor(payload, "p_fixed", row["cache_path"], required=False),
+    }
+
+
+def _load_despl_light_pseudo(row, expected_dataset, expected_stem, cfg):
+    payload = torch_load(row["cache_path"], map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(f"DESPL light cache payload must be a dict: {row['cache_path']}")
+    if payload.get("dataset") != expected_dataset:
+        raise RuntimeError(
+            f"DESPL light cache dataset mismatch for {row['cache_path']}: "
+            f"{payload.get('dataset')} != {expected_dataset}"
+        )
+    if payload.get("stem") != expected_stem:
+        raise RuntimeError(
+            f"DESPL light cache stem mismatch for {row['cache_path']}: "
+            f"{payload.get('stem')} != {expected_stem}"
+        )
+    if payload.get("backbone_key") != cfg.BACKBONE_KEY:
+        raise RuntimeError(
+            f"DESPL light cache backbone mismatch for {row['cache_path']}: "
+            f"{payload.get('backbone_key')} != {cfg.BACKBONE_KEY}"
+        )
+    tensor = payload.get("tensor", payload.get("p_init"))
+    if not torch.is_tensor(tensor):
+        raise TypeError(f"DESPL light cache tensor/p_init must be tensor: {row['cache_path']}")
+    tensor = tensor.float()
+    expected_shape = [1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE)]
+    if list(tensor.shape) != expected_shape:
+        raise RuntimeError(
+            f"DESPL light cache tensor shape mismatch: {list(tensor.shape)} != {expected_shape} | "
+            f"{row['cache_path']}"
+        )
+    pseudo_fixed = payload.get("p_fixed_68")
+    pseudo_despl = payload.get("p_despl_68")
+    if not torch.is_tensor(pseudo_fixed):
+        pseudo_fixed = torch.zeros_like(tensor)
+    if not torch.is_tensor(pseudo_despl):
+        pseudo_despl = torch.zeros_like(tensor)
+    return {
+        "pseudo": tensor,
+        "pseudo_fixed": pseudo_fixed.float(),
+        "pseudo_despl": pseudo_despl.float(),
+        "p_init_area": float(payload.get("p_init_area", tensor.mean().item())),
+        "p_fixed_area": float(payload.get("p_fixed_area", pseudo_fixed.float().mean().item())),
+        "p_despl_area": float(payload.get("p_despl_area", pseudo_despl.float().mean().item())),
+    }
+
+
+def _resize_like(tensor, reference):
+    if list(tensor.shape[-2:]) == list(reference.shape[-2:]):
+        return tensor.float()
+    return F.interpolate(
+        tensor.unsqueeze(0).float(),
+        size=reference.shape[-2:],
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0)
 
 
 def _load_qra(row, expected_dataset, expected_stem, cfg):
@@ -191,8 +291,12 @@ class CachedTrainDataset(Dataset):
         self.cfg = cfg
         self.use_qra = bool(getattr(cfg, "USE_QRA", False))
         self.use_ccr = bool(getattr(cfg, "USE_CCR", False))
+        self.use_despl_pseudo = bool(getattr(cfg, "USE_DESPL_PSEUDO", False))
+        self.use_despl_light_cache = self.use_despl_pseudo and bool(getattr(cfg, "USE_DESPL_LIGHT_CACHE", False))
         if self.use_qra and self.use_ccr:
             raise RuntimeError("USE_QRA=True and USE_CCR=True cannot be combined.")
+        if self.use_despl_pseudo and (self.use_qra or self.use_ccr):
+            raise RuntimeError("USE_DESPL_PSEUDO=True cannot be combined with USE_QRA=True or USE_CCR=True.")
         # 训练集只建立 image/cache 索引，不读取 GT，避免把训练 GT 引入监督。
         self.items = build_image_items(cfg.DATA_ROOT, cfg.TRAIN_DATASETS, require_gt=False)
         if max_samples >= 0:
@@ -222,6 +326,8 @@ class CachedTrainDataset(Dataset):
             raise RuntimeError("USE_QRA=True cannot be combined with PSEUDO_CACHE_OVERRIDE.")
         if self.use_ccr and self.pseudo_cache_override is not None:
             raise RuntimeError("USE_CCR=True cannot be combined with PSEUDO_CACHE_OVERRIDE.")
+        if self.use_despl_pseudo and self.pseudo_cache_override is not None:
+            raise RuntimeError("USE_DESPL_PSEUDO=True cannot be combined with PSEUDO_CACHE_OVERRIDE.")
         self.original_pseudo_cache_root = str(
             (
                 Path(cfg.CACHE_ROOT)
@@ -229,7 +335,37 @@ class CachedTrainDataset(Dataset):
                 / cfg.BACKBONE_KEY
             ).resolve()
         )
-        if self.pseudo_cache_override is None:
+        self.despl_map = None
+        self.despl_cache_root = None
+        self.despl_first_cache_path = None
+        self.despl_blend_despl_weight = float(getattr(cfg, "P_INIT_DESPL_WEIGHT", 0.8))
+        self.despl_blend_fixed_weight = float(getattr(cfg, "P_INIT_FIXED_WEIGHT", 0.2))
+        if self.use_despl_pseudo:
+            despl_manifest = (
+                despl_light_cache_manifest_path(cfg)
+                if self.use_despl_light_cache
+                else despl_pseudo_bank_manifest_path(cfg)
+            )
+            despl_rows = read_jsonl(despl_manifest)
+            self.despl_map = manifest_to_map(despl_rows, despl_manifest)
+            if max_samples < 0:
+                cache_name = "DESPL light cache" if self.use_despl_light_cache else "DESPL pseudo bank"
+                check_exact_keys(cache_name, self.despl_map.keys(), self.keys)
+            else:
+                missing_despl = sorted(set(self.keys) - set(self.despl_map))
+                if missing_despl:
+                    cache_name = "DESPL light cache" if self.use_despl_light_cache else "DESPL pseudo bank"
+                    raise RuntimeError(f"{cache_name} missing first 10: {missing_despl[:10]}")
+            self.despl_cache_root = str(despl_manifest.parent.resolve())
+            self.actual_pseudo_cache_root = self.despl_cache_root
+            self.actual_pseudo_cache_pattern = f"{self.despl_cache_root}/<dataset>/<stem>.pt"
+            self.pseudo_map = {}
+            if not self.use_despl_light_cache:
+                pseudo_manifest = _pseudo_manifest_path(cfg)
+                if pseudo_manifest.exists():
+                    pseudo_rows = read_jsonl(pseudo_manifest)
+                    self.pseudo_map = manifest_to_map(pseudo_rows, pseudo_manifest)
+        elif self.pseudo_cache_override is None:
             pseudo_manifest = _pseudo_manifest_path(cfg)
             pseudo_rows = read_jsonl(pseudo_manifest)
             self.pseudo_map = manifest_to_map(pseudo_rows, pseudo_manifest)
@@ -281,19 +417,45 @@ class CachedTrainDataset(Dataset):
 
         first_dataset, first_stem = self.keys[0]
         feature, _ = _load_feature(self.feature_map[(first_dataset, first_stem)], first_dataset, first_stem)
-        pseudo, pseudo_payload = _load_pseudo(
-            self.pseudo_map[(first_dataset, first_stem)],
-            first_dataset,
-            first_stem,
-        )
         self.feature_shape = list(feature.shape)
-        self.pseudo_shape = list(pseudo.shape)
         self.in_channels = int(feature.shape[0])
-        self.first_pseudo_cache_path = self.pseudo_map[
-            (first_dataset, first_stem)
-        ]["cache_path"]
-        self.pseudo_source = pseudo_payload.get("source", "original_fixed")
-        self.pseudo_final_candidate = pseudo_payload.get("final_candidate", "")
+        if self.use_despl_pseudo:
+            if self.use_despl_light_cache:
+                despl_payload = _load_despl_light_pseudo(
+                    self.despl_map[(first_dataset, first_stem)],
+                    first_dataset,
+                    first_stem,
+                    cfg,
+                )
+                self.pseudo_shape = list(despl_payload["pseudo"].shape)
+                self.pseudo_source = "despl_light_cache"
+            else:
+                despl_payload = _load_despl_pseudo(
+                    self.despl_map[(first_dataset, first_stem)],
+                    first_dataset,
+                    first_stem,
+                    cfg,
+                )
+                self.pseudo_shape = list(despl_payload["p_despl"].shape)
+                self.pseudo_source = getattr(cfg, "DESPL_PSEUDO_SOURCE", "nper_pseudo_bank")
+            self.despl_first_cache_path = self.despl_map[(first_dataset, first_stem)]["cache_path"]
+            self.first_pseudo_cache_path = self.despl_first_cache_path
+            self.pseudo_final_candidate = (
+                f"{self.despl_blend_despl_weight:.3f}*p_despl+"
+                f"{self.despl_blend_fixed_weight:.3f}*p_fixed"
+            )
+        else:
+            pseudo, pseudo_payload = _load_pseudo(
+                self.pseudo_map[(first_dataset, first_stem)],
+                first_dataset,
+                first_stem,
+            )
+            self.pseudo_shape = list(pseudo.shape)
+            self.first_pseudo_cache_path = self.pseudo_map[
+                (first_dataset, first_stem)
+            ]["cache_path"]
+            self.pseudo_source = pseudo_payload.get("source", "original_fixed")
+            self.pseudo_final_candidate = pseudo_payload.get("final_candidate", "")
         if self.pseudo_cache_override is not None:
             input_size = int(cfg.DINO["pseudo_input_size"])
             patch_size = int(cfg.DINO["patch_size"])
@@ -375,20 +537,49 @@ class CachedTrainDataset(Dataset):
         key = (dataset, stem)
 
         feature, feature_payload = _load_feature(self.feature_map[key], dataset, stem)
-        pseudo, pseudo_payload = _load_pseudo(self.pseudo_map[key], dataset, stem)
-        if (
-            self.override_expected_shape is not None
-            and list(pseudo.shape) != self.override_expected_shape
-        ):
-            raise RuntimeError(
-                "Override pseudo tensor shape mismatch: "
-                f"{list(pseudo.shape)} != {self.override_expected_shape} | "
-                f"{self.pseudo_map[key]['cache_path']}"
-            )
-        if feature_payload.get("dataset") != pseudo_payload.get("dataset"):
-            raise RuntimeError(f"Feature/pseudo dataset mismatch for {dataset}/{stem}")
-        if feature_payload.get("stem") != pseudo_payload.get("stem"):
-            raise RuntimeError(f"Feature/pseudo stem mismatch for {dataset}/{stem}")
+        if self.use_despl_pseudo:
+            if self.use_despl_light_cache:
+                light_payload = _load_despl_light_pseudo(self.despl_map[key], dataset, stem, self.cfg)
+                pseudo = light_payload["pseudo"]
+                pseudo_fixed = light_payload["pseudo_fixed"]
+                pseudo_despl = light_payload["pseudo_despl"]
+                p_init_area = light_payload["p_init_area"]
+                p_fixed_area = light_payload["p_fixed_area"]
+                p_despl_area = light_payload["p_despl_area"]
+            else:
+                despl_payload = _load_despl_pseudo(self.despl_map[key], dataset, stem, self.cfg)
+                pseudo_despl = despl_payload["p_despl"].float()
+                pseudo_fixed = despl_payload["p_fixed"]
+                if pseudo_fixed is None:
+                    if key not in self.pseudo_map:
+                        raise RuntimeError(
+                            "DESPL pseudo bank payload missing p_fixed and original fixed pseudo "
+                            f"cache is unavailable for {dataset}/{stem}"
+                        )
+                    pseudo_fixed, _ = _load_pseudo(self.pseudo_map[key], dataset, stem)
+                pseudo_fixed = _resize_like(pseudo_fixed.float(), pseudo_despl)
+                pseudo = (
+                    self.despl_blend_despl_weight * pseudo_despl
+                    + self.despl_blend_fixed_weight * pseudo_fixed
+                ).clamp(0.0, 1.0)
+                p_init_area = float(pseudo.mean().item())
+                p_fixed_area = float(pseudo_fixed.mean().item())
+                p_despl_area = float(pseudo_despl.mean().item())
+        else:
+            pseudo, pseudo_payload = _load_pseudo(self.pseudo_map[key], dataset, stem)
+            if (
+                self.override_expected_shape is not None
+                and list(pseudo.shape) != self.override_expected_shape
+            ):
+                raise RuntimeError(
+                    "Override pseudo tensor shape mismatch: "
+                    f"{list(pseudo.shape)} != {self.override_expected_shape} | "
+                    f"{self.pseudo_map[key]['cache_path']}"
+                )
+            if feature_payload.get("dataset") != pseudo_payload.get("dataset"):
+                raise RuntimeError(f"Feature/pseudo dataset mismatch for {dataset}/{stem}")
+            if feature_payload.get("stem") != pseudo_payload.get("stem"):
+                raise RuntimeError(f"Feature/pseudo stem mismatch for {dataset}/{stem}")
 
         sample = {
             "feature": feature,
@@ -397,6 +588,16 @@ class CachedTrainDataset(Dataset):
             "stem": stem,
             "image_path": item["image_path"],
         }
+        if self.use_despl_pseudo:
+            sample.update(
+                {
+                    "pseudo_fixed": pseudo_fixed.float(),
+                    "pseudo_despl": pseudo_despl.float(),
+                    "p_init_area": p_init_area,
+                    "p_fixed_area": p_fixed_area,
+                    "p_despl_area": p_despl_area,
+                }
+            )
         if self.use_qra:
             qra_payload = _load_qra(self.qra_map[key], dataset, stem, self.cfg)
             sample.update(

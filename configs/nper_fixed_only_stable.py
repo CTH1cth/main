@@ -1,0 +1,41 @@
+from configs.nper_ucod_v1 import *  # noqa: F401,F403
+
+EXP_NAME = "nper_fixed_only_stable"
+
+PSEUDO_BANK_ROOT = "../datasets/cache/nper_fixed_only_pseudo_bank"
+
+PSEUDO_USE_FIXED = True
+PSEUDO_USE_DESPL = False
+PSEUDO_USE_GCM = False
+PSEUDO_USE_TEACHER = False
+PSEUDO_USE_LOCAL_ATTN = False
+P_INIT_MODE = "fixed_only"
+
+USE_EMA_TEACHER = False
+EVOLUTION_START_EPOCH = 999
+TEACHER_MAX_WEIGHT = 0.0
+
+USE_PSTA = False
+LAMBDA_PSTA = 0.0
+
+USE_MNP = False
+LAMBDA_MNP = 0.0
+LAMBDA_LOCAL = 0.0
+LAMBDA_CONTRAST = 0.0
+LAMBDA_BOUNDARY = 0.0
+LAMBDA_ENTROPY = 0.0
+LAMBDA_ANCHOR = 0.0
+ANCHOR_WEIGHT = 0.0
+
+LAMBDA_PSEUDO = 1.0
+
+USE_CNN_DETAIL_BRANCH = True
+DETAIL_PRETRAINED = True
+DETAIL_ALLOW_RANDOM_INIT = False
+MNP_ALLOW_RANDOM_RESNET = False
+RESNET18_AUTO_DOWNLOAD = True
+RESNET18_WEIGHT_PATH = "../../workspace/weights/torchvision/resnet18-f37072fd.pth"
+TORCHVISION_CACHE_DIR = "../../workspace/weights/torchvision"
+
+MAX_EPOCH = 5
+SAVE_INTERVAL = 1

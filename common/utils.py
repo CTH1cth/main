@@ -260,6 +260,35 @@ def ccr_manifest_path(cfg):
     return ccr_cache_dir(cfg) / "manifest_train.jsonl"
 
 
+def nper_pseudo_bank_dir(cfg):
+    return Path(cfg.PSEUDO_BANK_ROOT) / cfg.BACKBONE_KEY
+
+
+def nper_pseudo_bank_manifest_path(cfg):
+    return nper_pseudo_bank_dir(cfg) / "manifest_train.jsonl"
+
+
+def despl_pseudo_bank_dir(cfg):
+    root = getattr(
+        cfg,
+        "NPER_PSEUDO_BANK_ROOT",
+        getattr(cfg, "PSEUDO_BANK_ROOT", "../datasets/cache/nper_pseudo_bank"),
+    )
+    return Path(root) / cfg.BACKBONE_KEY
+
+
+def despl_pseudo_bank_manifest_path(cfg):
+    return despl_pseudo_bank_dir(cfg) / "manifest_train.jsonl"
+
+
+def despl_light_cache_dir(cfg):
+    return Path(cfg.DESPL_LIGHT_CACHE_ROOT) / cfg.BACKBONE_KEY
+
+
+def despl_light_cache_manifest_path(cfg):
+    return despl_light_cache_dir(cfg) / "manifest_train.jsonl"
+
+
 def split_dataset_names(cfg, split):
     # 根据 split 选择配置里的数据集列表。
     if split == "train":
@@ -439,6 +468,215 @@ def check_ccr_cache(cfg, max_samples=None):
                         f"invalid shape for {key} {name}: {shape.get(name)} != {expected_shape}"
                     )
                 )
+
+    return True, f"complete: {manifest_path}"
+
+
+def _nper_required_shapes(cfg):
+    size = int(cfg.LOSS_SIZE)
+    return {
+        "p_fixed": [1, size, size],
+        "p_despl": [1, size, size],
+        "p_gcm": [1, size, size],
+        "p_init": [1, size, size],
+        "anchor_fg": [1, size, size],
+        "anchor_bg": [1, size, size],
+        "pixel_weight": [1, size, size],
+    }
+
+
+def _nper_error(reason):
+    return (
+        f"NPER pseudo bank missing or incomplete: {reason}\n"
+        "Please run:\n"
+        "python common/cache_nper_pseudo_bank.py --config configs/nper_ucod_v1.py --overwrite"
+    )
+
+
+def check_nper_pseudo_bank(cfg, max_samples=None):
+    manifest_path = nper_pseudo_bank_manifest_path(cfg)
+    if not manifest_path.exists():
+        raise RuntimeError(_nper_error(f"missing manifest: {manifest_path}"))
+
+    expected_items = build_image_items(cfg.DATA_ROOT, cfg.TRAIN_DATASETS, require_gt=False)
+    if max_samples is not None and int(max_samples) >= 0:
+        expected_items = expected_items[: int(max_samples)]
+    expected_keys = [(item["dataset"], item["stem"]) for item in expected_items]
+    expected_key_set = set(expected_keys)
+
+    rows = read_jsonl(manifest_path)
+    row_map = {}
+    for row in rows:
+        if "dataset" not in row or "stem" not in row:
+            raise RuntimeError(_nper_error(f"bad manifest row without dataset/stem in {manifest_path}"))
+        key = (row["dataset"], row["stem"])
+        if key in row_map:
+            raise RuntimeError(_nper_error(f"duplicate manifest key in {manifest_path}: {key}"))
+        row_map[key] = row
+
+    actual_key_set = set(row_map)
+    if max_samples is None or int(max_samples) < 0:
+        extra = sorted(actual_key_set - expected_key_set)
+        if extra:
+            raise RuntimeError(_nper_error(f"manifest has unexpected keys first 10: {extra[:10]}"))
+    missing = sorted(expected_key_set - actual_key_set)
+    if missing:
+        raise RuntimeError(_nper_error(f"missing manifest rows first 10: {missing[:10]}"))
+
+    required_shapes = _nper_required_shapes(cfg)
+    for key in expected_keys:
+        row = row_map[key]
+        if row.get("backbone_key", cfg.BACKBONE_KEY) != cfg.BACKBONE_KEY:
+            raise RuntimeError(
+                _nper_error(
+                    f"backbone mismatch for {key}: {row.get('backbone_key')} != {cfg.BACKBONE_KEY}"
+                )
+            )
+        cache_path = row.get("cache_path")
+        if not cache_path:
+            raise RuntimeError(_nper_error(f"missing cache_path for {key}"))
+        if not Path(cache_path).exists():
+            raise RuntimeError(_nper_error(f"missing cache file: {cache_path}"))
+        shape = row.get("shape")
+        if not isinstance(shape, dict):
+            raise RuntimeError(_nper_error(f"missing or invalid shape dict for {key}"))
+        for name, expected_shape in required_shapes.items():
+            if shape.get(name) != expected_shape:
+                raise RuntimeError(
+                    _nper_error(
+                        f"invalid shape for {key} {name}: {shape.get(name)} != {expected_shape}"
+                    )
+                )
+
+    return True, f"complete: {manifest_path}"
+
+
+def _despl_error(reason):
+    return (
+        f"DESPL pseudo bank missing or incomplete: {reason}\n"
+        "Please run:\n"
+        "python common/cache_nper_pseudo_bank.py --config configs/nper_ucod_v1.py --overwrite"
+    )
+
+
+def _single_channel_shape_ok(shape):
+    return (
+        isinstance(shape, list)
+        and len(shape) == 3
+        and shape[0] == 1
+        and all(isinstance(x, int) and x > 0 for x in shape)
+    )
+
+
+def check_despl_pseudo_bank(cfg, max_samples=None):
+    manifest_path = despl_pseudo_bank_manifest_path(cfg)
+    if not manifest_path.exists():
+        raise RuntimeError(_despl_error(f"missing manifest: {manifest_path}"))
+
+    expected_items = build_image_items(cfg.DATA_ROOT, cfg.TRAIN_DATASETS, require_gt=False)
+    if max_samples is not None and int(max_samples) >= 0:
+        expected_items = expected_items[: int(max_samples)]
+    expected_keys = [(item["dataset"], item["stem"]) for item in expected_items]
+    expected_key_set = set(expected_keys)
+
+    rows = read_jsonl(manifest_path)
+    row_map = {}
+    for row in rows:
+        if "dataset" not in row or "stem" not in row:
+            raise RuntimeError(_despl_error(f"bad manifest row without dataset/stem in {manifest_path}"))
+        key = (row["dataset"], row["stem"])
+        if key in row_map:
+            raise RuntimeError(_despl_error(f"duplicate manifest key in {manifest_path}: {key}"))
+        row_map[key] = row
+
+    actual_key_set = set(row_map)
+    if max_samples is None or int(max_samples) < 0:
+        extra = sorted(actual_key_set - expected_key_set)
+        if extra:
+            raise RuntimeError(_despl_error(f"manifest has unexpected keys first 10: {extra[:10]}"))
+    missing = sorted(expected_key_set - actual_key_set)
+    if missing:
+        raise RuntimeError(_despl_error(f"missing manifest rows first 10: {missing[:10]}"))
+
+    for key in expected_keys:
+        row = row_map[key]
+        if row.get("backbone_key", cfg.BACKBONE_KEY) != cfg.BACKBONE_KEY:
+            raise RuntimeError(
+                _despl_error(
+                    f"backbone mismatch for {key}: {row.get('backbone_key')} != {cfg.BACKBONE_KEY}"
+                )
+            )
+        cache_path = row.get("cache_path")
+        if not cache_path:
+            raise RuntimeError(_despl_error(f"missing cache_path for {key}"))
+        if not Path(cache_path).exists():
+            raise RuntimeError(_despl_error(f"missing cache file: {cache_path}"))
+        shape = row.get("shape")
+        if not isinstance(shape, dict):
+            raise RuntimeError(_despl_error(f"missing or invalid shape dict for {key}"))
+        if not _single_channel_shape_ok(shape.get("p_despl")):
+            raise RuntimeError(_despl_error(f"invalid p_despl shape for {key}: {shape.get('p_despl')}"))
+        if "p_fixed" in shape and not _single_channel_shape_ok(shape.get("p_fixed")):
+            raise RuntimeError(_despl_error(f"invalid p_fixed shape for {key}: {shape.get('p_fixed')}"))
+
+    return True, f"complete: {manifest_path}"
+
+
+def _despl_light_error(reason):
+    return (
+        f"DESPL light cache missing or incomplete: {reason}\n"
+        "Please run:\n"
+        "python common/cache_despl_blend_pseudo.py --config configs/dinov1_s8_despl_teacher_cache.py --overwrite"
+    )
+
+
+def check_despl_light_cache(cfg, max_samples=None):
+    manifest_path = despl_light_cache_manifest_path(cfg)
+    if not manifest_path.exists():
+        raise RuntimeError(_despl_light_error(f"missing manifest: {manifest_path}"))
+
+    expected_items = build_image_items(cfg.DATA_ROOT, cfg.TRAIN_DATASETS, require_gt=False)
+    if max_samples is not None and int(max_samples) >= 0:
+        expected_items = expected_items[: int(max_samples)]
+    expected_keys = [(item["dataset"], item["stem"]) for item in expected_items]
+    expected_key_set = set(expected_keys)
+
+    rows = read_jsonl(manifest_path)
+    row_map = {}
+    for row in rows:
+        if "dataset" not in row or "stem" not in row:
+            raise RuntimeError(_despl_light_error(f"bad manifest row without dataset/stem in {manifest_path}"))
+        key = (row["dataset"], row["stem"])
+        if key in row_map:
+            raise RuntimeError(_despl_light_error(f"duplicate manifest key in {manifest_path}: {key}"))
+        row_map[key] = row
+
+    actual_key_set = set(row_map)
+    if max_samples is None or int(max_samples) < 0:
+        extra = sorted(actual_key_set - expected_key_set)
+        if extra:
+            raise RuntimeError(_despl_light_error(f"manifest has unexpected keys first 10: {extra[:10]}"))
+    missing = sorted(expected_key_set - actual_key_set)
+    if missing:
+        raise RuntimeError(_despl_light_error(f"missing manifest rows first 10: {missing[:10]}"))
+
+    expected_shape = [1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE)]
+    for key in expected_keys:
+        row = row_map[key]
+        if row.get("backbone_key", cfg.BACKBONE_KEY) != cfg.BACKBONE_KEY:
+            raise RuntimeError(
+                _despl_light_error(
+                    f"backbone mismatch for {key}: {row.get('backbone_key')} != {cfg.BACKBONE_KEY}"
+                )
+            )
+        cache_path = row.get("cache_path")
+        if not cache_path:
+            raise RuntimeError(_despl_light_error(f"missing cache_path for {key}"))
+        if not Path(cache_path).exists():
+            raise RuntimeError(_despl_light_error(f"missing cache file: {cache_path}"))
+        shape = row.get("shape")
+        if shape != expected_shape:
+            raise RuntimeError(_despl_light_error(f"invalid shape for {key}: {shape} != {expected_shape}"))
 
     return True, f"complete: {manifest_path}"
 

@@ -1,0 +1,38 @@
+from configs.nper_fixed_only_stable import *  # noqa: F401,F403
+
+EXP_NAME = "nper_frozen_dino_linear_probe"
+
+DECODER = "linear_probe"
+LINEAR_PROBE_HEAD = "conv1x1"
+
+P_INIT_MODE = "fixed_only"
+PSEUDO_USE_FIXED = True
+PSEUDO_USE_DESPL = False
+PSEUDO_USE_GCM = False
+PSEUDO_USE_TEACHER = False
+PSEUDO_USE_LOCAL_ATTN = False
+
+DINO_FREEZE_BASE = True
+DINO_USE_LORA = False
+
+USE_CNN_DETAIL_BRANCH = False
+USE_AFF = False
+USE_DUAL_FG_BG_HEAD = False
+USE_BOUNDARY_HEAD = False
+
+USE_MNP = False
+USE_EMA_TEACHER = False
+USE_PSTA = False
+
+LAMBDA_PSEUDO = 1.0
+LAMBDA_ANCHOR = 0.0
+LAMBDA_MNP = 0.0
+LAMBDA_LOCAL = 0.0
+LAMBDA_PSTA = 0.0
+LAMBDA_CONTRAST = 0.0
+LAMBDA_BOUNDARY = 0.0
+LAMBDA_ENTROPY = 0.0
+ANCHOR_WEIGHT = 0.0
+
+MAX_EPOCH = 5
+SAVE_INTERVAL = 1
