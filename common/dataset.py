@@ -6,12 +6,14 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import Dataset
 
+from common.dre_safe_prior import build_dre_safe_prior
 from common.utils import (
     build_image_items,
     ccr_manifest_path,
     check_exact_keys,
     despl_light_cache_manifest_path,
     despl_pseudo_bank_manifest_path,
+    drepp_manifest_path,
     manifest_to_map,
     qra_manifest_path,
     read_jsonl,
@@ -40,6 +42,18 @@ CCR_TENSOR_FIELDS = {
     "trusted_shrink": torch.bool,
     "anchor_fg": torch.bool,
     "anchor_bg": torch.bool,
+}
+
+DREPP_TENSOR_FIELDS = {
+    "p_despl": torch.float32,
+    "p_fixed": torch.float32,
+    "core_fg": torch.bool,
+    "core_bg": torch.bool,
+    "uncertain": torch.bool,
+    "fixed_local_recall": torch.bool,
+    "boundary_band": torch.bool,
+    "memory_init": torch.float32,
+    "feature_sim": torch.float32,
 }
 
 
@@ -112,6 +126,16 @@ def _as_single_channel_tensor(payload, name, cache_path, required=True):
     return tensor
 
 
+def _validate_unit_range(tensor, name, cache_path):
+    min_value = float(tensor.min().item())
+    max_value = float(tensor.max().item())
+    if min_value < -1e-6 or max_value > 1.0 + 1e-6:
+        raise RuntimeError(
+            f"{name} values must be in [0,1], got min={min_value:.6f}, "
+            f"max={max_value:.6f}: {cache_path}"
+        )
+
+
 def _load_despl_pseudo(row, expected_dataset, expected_stem, cfg):
     payload = torch_load(row["cache_path"], map_location="cpu")
     if not isinstance(payload, dict):
@@ -131,8 +155,14 @@ def _load_despl_pseudo(row, expected_dataset, expected_stem, cfg):
             f"DESPL pseudo bank backbone mismatch for {row['cache_path']}: "
             f"{payload.get('backbone_key')} != {cfg.BACKBONE_KEY}"
         )
+    if "p_despl" not in payload:
+        raise KeyError(
+            f"DESPL pseudo missing for {expected_dataset}/{expected_stem}: {row['cache_path']}"
+        )
+    p_despl = _as_single_channel_tensor(payload, "p_despl", row["cache_path"], required=True)
+    _validate_unit_range(p_despl, "p_despl", row["cache_path"])
     return {
-        "p_despl": _as_single_channel_tensor(payload, "p_despl", row["cache_path"], required=True),
+        "p_despl": p_despl,
         "p_fixed": _as_single_channel_tensor(payload, "p_fixed", row["cache_path"], required=False),
     }
 
@@ -168,10 +198,27 @@ def _load_despl_light_pseudo(row, expected_dataset, expected_stem, cfg):
         )
     pseudo_fixed = payload.get("p_fixed_68")
     pseudo_despl = payload.get("p_despl_68")
+    has_pseudo_fixed = torch.is_tensor(pseudo_fixed)
+    has_pseudo_despl = torch.is_tensor(pseudo_despl)
     if not torch.is_tensor(pseudo_fixed):
         pseudo_fixed = torch.zeros_like(tensor)
     if not torch.is_tensor(pseudo_despl):
         pseudo_despl = torch.zeros_like(tensor)
+    else:
+        pseudo_despl = pseudo_despl.float()
+        if list(pseudo_despl.shape) != expected_shape:
+            raise RuntimeError(
+                f"DESPL light cache p_despl_68 shape mismatch: "
+                f"{list(pseudo_despl.shape)} != {expected_shape} | {row['cache_path']}"
+            )
+        _validate_unit_range(pseudo_despl, "p_despl_68", row["cache_path"])
+    if torch.is_tensor(pseudo_fixed):
+        pseudo_fixed = pseudo_fixed.float()
+        if list(pseudo_fixed.shape) != expected_shape:
+            raise RuntimeError(
+                f"DESPL light cache p_fixed_68 shape mismatch: "
+                f"{list(pseudo_fixed.shape)} != {expected_shape} | {row['cache_path']}"
+            )
     return {
         "pseudo": tensor,
         "pseudo_fixed": pseudo_fixed.float(),
@@ -179,6 +226,8 @@ def _load_despl_light_pseudo(row, expected_dataset, expected_stem, cfg):
         "p_init_area": float(payload.get("p_init_area", tensor.mean().item())),
         "p_fixed_area": float(payload.get("p_fixed_area", pseudo_fixed.float().mean().item())),
         "p_despl_area": float(payload.get("p_despl_area", pseudo_despl.float().mean().item())),
+        "_has_p_fixed_68": bool(has_pseudo_fixed),
+        "_has_p_despl_68": bool(has_pseudo_despl),
     }
 
 
@@ -278,6 +327,45 @@ def _load_ccr(row, expected_dataset, expected_stem, cfg):
     return out
 
 
+def _load_drepp(row, expected_dataset, expected_stem, cfg):
+    payload = torch_load(row["cache_path"], map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(f"DRE++ cache must be a dict: {row['cache_path']}")
+    if payload.get("dataset") != expected_dataset:
+        raise RuntimeError(
+            f"DRE++ dataset mismatch for {row['cache_path']}: "
+            f"{payload.get('dataset')} != {expected_dataset}"
+        )
+    if payload.get("stem") != expected_stem:
+        raise RuntimeError(
+            f"DRE++ stem mismatch for {row['cache_path']}: "
+            f"{payload.get('stem')} != {expected_stem}"
+        )
+    if payload.get("backbone_key") != cfg.BACKBONE_KEY:
+        raise RuntimeError(
+            f"DRE++ backbone mismatch for {row['cache_path']}: "
+            f"{payload.get('backbone_key')} != {cfg.BACKBONE_KEY}"
+        )
+    if bool(payload.get("global_blend", False)):
+        raise RuntimeError(f"DRE++ cache must not use global blending: {row['cache_path']}")
+
+    expected_shape = [1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE)]
+    out = dict(payload)
+    for name, dtype in DREPP_TENSOR_FIELDS.items():
+        if name not in payload:
+            raise KeyError(f"DRE++ cache missing {name}: {row['cache_path']}")
+        tensor = payload[name]
+        if not torch.is_tensor(tensor):
+            raise TypeError(f"DRE++ {name} must be a tensor: {row['cache_path']}")
+        if list(tensor.shape) != expected_shape:
+            raise RuntimeError(
+                f"DRE++ {name} shape mismatch for {row['cache_path']}: "
+                f"{list(tensor.shape)} != {expected_shape}"
+            )
+        out[name] = tensor.to(dtype=dtype)
+    return out
+
+
 def _load_gt(gt_path):
     # GT 读成 0/1 float tensor，指标计算前保持 [1,H,W]。
     gt = Image.open(gt_path).convert("L")
@@ -291,10 +379,16 @@ class CachedTrainDataset(Dataset):
         self.cfg = cfg
         self.use_qra = bool(getattr(cfg, "USE_QRA", False))
         self.use_ccr = bool(getattr(cfg, "USE_CCR", False))
+        self.use_drepp = bool(getattr(cfg, "USE_DREPP", False))
         self.use_despl_pseudo = bool(getattr(cfg, "USE_DESPL_PSEUDO", False))
+        self.p_init_mode = str(getattr(cfg, "P_INIT_MODE", ""))
+        self.use_despl_only = self.use_despl_pseudo and self.p_init_mode == "despl_only"
+        self.use_dre_safe_prior = self.use_despl_pseudo and bool(getattr(cfg, "USE_DRE_SAFE_PRIOR", False))
         self.use_despl_light_cache = self.use_despl_pseudo and bool(getattr(cfg, "USE_DESPL_LIGHT_CACHE", False))
         if self.use_qra and self.use_ccr:
             raise RuntimeError("USE_QRA=True and USE_CCR=True cannot be combined.")
+        if self.use_drepp and (self.use_qra or self.use_ccr or self.use_despl_pseudo):
+            raise RuntimeError("USE_DREPP=True cannot be combined with USE_QRA, USE_CCR, or USE_DESPL_PSEUDO.")
         if self.use_despl_pseudo and (self.use_qra or self.use_ccr):
             raise RuntimeError("USE_DESPL_PSEUDO=True cannot be combined with USE_QRA=True or USE_CCR=True.")
         # 训练集只建立 image/cache 索引，不读取 GT，避免把训练 GT 引入监督。
@@ -326,6 +420,8 @@ class CachedTrainDataset(Dataset):
             raise RuntimeError("USE_QRA=True cannot be combined with PSEUDO_CACHE_OVERRIDE.")
         if self.use_ccr and self.pseudo_cache_override is not None:
             raise RuntimeError("USE_CCR=True cannot be combined with PSEUDO_CACHE_OVERRIDE.")
+        if self.use_drepp and self.pseudo_cache_override is not None:
+            raise RuntimeError("USE_DREPP=True cannot be combined with PSEUDO_CACHE_OVERRIDE.")
         if self.use_despl_pseudo and self.pseudo_cache_override is not None:
             raise RuntimeError("USE_DESPL_PSEUDO=True cannot be combined with PSEUDO_CACHE_OVERRIDE.")
         self.original_pseudo_cache_root = str(
@@ -338,9 +434,26 @@ class CachedTrainDataset(Dataset):
         self.despl_map = None
         self.despl_cache_root = None
         self.despl_first_cache_path = None
+        self.drepp_map = None
+        self.drepp_cache_root = None
+        self.drepp_first_cache_path = None
         self.despl_blend_despl_weight = float(getattr(cfg, "P_INIT_DESPL_WEIGHT", 0.8))
         self.despl_blend_fixed_weight = float(getattr(cfg, "P_INIT_FIXED_WEIGHT", 0.2))
-        if self.use_despl_pseudo:
+        if self.use_drepp:
+            drepp_manifest = drepp_manifest_path(cfg)
+            drepp_rows = read_jsonl(drepp_manifest)
+            self.drepp_map = manifest_to_map(drepp_rows, drepp_manifest)
+            if max_samples < 0:
+                check_exact_keys("DRE++ cache", self.drepp_map.keys(), self.keys)
+            else:
+                missing_drepp = sorted(set(self.keys) - set(self.drepp_map))
+                if missing_drepp:
+                    raise RuntimeError(f"DRE++ cache missing first 10: {missing_drepp[:10]}")
+            self.drepp_cache_root = str(drepp_manifest.parent.resolve())
+            self.actual_pseudo_cache_root = self.drepp_cache_root
+            self.actual_pseudo_cache_pattern = f"{self.drepp_cache_root}/<dataset>/<stem>.pt"
+            self.pseudo_map = {}
+        elif self.use_despl_pseudo:
             despl_manifest = (
                 despl_light_cache_manifest_path(cfg)
                 if self.use_despl_light_cache
@@ -419,7 +532,19 @@ class CachedTrainDataset(Dataset):
         feature, _ = _load_feature(self.feature_map[(first_dataset, first_stem)], first_dataset, first_stem)
         self.feature_shape = list(feature.shape)
         self.in_channels = int(feature.shape[0])
-        if self.use_despl_pseudo:
+        if self.use_drepp:
+            drepp_payload = _load_drepp(
+                self.drepp_map[(first_dataset, first_stem)],
+                first_dataset,
+                first_stem,
+                cfg,
+            )
+            self.pseudo_shape = list(drepp_payload["p_despl"].shape)
+            self.pseudo_source = "drepp_v1"
+            self.drepp_first_cache_path = self.drepp_map[(first_dataset, first_stem)]["cache_path"]
+            self.first_pseudo_cache_path = self.drepp_first_cache_path
+            self.pseudo_final_candidate = "p_despl memory anchor + fixed-local recall (global_blend=false)"
+        elif self.use_despl_pseudo:
             if self.use_despl_light_cache:
                 despl_payload = _load_despl_light_pseudo(
                     self.despl_map[(first_dataset, first_stem)],
@@ -427,7 +552,13 @@ class CachedTrainDataset(Dataset):
                     first_stem,
                     cfg,
                 )
-                self.pseudo_shape = list(despl_payload["pseudo"].shape)
+                if self.use_despl_only and not despl_payload.get("_has_p_despl_68", False):
+                    raise RuntimeError(
+                        "DESPL-only requires p_despl_68 in DESPL light cache: "
+                        f"{self.despl_map[(first_dataset, first_stem)]['cache_path']}"
+                    )
+                shape_source = "pseudo_despl" if self.use_despl_only else "pseudo"
+                self.pseudo_shape = list(despl_payload[shape_source].shape)
                 self.pseudo_source = "despl_light_cache"
             else:
                 despl_payload = _load_despl_pseudo(
@@ -440,10 +571,15 @@ class CachedTrainDataset(Dataset):
                 self.pseudo_source = getattr(cfg, "DESPL_PSEUDO_SOURCE", "nper_pseudo_bank")
             self.despl_first_cache_path = self.despl_map[(first_dataset, first_stem)]["cache_path"]
             self.first_pseudo_cache_path = self.despl_first_cache_path
-            self.pseudo_final_candidate = (
-                f"{self.despl_blend_despl_weight:.3f}*p_despl+"
-                f"{self.despl_blend_fixed_weight:.3f}*p_fixed"
-            )
+            if self.use_dre_safe_prior:
+                self.pseudo_final_candidate = "safe_despl_residual"
+            elif self.use_despl_only:
+                self.pseudo_final_candidate = "p_despl"
+            else:
+                self.pseudo_final_candidate = (
+                    f"{self.despl_blend_despl_weight:.3f}*p_despl+"
+                    f"{self.despl_blend_fixed_weight:.3f}*p_fixed"
+                )
         else:
             pseudo, pseudo_payload = _load_pseudo(
                 self.pseudo_map[(first_dataset, first_stem)],
@@ -537,34 +673,86 @@ class CachedTrainDataset(Dataset):
         key = (dataset, stem)
 
         feature, feature_payload = _load_feature(self.feature_map[key], dataset, stem)
-        if self.use_despl_pseudo:
+        if self.use_drepp:
+            drepp_payload = _load_drepp(self.drepp_map[key], dataset, stem, self.cfg)
+            pseudo = drepp_payload["p_despl"].float()
+        elif self.use_despl_pseudo:
             if self.use_despl_light_cache:
                 light_payload = _load_despl_light_pseudo(self.despl_map[key], dataset, stem, self.cfg)
-                pseudo = light_payload["pseudo"]
                 pseudo_fixed = light_payload["pseudo_fixed"]
                 pseudo_despl = light_payload["pseudo_despl"]
-                p_init_area = light_payload["p_init_area"]
-                p_fixed_area = light_payload["p_fixed_area"]
-                p_despl_area = light_payload["p_despl_area"]
+                if self.use_despl_only:
+                    if not light_payload.get("_has_p_despl_68", False):
+                        raise RuntimeError(
+                            "DESPL pseudo missing for "
+                            f"{dataset}/{stem}: p_despl_68 not found in {self.despl_map[key]['cache_path']}"
+                        )
+                    pseudo = pseudo_despl.float()
+                    pseudo_base = pseudo
+                    pseudo_safe = pseudo
+                    dre_safe = None
+                    use_fixed_in_pseudo = False
+                else:
+                    use_fixed_in_pseudo = bool(abs(self.despl_blend_fixed_weight) > 0.0)
+                    pseudo_base = (
+                        self.despl_blend_despl_weight * pseudo_despl
+                        + self.despl_blend_fixed_weight * pseudo_fixed
+                    ).clamp(0.0, 1.0)
+                if self.use_dre_safe_prior and (
+                    not light_payload.get("_has_p_fixed_68", False)
+                    or not light_payload.get("_has_p_despl_68", False)
+                ):
+                    raise RuntimeError(
+                        "DRE-SAFE requires p_fixed_68 and p_despl_68 in DESPL light cache: "
+                        f"{self.despl_map[key]['cache_path']}"
+                    )
             else:
                 despl_payload = _load_despl_pseudo(self.despl_map[key], dataset, stem, self.cfg)
                 pseudo_despl = despl_payload["p_despl"].float()
                 pseudo_fixed = despl_payload["p_fixed"]
-                if pseudo_fixed is None:
+                if self.use_despl_only:
+                    if pseudo_fixed is None:
+                        pseudo_fixed = torch.zeros_like(pseudo_despl)
+                    else:
+                        pseudo_fixed = _resize_like(pseudo_fixed.float(), pseudo_despl)
+                    pseudo = pseudo_despl
+                    pseudo_base = pseudo
+                    pseudo_safe = pseudo
+                    dre_safe = None
+                    use_fixed_in_pseudo = False
+                elif pseudo_fixed is None:
                     if key not in self.pseudo_map:
                         raise RuntimeError(
                             "DESPL pseudo bank payload missing p_fixed and original fixed pseudo "
                             f"cache is unavailable for {dataset}/{stem}"
                         )
                     pseudo_fixed, _ = _load_pseudo(self.pseudo_map[key], dataset, stem)
-                pseudo_fixed = _resize_like(pseudo_fixed.float(), pseudo_despl)
-                pseudo = (
-                    self.despl_blend_despl_weight * pseudo_despl
-                    + self.despl_blend_fixed_weight * pseudo_fixed
-                ).clamp(0.0, 1.0)
-                p_init_area = float(pseudo.mean().item())
-                p_fixed_area = float(pseudo_fixed.mean().item())
-                p_despl_area = float(pseudo_despl.mean().item())
+                    pseudo_fixed = _resize_like(pseudo_fixed.float(), pseudo_despl)
+                    use_fixed_in_pseudo = bool(abs(self.despl_blend_fixed_weight) > 0.0)
+                    pseudo_base = (
+                        self.despl_blend_despl_weight * pseudo_despl
+                        + self.despl_blend_fixed_weight * pseudo_fixed
+                    ).clamp(0.0, 1.0)
+                else:
+                    pseudo_fixed = _resize_like(pseudo_fixed.float(), pseudo_despl)
+                    use_fixed_in_pseudo = bool(abs(self.despl_blend_fixed_weight) > 0.0)
+                    pseudo_base = (
+                        self.despl_blend_despl_weight * pseudo_despl
+                        + self.despl_blend_fixed_weight * pseudo_fixed
+                    ).clamp(0.0, 1.0)
+            if self.use_dre_safe_prior:
+                dre_safe = build_dre_safe_prior(pseudo_despl, pseudo_fixed, self.cfg)
+                pseudo = dre_safe["p_safe"]
+                pseudo_base = dre_safe["p_base"]
+                pseudo_safe = dre_safe["p_safe"]
+                use_fixed_in_pseudo = True
+            elif not self.use_despl_only:
+                dre_safe = None
+                pseudo = pseudo_base
+                pseudo_safe = pseudo_base
+            p_init_area = float(pseudo.mean().item())
+            p_fixed_area = float(pseudo_fixed.mean().item())
+            p_despl_area = float(pseudo_despl.mean().item())
         else:
             pseudo, pseudo_payload = _load_pseudo(self.pseudo_map[key], dataset, stem)
             if (
@@ -596,6 +784,46 @@ class CachedTrainDataset(Dataset):
                     "p_init_area": p_init_area,
                     "p_fixed_area": p_fixed_area,
                     "p_despl_area": p_despl_area,
+                    "use_fixed_in_pseudo": bool(use_fixed_in_pseudo),
+                    "fixed_used_for_training": bool(use_fixed_in_pseudo),
+                }
+            )
+            if self.use_dre_safe_prior:
+                sample.update(
+                    {
+                        "pseudo_base": pseudo_base.float(),
+                        "pseudo_safe": pseudo_safe.float(),
+                        "dre_safe_candidate": dre_safe["candidate"].bool(),
+                        "dre_safe_fallback": bool(dre_safe["fallback"]),
+                        "dre_safe_area_base": float(dre_safe["area_base"]),
+                        "dre_safe_area_safe": float(dre_safe["area_safe"]),
+                        "dre_safe_candidate_ratio": float(dre_safe["candidate_ratio"]),
+                        "dre_safe_cc_base": int(dre_safe["cc_base"]),
+                        "dre_safe_cc_safe": int(dre_safe["cc_safe"]),
+                        "dre_safe_positive_delta_mean": float(dre_safe["safe_positive_delta_mean"]),
+                        "dre_safe_changed_ratio": float(dre_safe["safe_changed_ratio"]),
+                    }
+                )
+        if self.use_drepp:
+            sample.update(
+                {
+                    "drepp_p_fixed": drepp_payload["p_fixed"].float(),
+                    "drepp_core_fg": drepp_payload["core_fg"].bool(),
+                    "drepp_core_bg": drepp_payload["core_bg"].bool(),
+                    "drepp_uncertain": drepp_payload["uncertain"].bool(),
+                    "drepp_fixed_local_recall": drepp_payload["fixed_local_recall"].bool(),
+                    "drepp_boundary_band": drepp_payload["boundary_band"].bool(),
+                    "drepp_memory_init": drepp_payload["memory_init"].float(),
+                    "drepp_feature_sim": drepp_payload["feature_sim"].float(),
+                    "drepp_p_despl_area": float(drepp_payload.get("p_despl_area", 0.0)),
+                    "drepp_p_fixed_area": float(drepp_payload.get("p_fixed_area", 0.0)),
+                    "drepp_core_fg_area": float(drepp_payload.get("core_fg_area", 0.0)),
+                    "drepp_core_bg_area": float(drepp_payload.get("core_bg_area", 0.0)),
+                    "drepp_uncertain_area": float(drepp_payload.get("uncertain_area", 0.0)),
+                    "drepp_fixed_local_area": float(drepp_payload.get("fixed_local_area", 0.0)),
+                    "drepp_boundary_band_area": float(drepp_payload.get("boundary_band_area", 0.0)),
+                    "drepp_fixed_local_ratio": float(drepp_payload.get("fixed_local_ratio", 0.0)),
+                    "drepp_global_blend": bool(drepp_payload.get("global_blend", False)),
                 }
             )
         if self.use_qra:

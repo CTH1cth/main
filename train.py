@@ -13,6 +13,7 @@ from common.utils import (
     check_ccr_cache,
     check_despl_light_cache,
     check_despl_pseudo_bank,
+    check_drepp_cache,
     check_qra_cache,
     config_to_dict,
     current_lr,
@@ -153,17 +154,40 @@ def log_cache_summary(logger, cfg, train_dataset):
         logger.log(f"first CCR quality = {train_dataset.ccr_first_quality}")
         logger.log(f"first CCR IoU = {train_dataset.ccr_first_iou:.6f}")
         logger.log(f"first CCR anchor ratio = {train_dataset.ccr_first_anchor_ratio:.6f}")
+    if getattr(cfg, "USE_DREPP", False):
+        logger.log(f"DRE++ cache path = {train_dataset.drepp_cache_root}")
+        logger.log(f"first DRE++ cache file = {train_dataset.drepp_first_cache_path}")
+        logger.log("USE_DREPP=True")
+        logger.log("DESPL-core active = true")
+        logger.log("memory initialized = true")
+        logger.log("teacher_uncertain_only=true")
+        logger.log("fixed_local_only=true")
+        logger.log(f"local_refine={bool(getattr(cfg, 'USE_LOCAL_REFINE', False))}")
+        logger.log("global_blend=false")
     if getattr(cfg, "USE_DESPL_PSEUDO", False):
+        fixed_weight_in_init = float(getattr(cfg, "P_INIT_FIXED_WEIGHT", 0.2))
+        use_fixed_in_pseudo = (
+            str(getattr(cfg, "P_INIT_MODE", "")) != "despl_only"
+            and abs(fixed_weight_in_init) > 0.0
+        )
         logger.log(f"DESPL pseudo cache path = {train_dataset.despl_cache_root}")
         logger.log(f"first DESPL pseudo file = {train_dataset.despl_first_cache_path}")
         logger.log(f"use_despl_pseudo = true")
         logger.log(f"use_despl_light_cache = {bool(getattr(cfg, 'USE_DESPL_LIGHT_CACHE', False))}")
+        logger.log(f"use_dre_safe_prior = {bool(getattr(cfg, 'USE_DRE_SAFE_PRIOR', False))}")
+        logger.log(f"use_late_despl_anchor_loss = {bool(getattr(cfg, 'USE_LATE_DESPL_ANCHOR_LOSS', False))}")
+        logger.log(f"use_gcm = {bool(getattr(cfg, 'PSEUDO_USE_GCM', False))}")
         logger.log(f"p_init_mode = {getattr(cfg, 'P_INIT_MODE', 'despl_fixed_blend')}")
-        logger.log(
-            "p_init_formula = "
-            f"{float(getattr(cfg, 'P_INIT_DESPL_WEIGHT', 0.8)):.3f}*p_despl + "
-            f"{float(getattr(cfg, 'P_INIT_FIXED_WEIGHT', 0.2)):.3f}*p_fixed"
-        )
+        if str(getattr(cfg, "P_INIT_MODE", "")) == "despl_only":
+            logger.log("p_init_formula = p_despl")
+        else:
+            logger.log(
+                "p_init_formula = "
+                f"{float(getattr(cfg, 'P_INIT_DESPL_WEIGHT', 0.8)):.3f}*p_despl + "
+                f"{float(getattr(cfg, 'P_INIT_FIXED_WEIGHT', 0.2)):.3f}*p_fixed"
+            )
+        logger.log(f"use_fixed_in_pseudo = {use_fixed_in_pseudo}")
+        logger.log(f"fixed_used_for_training = {use_fixed_in_pseudo}")
     logger.log(f"loss size = {cfg.LOSS_SIZE}x{cfg.LOSS_SIZE}")
 
 
@@ -204,9 +228,46 @@ def log_first_batch_pseudo(logger, cfg, train_dataset):
             "first batch CCR IoU = "
             + ",".join(f"{float(value):.4f}" for value in batch["ccr_iou_fixed_despl"])
         )
+    if getattr(cfg, "USE_DREPP", False):
+        logger.log(
+            "first batch DRE++ p_despl_area = "
+            + ",".join(f"{float(value):.6f}" for value in batch["drepp_p_despl_area"])
+        )
+        logger.log(
+            "first batch DRE++ fixed_local_area = "
+            + ",".join(f"{float(value):.6f}" for value in batch["drepp_fixed_local_area"])
+        )
+        logger.log(
+            "first batch DRE++ core_fg_area = "
+            + ",".join(f"{float(value):.6f}" for value in batch["drepp_core_fg_area"])
+        )
+        logger.log(
+            "first batch DRE++ core_bg_area = "
+            + ",".join(f"{float(value):.6f}" for value in batch["drepp_core_bg_area"])
+        )
+        logger.log(
+            "first batch DRE++ uncertain_area = "
+            + ",".join(f"{float(value):.6f}" for value in batch["drepp_uncertain_area"])
+        )
+        logger.log(
+            "first batch DRE++ boundary_band_area = "
+            + ",".join(f"{float(value):.6f}" for value in batch["drepp_boundary_band_area"])
+        )
+        logger.log(f"first batch DRE++ global_blend = {batch['drepp_global_blend'].tolist()}")
     if getattr(cfg, "USE_DESPL_PSEUDO", False):
         logger.log(f"first batch pseudo_fixed tensor shape = {list(batch['pseudo_fixed'].shape)}")
         logger.log(f"first batch pseudo_despl tensor shape = {list(batch['pseudo_despl'].shape)}")
+        if getattr(cfg, "USE_DRE_SAFE_PRIOR", False):
+            logger.log(f"first batch pseudo_base tensor shape = {list(batch['pseudo_base'].shape)}")
+            logger.log(f"first batch pseudo_safe tensor shape = {list(batch['pseudo_safe'].shape)}")
+            logger.log(
+                "first batch dre_safe_candidate_ratio = "
+                + ",".join(f"{float(value):.6f}" for value in batch["dre_safe_candidate_ratio"])
+            )
+            logger.log(
+                "first batch dre_safe_fallback = "
+                + ",".join(str(bool(value)) for value in batch["dre_safe_fallback"])
+            )
         logger.log(
             "first batch p_init_area = "
             + ",".join(f"{float(value):.6f}" for value in batch["p_init_area"])
@@ -337,11 +398,181 @@ def apply_ccr_late_override(cfg, mixed_target, teacher_binary, batch, device):
     return mixed_target, float(active_mask.float().mean().item())
 
 
+def compute_late_despl_anchor_loss(cfg, student_logits, batch, device, criterion_none):
+    if not bool(getattr(cfg, "USE_LATE_DESPL_ANCHOR_LOSS", False)):
+        return student_logits.sum() * 0.0
+    pseudo_despl = batch["pseudo_despl"].to(device, non_blocking=True).float()
+    if list(pseudo_despl.shape[-2:]) != list(student_logits.shape[-2:]):
+        pseudo_despl = F.interpolate(
+            pseudo_despl,
+            size=student_logits.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+    anchor_fg = pseudo_despl >= 0.75
+    anchor_bg = pseudo_despl <= 0.10
+    anchor_mask = anchor_fg | anchor_bg
+    if not bool(anchor_mask.any().item()):
+        return student_logits.sum() * 0.0
+    anchor_label = anchor_fg.float()
+    loss_map = criterion_none(student_logits, anchor_label)
+    den = anchor_mask.float().flatten(1).sum(dim=1).clamp_min(1.0)
+    loss_sample = (loss_map * anchor_mask.float()).flatten(1).sum(dim=1) / den
+    return float(getattr(cfg, "LATE_DESPL_ANCHOR_LAMBDA", 0.02)) * loss_sample.mean()
+
+
 def head_gamma_value(model):
     gamma = getattr(model, "gamma", None)
     if gamma is None:
         return None
     return float(gamma.detach().cpu().item())
+
+
+def drepp_restore_core(tensor, core_fg, core_bg):
+    tensor = torch.where(core_fg, torch.ones_like(tensor), tensor)
+    tensor = torch.where(core_bg, torch.zeros_like(tensor), tensor)
+    return tensor.clamp(0.0, 1.0)
+
+
+def drepp_entropy(prob):
+    eps = 1e-6
+    p = prob.clamp(eps, 1.0 - eps)
+    return -(p * torch.log(p) + (1.0 - p) * torch.log(1.0 - p)) / torch.log(
+        torch.tensor(2.0, device=prob.device)
+    )
+
+
+def drepp_quality(prob, mask):
+    active = mask.bool()
+    if not bool(active.any().item()):
+        return 0.0
+    reliability = 1.0 - drepp_entropy(prob)
+    return float(reliability[active].mean().item())
+
+
+def drepp_binary_iou(first, second, mask):
+    active = mask.bool()
+    if not bool(active.any().item()):
+        return 1.0
+    first = first.bool() & active
+    second = second.bool() & active
+    union = (first | second).float().sum().item()
+    if union <= 0:
+        return 1.0
+    return float((first & second).float().sum().item() / union)
+
+
+def drepp_batch_keys(batch):
+    return [(str(dataset), str(stem)) for dataset, stem in zip(batch["dataset"], batch["stem"])]
+
+
+def drepp_memory_batch(memory_bank, batch, device):
+    tensors = []
+    for index, key in enumerate(drepp_batch_keys(batch)):
+        if key not in memory_bank:
+            memory_bank[key] = batch["drepp_memory_init"][index].detach().cpu().float().clone()
+        tensors.append(memory_bank[key])
+    return torch.stack(tensors, dim=0).to(device, non_blocking=True).float()
+
+
+def drepp_apply_fixed_local(memory, fixed_local, core_fg, core_bg, cfg):
+    value = float(getattr(cfg, "DREPP_FIXED_RECALL_VALUE", 0.65))
+    recall = torch.full_like(memory, value)
+    memory = torch.where(fixed_local.bool(), torch.maximum(memory, recall), memory)
+    return drepp_restore_core(memory, core_fg, core_bg)
+
+
+@torch.no_grad()
+def drepp_update_memory(cfg, epoch, memory_bank, batch, teacher_prob, current_memory, device):
+    if epoch <= 5:
+        return current_memory, 0, 0.0, 0.0, 0.0
+    core_fg = batch["drepp_core_fg"].to(device, non_blocking=True).bool()
+    core_bg = batch["drepp_core_bg"].to(device, non_blocking=True).bool()
+    uncertain = batch["drepp_uncertain"].to(device, non_blocking=True).bool()
+    alpha = float(getattr(cfg, "DREPP_MEMORY_ALPHA_LATE", 0.35)) if epoch >= 21 else float(
+        getattr(cfg, "DREPP_MEMORY_ALPHA", 0.20)
+    )
+    margin = float(getattr(cfg, "DREPP_MEMORY_MARGIN", 0.03))
+    iou_th = float(getattr(cfg, "DREPP_MEMORY_IOU_TH", 0.30))
+    conf_th = float(getattr(cfg, "DREPP_MEMORY_CONF_TH", 0.45))
+    updated_memory = current_memory.clone()
+    accepted = 0
+    quality_teacher_sum = 0.0
+    quality_memory_sum = 0.0
+    iou_sum = 0.0
+    keys = drepp_batch_keys(batch)
+    for index, key in enumerate(keys):
+        mask = uncertain[index]
+        teacher_i = teacher_prob[index]
+        memory_i = current_memory[index]
+        q_teacher = drepp_quality(teacher_i, mask)
+        q_memory = drepp_quality(memory_i, mask)
+        iou = drepp_binary_iou(
+            teacher_i > float(cfg.THRESHOLD),
+            memory_i > float(cfg.THRESHOLD),
+            mask,
+        )
+        quality_teacher_sum += q_teacher
+        quality_memory_sum += q_memory
+        iou_sum += iou
+        if q_teacher >= q_memory - margin and iou >= iou_th and q_teacher >= conf_th:
+            proposed = memory_i + alpha * (teacher_i - memory_i)
+            proposed = torch.where(mask, proposed, memory_i)
+            proposed = drepp_restore_core(proposed, core_fg[index], core_bg[index])
+            updated_memory[index] = proposed
+            memory_bank[key] = proposed.detach().cpu().float()
+            accepted += 1
+    num = max(len(keys), 1)
+    return (
+        updated_memory,
+        accepted,
+        quality_teacher_sum / num,
+        quality_memory_sum / num,
+        iou_sum / num,
+    )
+
+
+def compute_drepp_local_loss(cfg, epoch, student_logits, teacher_prob, batch, device, criterion_none):
+    if not bool(getattr(cfg, "USE_LOCAL_REFINE", False)):
+        return student_logits.sum() * 0.0, 0.0
+    if epoch < int(getattr(cfg, "DREPP_LOCAL_START_EPOCH", 6)):
+        return student_logits.sum() * 0.0, 0.0
+    lambda_local = float(getattr(cfg, "DREPP_LAMBDA_LOCAL", 0.0))
+    if lambda_local <= 0.0:
+        return student_logits.sum() * 0.0, 0.0
+    band = batch["drepp_boundary_band"].to(device, non_blocking=True).bool()
+    uncertain = batch["drepp_uncertain"].to(device, non_blocking=True).bool()
+    sim = batch["drepp_feature_sim"].to(device, non_blocking=True).float()
+    fg = (teacher_prob >= float(getattr(cfg, "DREPP_LOCAL_FG_TH", 0.70))) & (
+        sim >= float(getattr(cfg, "DREPP_LOCAL_SIM_TH", 0.35))
+    )
+    bg = (teacher_prob <= float(getattr(cfg, "DREPP_LOCAL_BG_TH", 0.30))) & (
+        sim <= float(getattr(cfg, "DREPP_LOCAL_BG_SIM_TH", 0.25))
+    )
+    mask = band & uncertain & (fg | bg)
+    if not bool(mask.any().item()):
+        return student_logits.sum() * 0.0, 0.0
+    label = fg.float()
+    loss_map = criterion_none(student_logits, label)
+    den = mask.float().flatten(1).sum(dim=1).clamp_min(1.0)
+    loss_sample = (loss_map * mask.float()).flatten(1).sum(dim=1) / den
+    return lambda_local * loss_sample.mean(), float(mask.float().mean().item())
+
+
+def compute_drepp_anchor_loss(cfg, student_logits, batch, device, criterion_none):
+    lambda_anchor = float(getattr(cfg, "DREPP_LAMBDA_ANCHOR", 0.0))
+    if lambda_anchor <= 0.0:
+        return student_logits.sum() * 0.0
+    core_fg = batch["drepp_core_fg"].to(device, non_blocking=True).bool()
+    core_bg = batch["drepp_core_bg"].to(device, non_blocking=True).bool()
+    mask = core_fg | core_bg
+    if not bool(mask.any().item()):
+        return student_logits.sum() * 0.0
+    label = core_fg.float()
+    loss_map = criterion_none(student_logits, label)
+    den = mask.float().flatten(1).sum(dim=1).clamp_min(1.0)
+    loss_sample = (loss_map * mask.float()).flatten(1).sum(dim=1) / den
+    return lambda_anchor * loss_sample.mean()
 
 
 def main():
@@ -365,6 +596,12 @@ def main():
     cfg = load_config(args.config)
     if bool(getattr(cfg, "USE_QRA", False)) and bool(getattr(cfg, "USE_CCR", False)):
         raise RuntimeError("USE_QRA=True and USE_CCR=True cannot be combined.")
+    if bool(getattr(cfg, "USE_DREPP", False)) and (
+        bool(getattr(cfg, "USE_QRA", False))
+        or bool(getattr(cfg, "USE_CCR", False))
+        or bool(getattr(cfg, "USE_DESPL_PSEUDO", False))
+    ):
+        raise RuntimeError("USE_DREPP=True cannot be combined with USE_QRA, USE_CCR, or USE_DESPL_PSEUDO.")
     if bool(getattr(cfg, "USE_DESPL_PSEUDO", False)) and (
         bool(getattr(cfg, "USE_QRA", False)) or bool(getattr(cfg, "USE_CCR", False))
     ):
@@ -373,6 +610,8 @@ def main():
         raise RuntimeError("USE_QRA=True cannot be combined with --pseudo_cache_override.")
     if bool(getattr(cfg, "USE_CCR", False)) and args.pseudo_cache_override:
         raise RuntimeError("USE_CCR=True cannot be combined with --pseudo_cache_override.")
+    if bool(getattr(cfg, "USE_DREPP", False)) and args.pseudo_cache_override:
+        raise RuntimeError("USE_DREPP=True cannot be combined with --pseudo_cache_override.")
     if bool(getattr(cfg, "USE_DESPL_PSEUDO", False)) and args.pseudo_cache_override:
         raise RuntimeError("USE_DESPL_PSEUDO=True cannot be combined with --pseudo_cache_override.")
     cfg.PSEUDO_CACHE_OVERRIDE = args.pseudo_cache_override
@@ -407,17 +646,22 @@ def main():
         logger.log("DINO_in_training_loop = false")
         logger.log("train_gt_in_train = false")
         logger.log(f"head_type = {getattr(cfg, 'HEAD_TYPE', 'simple')}")
+        logger.log(f"USE_DREPP={bool(getattr(cfg, 'USE_DREPP', False))}")
         logger.log(f"use_despl_pseudo = {bool(getattr(cfg, 'USE_DESPL_PSEUDO', False))}")
         logger.log(f"use_despl_light_cache = {bool(getattr(cfg, 'USE_DESPL_LIGHT_CACHE', False))}")
+        logger.log(f"use_dre_safe_prior = {bool(getattr(cfg, 'USE_DRE_SAFE_PRIOR', False))}")
         logger.log(f"p_init_mode = {getattr(cfg, 'P_INIT_MODE', 'original_fixed')}")
+        logger.log(f"use_gcm = {bool(getattr(cfg, 'PSEUDO_USE_GCM', False))}")
 
         use_qra = bool(getattr(cfg, "USE_QRA", False))
         use_ccr = bool(getattr(cfg, "USE_CCR", False))
+        use_drepp = bool(getattr(cfg, "USE_DREPP", False))
         use_despl = bool(getattr(cfg, "USE_DESPL_PSEUDO", False))
+        use_dre_safe = use_despl and bool(getattr(cfg, "USE_DRE_SAFE_PRIOR", False))
         use_despl_light = use_despl and bool(getattr(cfg, "USE_DESPL_LIGHT_CACHE", False))
 
         # 正式训练循环不加载 DINO，也不读训练集 GT。DESPL 实验只检查现有 cache，不自动生成。
-        if use_despl:
+        if use_despl or use_drepp:
             for split in ("train", "val"):
                 if split == "val" and args.debug_loader_only:
                     continue
@@ -434,6 +678,16 @@ def main():
                 "[Cache] pseudo override enabled | "
                 "skip original pseudo cache generation/check"
             )
+        elif use_drepp:
+            complete, reason = cache_status(cfg, "pseudo")
+            if not complete:
+                raise RuntimeError(f"fixed pseudo cache missing or incomplete: {reason}")
+            logger.log(f"[Cache] pseudo ready | {reason}")
+            _, drepp_reason = check_drepp_cache(
+                cfg,
+                max_samples=sample_limit if sample_limit >= 0 else None,
+            )
+            logger.log(f"[Cache] DRE++ ready | {drepp_reason}")
         elif use_despl:
             if use_despl_light:
                 _, despl_reason = check_despl_light_cache(
@@ -488,6 +742,7 @@ def main():
         best_metric = float("inf")
         best_epoch = 0
         global_step = 0
+        drepp_memory_bank = {}
 
         for epoch in range(1, max_epoch + 1):
             # 对齐 UCOD-DPL：teacher-only 阶段首轮第一个 batch 前重置优化器状态和 EMA 步数。
@@ -532,6 +787,30 @@ def main():
             despl_p_init_area_sum = 0.0
             despl_p_fixed_area_sum = 0.0
             despl_p_despl_area_sum = 0.0
+            dre_safe_p_base_area_sum = 0.0
+            dre_safe_p_safe_area_sum = 0.0
+            dre_safe_candidate_ratio_sum = 0.0
+            dre_safe_fallback_sum = 0.0
+            dre_safe_cc_base_sum = 0.0
+            dre_safe_cc_safe_sum = 0.0
+            dre_safe_delta_sum = 0.0
+            dre_safe_changed_ratio_sum = 0.0
+            drepp_num_samples = 0
+            drepp_p_despl_area_sum = 0.0
+            drepp_p_fixed_area_sum = 0.0
+            drepp_core_fg_area_sum = 0.0
+            drepp_core_bg_area_sum = 0.0
+            drepp_uncertain_area_sum = 0.0
+            drepp_fixed_local_area_sum = 0.0
+            drepp_boundary_band_area_sum = 0.0
+            drepp_fixed_local_ratio_sum = 0.0
+            drepp_memory_accept_count = 0
+            drepp_teacher_quality_sum = 0.0
+            drepp_memory_quality_sum = 0.0
+            drepp_iou_sum = 0.0
+            drepp_local_ratio_sum = 0.0
+            drepp_beta_epoch = 0.0
+            total_local_loss = 0.0
 
             for batch in train_loader:
                 feature = batch["feature"].to(device, non_blocking=True).float()
@@ -542,7 +821,8 @@ def main():
                 student_logits = student(feature_68)
                 with torch.no_grad():
                     teacher_logits = teacher(feature_68)
-                    teacher_binary = (teacher_logits.sigmoid() > float(cfg.THRESHOLD)).float()
+                    teacher_prob = teacher_logits.sigmoid()
+                    teacher_binary = (teacher_prob > float(cfg.THRESHOLD)).float()
 
                 fixed_target = pseudo_68
                 if use_ccr:
@@ -554,7 +834,50 @@ def main():
                     fixed_target = (1.0 - blend) * pseudo_68 + blend * qra_fused
 
                 late_override_ratio = 0.0
-                if epoch <= 20:
+                if use_drepp:
+                    core_fg = batch["drepp_core_fg"].to(device, non_blocking=True).bool()
+                    core_bg = batch["drepp_core_bg"].to(device, non_blocking=True).bool()
+                    uncertain = batch["drepp_uncertain"].to(device, non_blocking=True).bool()
+                    current_memory = drepp_memory_batch(drepp_memory_bank, batch, device)
+                    (
+                        current_memory,
+                        accepted,
+                        q_teacher,
+                        q_memory,
+                        stable_iou,
+                    ) = drepp_update_memory(
+                        cfg,
+                        epoch,
+                        drepp_memory_bank,
+                        batch,
+                        teacher_prob,
+                        current_memory,
+                        device,
+                    )
+                    if epoch <= 5:
+                        mixed_target = pseudo_68
+                        drepp_beta = 0.0
+                    else:
+                        fixed_local = batch["drepp_fixed_local_recall"].to(device, non_blocking=True).bool()
+                        memory_target = drepp_apply_fixed_local(current_memory, fixed_local, core_fg, core_bg, cfg)
+                        if epoch <= 20:
+                            drepp_beta = min(
+                                teacher_weight,
+                                float(getattr(cfg, "DREPP_TEACHER_BETA_MAX", 0.35)),
+                            )
+                        else:
+                            drepp_beta = float(getattr(cfg, "DREPP_TEACHER_BETA_LATE", 0.65))
+                        uncertain_target = (1.0 - drepp_beta) * memory_target + drepp_beta * teacher_prob
+                        mixed_target = torch.where(uncertain, uncertain_target, memory_target)
+                    mixed_target = drepp_restore_core(mixed_target, core_fg, core_bg)
+                    batch_size_drepp = int(batch["drepp_p_despl_area"].numel())
+                    drepp_num_samples += batch_size_drepp
+                    drepp_memory_accept_count += int(accepted)
+                    drepp_teacher_quality_sum += float(q_teacher) * batch_size_drepp
+                    drepp_memory_quality_sum += float(q_memory) * batch_size_drepp
+                    drepp_iou_sum += float(stable_iou) * batch_size_drepp
+                    drepp_beta_epoch = drepp_beta
+                elif epoch <= 20:
                     mixed_target = fixed_weight * fixed_target + teacher_weight * teacher_binary
                 else:
                     mixed_target = teacher_binary
@@ -591,6 +914,39 @@ def main():
                     loss_anchor = student_logits.sum() * 0.0
                     loss_soft = student_logits.sum() * 0.0
                     loss = loss_base
+                if (
+                    use_despl
+                    and bool(getattr(cfg, "USE_LATE_DESPL_ANCHOR_LOSS", False))
+                    and epoch > 20
+                ):
+                    loss_anchor = loss_anchor + compute_late_despl_anchor_loss(
+                        cfg,
+                        student_logits,
+                        batch,
+                        device,
+                        criterion_none,
+                    )
+                    loss = loss + loss_anchor
+                loss_local = student_logits.sum() * 0.0
+                if use_drepp:
+                    loss_local, local_ratio = compute_drepp_local_loss(
+                        cfg,
+                        epoch,
+                        student_logits,
+                        teacher_prob,
+                        batch,
+                        device,
+                        criterion_none,
+                    )
+                    loss_anchor = loss_anchor + compute_drepp_anchor_loss(
+                        cfg,
+                        student_logits,
+                        batch,
+                        device,
+                        criterion_none,
+                    )
+                    loss = loss + loss_local + loss_anchor
+                    drepp_local_ratio_sum += float(local_ratio)
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -604,6 +960,7 @@ def main():
                 total_base_loss += float(loss_base.item())
                 total_anchor_loss += float(loss_anchor.item())
                 total_soft_loss += float(loss_soft.item())
+                total_local_loss += float(loss_local.item())
                 num_batches += 1
                 if use_qra:
                     quality_cpu = batch["qra_quality"]
@@ -630,6 +987,24 @@ def main():
                     despl_p_init_area_sum += float(batch["p_init_area"].sum().item())
                     despl_p_fixed_area_sum += float(batch["p_fixed_area"].sum().item())
                     despl_p_despl_area_sum += float(batch["p_despl_area"].sum().item())
+                    if use_dre_safe:
+                        dre_safe_p_base_area_sum += float(batch["dre_safe_area_base"].sum().item())
+                        dre_safe_p_safe_area_sum += float(batch["dre_safe_area_safe"].sum().item())
+                        dre_safe_candidate_ratio_sum += float(batch["dre_safe_candidate_ratio"].sum().item())
+                        dre_safe_fallback_sum += float(batch["dre_safe_fallback"].float().sum().item())
+                        dre_safe_cc_base_sum += float(batch["dre_safe_cc_base"].float().sum().item())
+                        dre_safe_cc_safe_sum += float(batch["dre_safe_cc_safe"].float().sum().item())
+                        dre_safe_delta_sum += float(batch["dre_safe_positive_delta_mean"].sum().item())
+                        dre_safe_changed_ratio_sum += float(batch["dre_safe_changed_ratio"].sum().item())
+                if use_drepp:
+                    drepp_p_despl_area_sum += float(batch["drepp_p_despl_area"].sum().item())
+                    drepp_p_fixed_area_sum += float(batch["drepp_p_fixed_area"].sum().item())
+                    drepp_core_fg_area_sum += float(batch["drepp_core_fg_area"].sum().item())
+                    drepp_core_bg_area_sum += float(batch["drepp_core_bg_area"].sum().item())
+                    drepp_uncertain_area_sum += float(batch["drepp_uncertain_area"].sum().item())
+                    drepp_fixed_local_area_sum += float(batch["drepp_fixed_local_area"].sum().item())
+                    drepp_boundary_band_area_sum += float(batch["drepp_boundary_band_area"].sum().item())
+                    drepp_fixed_local_ratio_sum += float(batch["drepp_fixed_local_ratio"].sum().item())
 
             avg_loss = total_loss / max(num_batches, 1)
             logger.log(
@@ -664,16 +1039,72 @@ def main():
                     f"head_gamma={gamma_text}"
                 )
             if use_despl:
+                fixed_weight_in_init = float(getattr(cfg, "P_INIT_FIXED_WEIGHT", 0.2))
+                use_fixed_in_pseudo = (
+                    str(getattr(cfg, "P_INIT_MODE", "")) != "despl_only"
+                    and abs(fixed_weight_in_init) > 0.0
+                )
                 logger.log(
                     f"[DESPL] epoch={epoch:03d} | "
                     "use_despl_pseudo=True | "
                     f"use_despl_light_cache={use_despl_light} | "
                     f"p_init_mode={getattr(cfg, 'P_INIT_MODE', 'despl_fixed_blend')} | "
+                    f"use_fixed_in_pseudo={use_fixed_in_pseudo} | "
+                    f"fixed_used_for_training={use_fixed_in_pseudo} | "
+                    f"use_gcm={bool(getattr(cfg, 'PSEUDO_USE_GCM', False))} | "
                     f"p_init_area_mean={despl_p_init_area_sum / max(despl_num_samples, 1):.6f} | "
                     f"p_fixed_area_mean={despl_p_fixed_area_sum / max(despl_num_samples, 1):.6f} | "
                     f"p_despl_area_mean={despl_p_despl_area_sum / max(despl_num_samples, 1):.6f} | "
                     f"fixed_weight={fixed_weight:.2f} | "
                     f"teacher_weight={teacher_weight:.2f}"
+                )
+            if use_dre_safe:
+                logger.log(
+                    f"[DRE_SAFE] epoch={epoch:03d} | "
+                    "use_dre_safe_prior=True | "
+                    f"p_init_mode={getattr(cfg, 'P_INIT_MODE', 'safe_despl_residual')} | "
+                    f"p_base_area_mean={dre_safe_p_base_area_sum / max(despl_num_samples, 1):.6f} | "
+                    f"p_safe_area_mean={dre_safe_p_safe_area_sum / max(despl_num_samples, 1):.6f} | "
+                    f"safe_candidate_ratio_mean={dre_safe_candidate_ratio_sum / max(despl_num_samples, 1):.6f} | "
+                    f"safe_fallback_ratio={dre_safe_fallback_sum / max(despl_num_samples, 1):.6f} | "
+                    f"cc_base_mean={dre_safe_cc_base_sum / max(despl_num_samples, 1):.6f} | "
+                    f"cc_safe_mean={dre_safe_cc_safe_sum / max(despl_num_samples, 1):.6f} | "
+                    f"safe_positive_delta_mean={dre_safe_delta_sum / max(despl_num_samples, 1):.6f} | "
+                    f"safe_changed_ratio_mean={dre_safe_changed_ratio_sum / max(despl_num_samples, 1):.6f} | "
+                    f"fixed_weight={fixed_weight:.2f} | "
+                    f"teacher_weight={teacher_weight:.2f} | "
+                    f"use_late_despl_anchor_loss={bool(getattr(cfg, 'USE_LATE_DESPL_ANCHOR_LOSS', False))}"
+                )
+            if use_drepp:
+                memory_update_ratio = drepp_memory_accept_count / max(drepp_num_samples, 1)
+                logger.log(
+                    f"[DREPP] epoch={epoch:03d} | "
+                    "USE_DREPP=True | "
+                    "DESPL-core active=true | "
+                    "memory initialized=true | "
+                    "teacher_uncertain_only=true | "
+                    "fixed_local_only=true | "
+                    f"local_refine={bool(getattr(cfg, 'USE_LOCAL_REFINE', False))} | "
+                    "anchor_protected=true | "
+                    "global_blend=false | "
+                    f"memory_update_ratio={memory_update_ratio:.6f} | "
+                    f"teacher_accept_ratio={memory_update_ratio:.6f} | "
+                    f"teacher_q={drepp_teacher_quality_sum / max(drepp_num_samples, 1):.6f} | "
+                    f"memory_q={drepp_memory_quality_sum / max(drepp_num_samples, 1):.6f} | "
+                    f"stable_iou={drepp_iou_sum / max(drepp_num_samples, 1):.6f} | "
+                    f"uncertain_ratio={drepp_uncertain_area_sum / max(drepp_num_samples, 1):.6f} | "
+                    f"despl_area={drepp_p_despl_area_sum / max(drepp_num_samples, 1):.6f} | "
+                    f"fixed_area={drepp_p_fixed_area_sum / max(drepp_num_samples, 1):.6f} | "
+                    f"core_fg_area={drepp_core_fg_area_sum / max(drepp_num_samples, 1):.6f} | "
+                    f"core_bg_area={drepp_core_bg_area_sum / max(drepp_num_samples, 1):.6f} | "
+                    f"fixed_local_area={drepp_fixed_local_area_sum / max(drepp_num_samples, 1):.6f} | "
+                    f"fixed_local_ratio={drepp_fixed_local_ratio_sum / max(drepp_num_samples, 1):.6f} | "
+                    f"boundary_band_area={drepp_boundary_band_area_sum / max(drepp_num_samples, 1):.6f} | "
+                    f"local_mask_ratio={drepp_local_ratio_sum / max(num_batches, 1):.6f} | "
+                    f"beta={drepp_beta_epoch:.2f} | "
+                    f"loss_base={total_base_loss / max(num_batches, 1):.6f} | "
+                    f"loss_local={total_local_loss / max(num_batches, 1):.6f} | "
+                    f"loss_anchor={total_anchor_loss / max(num_batches, 1):.6f}"
                 )
 
             val_results = {}

@@ -8,23 +8,17 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from scipy.ndimage import label as cc_label
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from common.dataset import CachedTrainDataset  # noqa: E402
 from common.metrics import CODMetrics  # noqa: E402
-from common.utils import (  # noqa: E402
-    build_image_items,
-    ensure_dir,
-    find_gt_path,
-    load_config,
-    manifest_to_map,
-    read_jsonl,
-    torch_load,
-)
+from common.utils import ensure_dir, find_gt_path, load_config  # noqa: E402
 
 
-METHODS = ("p_fixed", "p_despl", "p_gcm", "p_init")
+METHODS = ("p_fixed", "p_despl", "p_base", "p_safe")
 CSV_FIELDS = [
     "scope",
     "dataset",
@@ -37,6 +31,7 @@ CSV_FIELDS = [
     "IoU",
     "Recall",
     "Area",
+    "CC",
     "num_samples",
 ]
 
@@ -45,6 +40,12 @@ def load_gt(path):
     image = Image.open(path).convert("L")
     array = np.asarray(image, dtype=np.float32) / 255.0
     return torch.from_numpy((array > 0.5).astype(np.float32)).unsqueeze(0)
+
+
+def connected_components(mask):
+    array = mask.detach().cpu().numpy().astype(np.uint8).squeeze()
+    _, num = cc_label(array)
+    return int(num)
 
 
 def extra_stats(gt, pred):
@@ -57,6 +58,7 @@ def extra_stats(gt, pred):
         "iou": 1.0 if union == 0 else float(inter / union),
         "recall": 1.0 if gt_count == 0 else float(inter / gt_count),
         "area": float(pred_b.float().mean().item()),
+        "cc": connected_components(pred_b),
     }
 
 
@@ -66,6 +68,7 @@ class Accumulator:
         self.ious = []
         self.recalls = []
         self.areas = []
+        self.ccs = []
         self.count = 0
 
     def step(self, gt, pred):
@@ -74,6 +77,7 @@ class Accumulator:
         self.ious.append(stats["iou"])
         self.recalls.append(stats["recall"])
         self.areas.append(stats["area"])
+        self.ccs.append(stats["cc"])
         self.count += 1
 
     def result(self):
@@ -87,111 +91,106 @@ class Accumulator:
             "IoU": float(np.mean(self.ious)) if self.ious else 0.0,
             "Recall": float(np.mean(self.recalls)) if self.recalls else 0.0,
             "Area": float(np.mean(self.areas)) if self.areas else 0.0,
+            "CC": float(np.mean(self.ccs)) if self.ccs else 0.0,
             "num_samples": int(self.count),
         }
 
 
 def make_row(scope, dataset, method, accumulator):
-    values = accumulator.result()
     return {
         "scope": scope,
         "dataset": dataset,
         "method": method,
-        **values,
+        **accumulator.result(),
     }
 
 
-def pseudo_bank_manifest_path(cfg):
-    root = getattr(cfg, "PSEUDO_BANK_ROOT", None)
-    if root is None:
-        root = getattr(cfg, "NPER_PSEUDO_BANK_ROOT", None)
-    if root is None:
-        raise AttributeError("Config must define PSEUDO_BANK_ROOT or NPER_PSEUDO_BANK_ROOT.")
-    return Path(root) / cfg.BACKBONE_KEY / "manifest_train.jsonl"
+def sample_pseudos(sample):
+    return {
+        "p_fixed": sample["pseudo_fixed"].float(),
+        "p_despl": sample["pseudo_despl"].float(),
+        "p_base": sample["pseudo_base"].float(),
+        "p_safe": sample["pseudo_safe"].float(),
+    }
 
 
-def eval_nper_pseudo_bank(cfg, max_samples=-1, logger=print):
-    p_init_mode = str(getattr(cfg, "P_INIT_MODE", "quality_fusion"))
-    manifest_path = pseudo_bank_manifest_path(cfg)
-    rows = read_jsonl(manifest_path)
-    row_map = manifest_to_map(rows, manifest_path)
-    items = build_image_items(cfg.DATA_ROOT, cfg.TRAIN_DATASETS, require_gt=False)
-    if max_samples is not None and int(max_samples) >= 0:
-        items = items[: int(max_samples)]
-
+def eval_dre_safe_prior(cfg, max_samples=-1, logger=print):
+    if not bool(getattr(cfg, "USE_DRE_SAFE_PRIOR", False)):
+        raise RuntimeError("eval_dre_safe_prior requires USE_DRE_SAFE_PRIOR=True config.")
+    dataset = CachedTrainDataset(cfg, max_samples=max_samples)
     by_dataset = defaultdict(lambda: {method: Accumulator() for method in METHODS})
     overall = {method: Accumulator() for method in METHODS}
     logger("train_gt_used = true | diagnostic_only = true")
-    for item in items:
-        key = (item["dataset"], item["stem"])
-        if key not in row_map:
-            raise RuntimeError(f"NPER pseudo bank missing {key}")
-        payload = torch_load(row_map[key]["cache_path"], map_location="cpu")
-        gt_path = find_gt_path(cfg.DATA_ROOT, item["dataset"], item["stem"])
+    logger("use_gcm = false")
+    for index in range(len(dataset)):
+        sample = dataset[index]
+        gt_path = find_gt_path(cfg.DATA_ROOT, sample["dataset"], sample["stem"])
         gt = load_gt(gt_path).float()
-        for method in METHODS:
-            if method == "p_init" and p_init_mode == "despl_only":
-                pseudo = payload["p_despl"].float()
-            else:
-                pseudo = payload[method].float()
-            pseudo = F.interpolate(
+        for method, pseudo in sample_pseudos(sample).items():
+            resized = F.interpolate(
                 pseudo.unsqueeze(0),
                 size=gt.shape[-2:],
                 mode="bilinear",
                 align_corners=False,
             ).squeeze(0)
-            pred = (pseudo > 0.5).float()
-            by_dataset[item["dataset"]][method].step(gt, pred)
+            pred = (resized > 0.5).float()
+            by_dataset[sample["dataset"]][method].step(gt, pred)
             overall[method].step(gt, pred)
 
     out_dir = Path(cfg.WORK_ROOT) / cfg.EXP_NAME / "diagnosis"
     ensure_dir(out_dir)
-    csv_path = out_dir / "pseudo_bank_eval.csv"
-    summary_path = out_dir / "summary.txt"
+    csv_path = out_dir / "dre_safe_prior_eval.csv"
+    summary_path = out_dir / "dre_safe_prior_summary.txt"
 
-    out_rows = []
-    for dataset in sorted(by_dataset):
+    rows = []
+    for dataset_name in sorted(by_dataset):
         for method in METHODS:
-            out_rows.append(make_row("dataset", dataset, method, by_dataset[dataset][method]))
+            rows.append(make_row("dataset", dataset_name, method, by_dataset[dataset_name][method]))
     for method in METHODS:
-        out_rows.append(make_row("overall", "ALL", method, overall[method]))
+        rows.append(make_row("overall", "ALL", method, overall[method]))
 
     with csv_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         writer.writeheader()
-        writer.writerows(out_rows)
+        writer.writerows(rows)
 
-    p_init_equals_p_despl = p_init_mode == "despl_only"
+    overall_rows = {row["method"]: row for row in rows if row["scope"] == "overall"}
+    safe = overall_rows["p_safe"]
+    base = overall_rows["p_base"]
+    recommend_train = safe["M"] <= base["M"] and safe["F_beta^w"] >= base["F_beta^w"]
     lines = [
-        "NPER pseudo bank GT diagnostic",
+        "DRE-SAFE prior GT diagnostic",
         "train_gt_used = true",
-        f"P_INIT_MODE = {p_init_mode}",
-        f"p_init equals p_despl = {p_init_equals_p_despl}",
+        "use_gcm = false",
+        f"recommend_train = {recommend_train}",
         "",
     ]
-    for row in out_rows:
-        if row["scope"] != "overall":
-            continue
+    for method in METHODS:
+        row = overall_rows[method]
         lines.append(
-            f"{row['method']}: S_m={row['S_m']:.4f} Fw={row['F_beta^w']:.4f} "
+            f"{method}: S_m={row['S_m']:.4f} Fw={row['F_beta^w']:.4f} "
             f"Fm={row['F_beta^m']:.4f} E={row['E_phi^m']:.4f} M={row['M']:.4f} "
             f"IoU={row['IoU']:.4f} Recall={row['Recall']:.4f} "
-            f"Area={row['Area']:.4f} n={row['num_samples']}"
+            f"Area={row['Area']:.4f} CC={row['CC']:.4f} n={row['num_samples']}"
         )
+    if not recommend_train:
+        lines.append("")
+        lines.append("WARNING: p_safe is worse than p_base by MAE or Fw; do not train dre_safe yet.")
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     logger(f"wrote_csv = {csv_path}")
     logger(f"wrote_summary = {summary_path}")
+    logger(f"recommend_train = {recommend_train}")
     return csv_path, summary_path
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate NPER pseudo bank against train GT for diagnostics.")
+    parser = argparse.ArgumentParser(description="Evaluate DRE-SAFE pseudo priors against train GT.")
     parser.add_argument("--config", required=True)
     parser.add_argument("--max_samples", type=int, default=-1)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    eval_nper_pseudo_bank(cfg, max_samples=args.max_samples, logger=print)
+    eval_dre_safe_prior(cfg, max_samples=args.max_samples, logger=print)
 
 
 if __name__ == "__main__":

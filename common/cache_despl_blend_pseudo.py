@@ -23,7 +23,19 @@ from common.utils import (  # noqa: E402
 )
 
 
-FORMULA = "resize(clamp(0.8*p_despl + 0.2*p_fixed, 0, 1), 68)"
+def formula_text(cfg):
+    loss_size = int(cfg.LOSS_SIZE)
+    mode = str(getattr(cfg, "P_INIT_MODE", "despl_fixed_blend"))
+    despl_weight = float(getattr(cfg, "P_INIT_DESPL_WEIGHT", 0.8))
+    fixed_weight = float(getattr(cfg, "P_INIT_FIXED_WEIGHT", 0.2))
+    if mode == "despl_only" or (despl_weight == 1.0 and fixed_weight == 0.0):
+        return f"resize(p_despl, {loss_size})"
+    if fixed_weight == 0.0:
+        return f"resize(clamp({despl_weight:g}*p_despl, 0, 1), {loss_size})"
+    return (
+        f"resize(clamp({despl_weight:g}*p_despl + "
+        f"{fixed_weight:g}*p_fixed, 0, 1), {loss_size})"
+    )
 
 
 def _single_channel(payload, name, cache_path):
@@ -93,7 +105,7 @@ def build_light_payload(cfg, item, source_row):
         "shape": list(p_init.shape),
         "source_shape": list(p_despl.shape),
         "source_cache_path": str(Path(source_row["cache_path"]).resolve()),
-        "formula": FORMULA,
+        "formula": formula_text(cfg),
         "p_init_mode": getattr(cfg, "P_INIT_MODE", "despl_fixed_blend"),
         "p_init_despl_weight": despl_weight,
         "p_init_fixed_weight": fixed_weight,
@@ -123,7 +135,7 @@ def generate_despl_blend_cache(cfg, overwrite=False, max_samples=-1, logger=prin
     logger(f"source_manifest = {source_manifest}")
     logger(f"output_root = {out_root}")
     logger(f"loss_size = {int(cfg.LOSS_SIZE)}")
-    logger(f"formula = {FORMULA}")
+    logger(f"formula = {formula_text(cfg)}")
     logger(f"num_items = {len(items)}")
     logger("train_gt_used = false")
 

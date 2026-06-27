@@ -260,6 +260,14 @@ def ccr_manifest_path(cfg):
     return ccr_cache_dir(cfg) / "manifest_train.jsonl"
 
 
+def drepp_cache_dir(cfg):
+    return Path(cfg.DREPP_CACHE_ROOT) / cfg.BACKBONE_KEY
+
+
+def drepp_manifest_path(cfg):
+    return drepp_cache_dir(cfg) / "manifest_train.jsonl"
+
+
 def nper_pseudo_bank_dir(cfg):
     return Path(cfg.PSEUDO_BANK_ROOT) / cfg.BACKBONE_KEY
 
@@ -472,6 +480,89 @@ def check_ccr_cache(cfg, max_samples=None):
     return True, f"complete: {manifest_path}"
 
 
+def _drepp_required_shapes(cfg):
+    size = int(cfg.LOSS_SIZE)
+    return {
+        "p_despl": [1, size, size],
+        "p_fixed": [1, size, size],
+        "core_fg": [1, size, size],
+        "core_bg": [1, size, size],
+        "uncertain": [1, size, size],
+        "fixed_local_recall": [1, size, size],
+        "boundary_band": [1, size, size],
+        "memory_init": [1, size, size],
+        "feature_sim": [1, size, size],
+    }
+
+
+def _drepp_error(reason):
+    return (
+        f"DRE++ cache missing or incomplete: {reason}\n"
+        "Please run:\n"
+        "python common/cache_drepp_pseudo.py --config configs/drepp_v1.py --overwrite"
+    )
+
+
+def check_drepp_cache(cfg, max_samples=None):
+    manifest_path = drepp_manifest_path(cfg)
+    if not manifest_path.exists():
+        raise RuntimeError(_drepp_error(f"missing manifest: {manifest_path}"))
+
+    expected_items = build_image_items(cfg.DATA_ROOT, cfg.TRAIN_DATASETS, require_gt=False)
+    if max_samples is not None and int(max_samples) >= 0:
+        expected_items = expected_items[: int(max_samples)]
+    expected_keys = [(item["dataset"], item["stem"]) for item in expected_items]
+    expected_key_set = set(expected_keys)
+
+    rows = read_jsonl(manifest_path)
+    row_map = {}
+    for row in rows:
+        if "dataset" not in row or "stem" not in row:
+            raise RuntimeError(_drepp_error(f"bad manifest row without dataset/stem in {manifest_path}"))
+        key = (row["dataset"], row["stem"])
+        if key in row_map:
+            raise RuntimeError(_drepp_error(f"duplicate manifest key in {manifest_path}: {key}"))
+        row_map[key] = row
+
+    actual_key_set = set(row_map)
+    if max_samples is None or int(max_samples) < 0:
+        extra = sorted(actual_key_set - expected_key_set)
+        if extra:
+            raise RuntimeError(_drepp_error(f"manifest has unexpected keys first 10: {extra[:10]}"))
+    missing = sorted(expected_key_set - actual_key_set)
+    if missing:
+        raise RuntimeError(_drepp_error(f"missing manifest rows first 10: {missing[:10]}"))
+
+    required_shapes = _drepp_required_shapes(cfg)
+    for key in expected_keys:
+        row = row_map[key]
+        if row.get("backbone_key", cfg.BACKBONE_KEY) != cfg.BACKBONE_KEY:
+            raise RuntimeError(
+                _drepp_error(
+                    f"backbone mismatch for {key}: {row.get('backbone_key')} != {cfg.BACKBONE_KEY}"
+                )
+            )
+        if row.get("global_blend", False):
+            raise RuntimeError(_drepp_error(f"global_blend must be false for {key}"))
+        cache_path = row.get("cache_path")
+        if not cache_path:
+            raise RuntimeError(_drepp_error(f"missing cache_path for {key}"))
+        if not Path(cache_path).exists():
+            raise RuntimeError(_drepp_error(f"missing cache file: {cache_path}"))
+        shape = row.get("shape")
+        if not isinstance(shape, dict):
+            raise RuntimeError(_drepp_error(f"missing or invalid shape dict for {key}"))
+        for name, expected_shape in required_shapes.items():
+            if shape.get(name) != expected_shape:
+                raise RuntimeError(
+                    _drepp_error(
+                        f"invalid shape for {key} {name}: {shape.get(name)} != {expected_shape}"
+                    )
+                )
+
+    return True, f"complete: {manifest_path}"
+
+
 def _nper_required_shapes(cfg):
     size = int(cfg.LOSS_SIZE)
     return {
@@ -661,6 +752,10 @@ def check_despl_light_cache(cfg, max_samples=None):
         raise RuntimeError(_despl_light_error(f"missing manifest rows first 10: {missing[:10]}"))
 
     expected_shape = [1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE)]
+    require_p_despl_68 = (
+        bool(getattr(cfg, "USE_DESPL_PSEUDO", False))
+        and str(getattr(cfg, "P_INIT_MODE", "")) == "despl_only"
+    )
     for key in expected_keys:
         row = row_map[key]
         if row.get("backbone_key", cfg.BACKBONE_KEY) != cfg.BACKBONE_KEY:
@@ -677,6 +772,17 @@ def check_despl_light_cache(cfg, max_samples=None):
         shape = row.get("shape")
         if shape != expected_shape:
             raise RuntimeError(_despl_light_error(f"invalid shape for {key}: {shape} != {expected_shape}"))
+        if require_p_despl_68:
+            payload = torch_load(cache_path, map_location="cpu")
+            tensor = payload.get("p_despl_68") if isinstance(payload, dict) else None
+            if not torch.is_tensor(tensor):
+                raise RuntimeError(_despl_light_error(f"missing p_despl_68 for {key}: {cache_path}"))
+            if list(tensor.shape) != expected_shape:
+                raise RuntimeError(
+                    _despl_light_error(
+                        f"invalid p_despl_68 shape for {key}: {list(tensor.shape)} != {expected_shape}"
+                    )
+                )
 
     return True, f"complete: {manifest_path}"
 
