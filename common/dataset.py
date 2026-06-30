@@ -491,6 +491,13 @@ def _load_gt(gt_path):
     return torch.from_numpy(array).unsqueeze(0)
 
 
+def _load_image_68(image_path, loss_size):
+    image = Image.open(image_path).convert("RGB")
+    image = image.resize((int(loss_size), int(loss_size)), resample=Image.BILINEAR)
+    array = np.asarray(image, dtype=np.float32) / 255.0
+    return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+
+
 class CachedTrainDataset(Dataset):
     def __init__(self, cfg, max_samples=-1):
         self.cfg = cfg
@@ -504,6 +511,7 @@ class CachedTrainDataset(Dataset):
         self.use_dre_safe_prior = self.use_despl_pseudo and bool(getattr(cfg, "USE_DRE_SAFE_PRIOR", False))
         self.use_despl_light_cache = self.use_despl_pseudo and bool(getattr(cfg, "USE_DESPL_LIGHT_CACHE", False))
         self.use_multi_level_feature = bool(getattr(cfg, "USE_MULTI_LEVEL_FEATURE", False))
+        self.use_ndr_branch = bool(getattr(cfg, "USE_NDR_BRANCH", False))
         self.multi_level_layers = [int(layer) for layer in getattr(cfg, "MULTI_LEVEL_LAYERS", [4, 8, 12])]
         if self.use_qra and self.use_ccr:
             raise RuntimeError("USE_QRA=True and USE_CCR=True cannot be combined.")
@@ -960,6 +968,8 @@ class CachedTrainDataset(Dataset):
             "stem": stem,
             "image_path": item["image_path"],
         }
+        if self.use_ndr_branch:
+            sample["image_68"] = _load_image_68(item["image_path"], int(self.cfg.LOSS_SIZE))
         if self.use_multi_level_feature:
             sample.update(
                 {
@@ -1086,6 +1096,7 @@ class CachedEvalDataset(Dataset):
             raise RuntimeError(f"{split} dataset is empty.")
         self.keys = [(item["dataset"], item["stem"]) for item in self.items]
         self.use_multi_level_feature = bool(getattr(cfg, "USE_MULTI_LEVEL_FEATURE", False))
+        self.use_ndr_branch = bool(getattr(cfg, "USE_NDR_BRANCH", False))
         self.multi_level_layers = [int(layer) for layer in getattr(cfg, "MULTI_LEVEL_LAYERS", [4, 8, 12])]
 
         feature_manifest = (
@@ -1138,6 +1149,8 @@ class CachedEvalDataset(Dataset):
             "gt_path": item["gt_path"],
             "original_size": original_size,
         }
+        if self.use_ndr_branch:
+            sample["image_68"] = _load_image_68(item["image_path"], int(self.cfg.LOSS_SIZE))
         if self.use_multi_level_feature:
             sample.update(
                 {

@@ -104,6 +104,120 @@ class DINOAffinityGraphPropagationHead(nn.Module):
         return base_logits + self.alpha.to(dtype=graph_logits.dtype) * graph_logits
 
 
+class NativeDetailResidualBranch(nn.Module):
+    def __init__(
+        self,
+        in_channels=5,
+        hidden=32,
+        num_layers=3,
+        use_gn=True,
+        gn_groups=4,
+        act="gelu",
+        zero_init_out=True,
+        residual_clip=2.0,
+        input_rgb=True,
+        input_sobel=True,
+        input_coarse_prob=True,
+    ):
+        super().__init__()
+        if int(hidden) <= 0:
+            raise ValueError(f"NDR_HIDDEN must be positive, got {hidden}")
+        if int(num_layers) != 3:
+            raise ValueError(f"NDR_NUM_LAYERS=3 is required for the native detail branch, got {num_layers}")
+        if float(residual_clip) <= 0.0:
+            raise ValueError(f"NDR_RESIDUAL_CLIP must be positive, got {residual_clip}")
+        self.input_rgb = bool(input_rgb)
+        self.input_sobel = bool(input_sobel)
+        self.input_coarse_prob = bool(input_coarse_prob)
+        expected_channels = 0
+        expected_channels += 3 if self.input_rgb else 0
+        expected_channels += 1 if self.input_sobel else 0
+        expected_channels += 1 if self.input_coarse_prob else 0
+        if int(in_channels) != expected_channels:
+            raise ValueError(
+                f"NDR_IN_CHANNELS={in_channels} does not match enabled inputs "
+                f"({expected_channels} channels)"
+            )
+        self.in_channels = int(in_channels)
+        self.hidden = int(hidden)
+        self.mid_channels = max(1, self.hidden // 2)
+        self.use_gn = bool(use_gn)
+        self.gn_groups = int(gn_groups)
+        self.act_name = str(act).lower()
+        self.residual_clip = float(residual_clip)
+
+        self.block1 = self._block(self.in_channels, self.hidden)
+        self.block2 = self._block(self.hidden, self.hidden)
+        self.block3 = self._block(self.hidden, self.mid_channels)
+        self.out_conv = nn.Conv2d(self.mid_channels, 1, kernel_size=1)
+        if bool(zero_init_out):
+            nn.init.zeros_(self.out_conv.weight)
+            nn.init.zeros_(self.out_conv.bias)
+
+        sobel_x = torch.tensor(
+            [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]],
+            dtype=torch.float32,
+        ).unsqueeze(0)
+        sobel_y = torch.tensor(
+            [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]],
+            dtype=torch.float32,
+        ).unsqueeze(0)
+        self.register_buffer("sobel_x", sobel_x)
+        self.register_buffer("sobel_y", sobel_y)
+
+    def _activation(self):
+        if self.act_name == "gelu":
+            return nn.GELU()
+        if self.act_name == "relu":
+            return nn.ReLU(inplace=True)
+        raise ValueError(f"Unsupported NDR_ACT: {self.act_name}")
+
+    def _norm(self, channels):
+        if not self.use_gn:
+            return nn.Identity()
+        groups = max(1, min(self.gn_groups, channels))
+        while channels % groups != 0 and groups > 1:
+            groups -= 1
+        return nn.GroupNorm(groups, channels)
+
+    def _block(self, in_channels, out_channels):
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            self._norm(out_channels),
+            self._activation(),
+        )
+
+    def compute_sobel(self, image_68):
+        if image_68.ndim != 4 or image_68.shape[1] != 3:
+            raise ValueError(f"NDR image_68 must be [B,3,H,W], got {list(image_68.shape)}")
+        gray = (
+            0.299 * image_68[:, 0:1]
+            + 0.587 * image_68[:, 1:2]
+            + 0.114 * image_68[:, 2:3]
+        )
+        sobel_x = self.sobel_x.to(device=gray.device, dtype=gray.dtype)
+        sobel_y = self.sobel_y.to(device=gray.device, dtype=gray.dtype)
+        dx = F.conv2d(gray, sobel_x, padding=1)
+        dy = F.conv2d(gray, sobel_y, padding=1)
+        sobel_mag = torch.sqrt(dx * dx + dy * dy + 1e-6)
+        sobel_mag = sobel_mag / (sobel_mag.amax(dim=(2, 3), keepdim=True) + 1e-6)
+        return torch.clamp(sobel_mag, 0.0, 1.0)
+
+    def forward(self, image_68, coarse_prob_68):
+        sobel_68 = self.compute_sobel(image_68)
+        inputs = []
+        if self.input_rgb:
+            inputs.append(image_68)
+        if self.input_sobel:
+            inputs.append(sobel_68)
+        if self.input_coarse_prob:
+            inputs.append(coarse_prob_68)
+        ndr_input = torch.cat(inputs, dim=1)
+        raw_residual = self.out_conv(self.block3(self.block2(self.block1(ndr_input))))
+        residual = raw_residual.tanh() * raw_residual.new_tensor(self.residual_clip)
+        return residual, sobel_68
+
+
 class DAGPSafeHead(nn.Module):
     def __init__(
         self,
@@ -128,6 +242,26 @@ class DAGPSafeHead(nn.Module):
         uncertainty_min=0.0,
         uncertainty_max=1.0,
         uncertainty_detach=True,
+        use_ndr_branch=False,
+        ndr_loss_size=68,
+        ndr_input_rgb=True,
+        ndr_input_sobel=True,
+        ndr_input_coarse_prob=True,
+        ndr_in_channels=5,
+        ndr_hidden=32,
+        ndr_num_layers=3,
+        ndr_use_gn=True,
+        ndr_gn_groups=4,
+        ndr_act="gelu",
+        ndr_zero_init_out=True,
+        ndr_residual_clip=2.0,
+        ndr_beta_max=0.10,
+        ndr_warmup_epoch=6,
+        ndr_ramp_start_epoch=7,
+        ndr_ramp_end_epoch=15,
+        ndr_use_uncertainty_gate=True,
+        ndr_use_edge_gate=True,
+        ndr_gate_mode="uncertainty_edge_boost",
     ):
         super().__init__()
         if int(hidden) <= 0:
@@ -164,12 +298,43 @@ class DAGPSafeHead(nn.Module):
         self.uncertainty_min = float(uncertainty_min)
         self.uncertainty_max = float(uncertainty_max)
         self.uncertainty_detach = bool(uncertainty_detach)
+        self.use_ndr_branch = bool(use_ndr_branch)
+        self.ndr_loss_size = int(ndr_loss_size)
+        self.ndr_beta_max = float(ndr_beta_max)
+        self.ndr_warmup_epoch = int(ndr_warmup_epoch)
+        self.ndr_ramp_start_epoch = int(ndr_ramp_start_epoch)
+        self.ndr_ramp_end_epoch = int(ndr_ramp_end_epoch)
+        self.ndr_use_uncertainty_gate = bool(ndr_use_uncertainty_gate)
+        self.ndr_use_edge_gate = bool(ndr_use_edge_gate)
+        self.ndr_gate_mode = str(ndr_gate_mode)
 
         self.base_head = nn.Conv2d(in_channels, 1, kernel_size=1)
         self.proj = nn.Conv2d(in_channels, self.hidden, kernel_size=1)
         self.value = nn.Linear(self.hidden, self.hidden)
         self.graph_pred = nn.Conv2d(self.hidden, 1, kernel_size=1)
         self.register_buffer("current_epoch_tensor", torch.zeros(1, dtype=torch.float32))
+        if self.use_ndr_branch:
+            if self.ndr_loss_size <= 0:
+                raise ValueError(f"LOSS_SIZE for NDR must be positive, got {self.ndr_loss_size}")
+            if self.ndr_beta_max < 0.0:
+                raise ValueError(f"NDR_BETA_MAX must be non-negative, got {self.ndr_beta_max}")
+            if self.ndr_gate_mode != "uncertainty_edge_boost":
+                raise ValueError(f"Unsupported NDR_GATE_MODE: {self.ndr_gate_mode}")
+            self.ndr_branch = NativeDetailResidualBranch(
+                in_channels=int(ndr_in_channels),
+                hidden=int(ndr_hidden),
+                num_layers=int(ndr_num_layers),
+                use_gn=bool(ndr_use_gn),
+                gn_groups=int(ndr_gn_groups),
+                act=str(ndr_act),
+                zero_init_out=bool(ndr_zero_init_out),
+                residual_clip=float(ndr_residual_clip),
+                input_rgb=bool(ndr_input_rgb),
+                input_sobel=bool(ndr_input_sobel),
+                input_coarse_prob=bool(ndr_input_coarse_prob),
+            )
+        else:
+            self.ndr_branch = None
 
         if bool(zero_init_graph_pred):
             nn.init.zeros_(self.graph_pred.weight)
@@ -191,6 +356,20 @@ class DAGPSafeHead(nn.Module):
             return 0.0
         denom = max(1, self.ramp_end_epoch - self.ramp_start_epoch + 1)
         return float(epoch - self.ramp_start_epoch + 1) / float(denom)
+
+    def _ndr_ramp_scale(self):
+        epoch = int(self.current_epoch_tensor.item())
+        if epoch <= self.ndr_warmup_epoch:
+            return 0.0
+        if epoch >= self.ndr_ramp_end_epoch:
+            return 1.0
+        if epoch < self.ndr_ramp_start_epoch:
+            return 0.0
+        denom = max(1, self.ndr_ramp_end_epoch - self.ndr_ramp_start_epoch + 1)
+        return float(epoch - self.ndr_ramp_start_epoch + 1) / float(denom)
+
+    def _ndr_beta_eff(self):
+        return self.ndr_beta_max * self._ndr_ramp_scale()
 
     @staticmethod
     def _gather_neighbors(v, idx):
@@ -275,7 +454,83 @@ class DAGPSafeHead(nn.Module):
             "uncertainty_gate_max": unc_max,
         }
 
-    def forward(self, feat, return_aux=False):
+    @staticmethod
+    def _tensor_stats(tensor):
+        tensor_detached = tensor.detach()
+        return tensor_detached.mean(), tensor_detached.min(), tensor_detached.max()
+
+    def _apply_ndr(
+        self,
+        coarse_logits_37,
+        image_68,
+        base_logits,
+        graph_logits,
+        scale,
+        alpha_eff,
+        gamma_eff,
+        uncertainty_gate,
+        return_aux,
+    ):
+        if image_68 is None:
+            raise ValueError("NDR branch requires image_68")
+        if image_68.ndim != 4 or image_68.shape[1] != 3:
+            raise ValueError(f"NDR image_68 must be [B,3,H,W], got {list(image_68.shape)}")
+        target_size = (self.ndr_loss_size, self.ndr_loss_size)
+        if tuple(image_68.shape[-2:]) != target_size:
+            raise ValueError(
+                f"NDR image_68 spatial size must be {target_size}, got {tuple(image_68.shape[-2:])}"
+            )
+        coarse_logits_68 = F.interpolate(
+            coarse_logits_37,
+            size=target_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        coarse_prob_68 = torch.sigmoid(coarse_logits_68.detach())
+        residual_logits_68, sobel_68 = self.ndr_branch(image_68.to(dtype=coarse_logits_68.dtype), coarse_prob_68)
+
+        if self.ndr_use_uncertainty_gate:
+            uncertainty = 1.0 - 2.0 * torch.abs(coarse_prob_68 - 0.5)
+            uncertainty = torch.clamp(uncertainty, 0.0, 1.0)
+        else:
+            uncertainty = torch.ones_like(coarse_prob_68)
+        edge_gate = 0.5 + 0.5 * sobel_68 if self.ndr_use_edge_gate else torch.ones_like(sobel_68)
+        detail_gate = torch.clamp(uncertainty * edge_gate, 0.0, 1.0)
+        beta_eff = self._ndr_beta_eff()
+        logits = coarse_logits_68 + coarse_logits_68.new_tensor(float(beta_eff)) * detail_gate * residual_logits_68
+
+        if not return_aux:
+            return logits
+
+        output = self._aux_output(
+            logits,
+            base_logits,
+            graph_logits,
+            scale,
+            alpha_eff,
+            gamma_eff,
+            uncertainty_gate,
+        )
+        gate_mean, gate_min, gate_max = self._tensor_stats(detail_gate)
+        residual_abs = residual_logits_68.detach().abs()
+        output.update(
+            {
+                "coarse_logits_37": coarse_logits_37,
+                "coarse_logits_68": coarse_logits_68,
+                "residual_logits_68": residual_logits_68,
+                "detail_gate": detail_gate,
+                "sobel_68": sobel_68,
+                "ndr_beta_eff": coarse_logits_68.new_tensor(float(beta_eff)),
+                "ndr_detail_gate_mean": gate_mean,
+                "ndr_detail_gate_min": gate_min,
+                "ndr_detail_gate_max": gate_max,
+                "ndr_residual_abs_mean": residual_abs.mean(),
+                "ndr_residual_abs_max": residual_abs.max(),
+            }
+        )
+        return output
+
+    def forward(self, feat, image_68=None, return_aux=False):
         bsz, _, height, width = feat.shape
         base_logits = self.base_head(feat)
         scale = self._ramp_scale()
@@ -283,8 +538,20 @@ class DAGPSafeHead(nn.Module):
         gamma_eff = self.gamma_max * scale
 
         if alpha_eff == 0.0 or gamma_eff == 0.0:
+            graph_logits = torch.zeros_like(base_logits)
+            if self.use_ndr_branch:
+                return self._apply_ndr(
+                    base_logits,
+                    image_68,
+                    base_logits,
+                    graph_logits,
+                    scale,
+                    alpha_eff,
+                    gamma_eff,
+                    self._uncertainty_output_gate(base_logits),
+                    return_aux,
+                )
             if return_aux:
-                graph_logits = torch.zeros_like(base_logits)
                 uncertainty_gate = self._uncertainty_output_gate(base_logits)
                 return self._aux_output(
                     base_logits,
@@ -316,6 +583,18 @@ class DAGPSafeHead(nn.Module):
         uncertainty_gate = self._uncertainty_output_gate(base_logits)
         graph_residual = graph_logits if uncertainty_gate is None else uncertainty_gate * graph_logits
         logits = base_logits + graph_logits.new_tensor(float(alpha_eff)) * graph_residual
+        if self.use_ndr_branch:
+            return self._apply_ndr(
+                logits,
+                image_68,
+                base_logits,
+                graph_logits,
+                scale,
+                alpha_eff,
+                gamma_eff,
+                uncertainty_gate,
+                return_aux,
+            )
         if return_aux:
             return self._aux_output(
                 logits,
@@ -853,6 +1132,26 @@ def build_seg_head(in_channels, cfg):
             uncertainty_min=float(getattr(cfg, "DAGP_SAFE_UNCERTAINTY_MIN", 0.0)),
             uncertainty_max=float(getattr(cfg, "DAGP_SAFE_UNCERTAINTY_MAX", 1.0)),
             uncertainty_detach=bool(getattr(cfg, "DAGP_SAFE_UNCERTAINTY_DETACH", True)),
+            use_ndr_branch=bool(getattr(cfg, "USE_NDR_BRANCH", False)),
+            ndr_loss_size=int(getattr(cfg, "LOSS_SIZE", 68)),
+            ndr_input_rgb=bool(getattr(cfg, "NDR_INPUT_RGB", True)),
+            ndr_input_sobel=bool(getattr(cfg, "NDR_INPUT_SOBEL", True)),
+            ndr_input_coarse_prob=bool(getattr(cfg, "NDR_INPUT_COARSE_PROB", True)),
+            ndr_in_channels=int(getattr(cfg, "NDR_IN_CHANNELS", 5)),
+            ndr_hidden=int(getattr(cfg, "NDR_HIDDEN", 32)),
+            ndr_num_layers=int(getattr(cfg, "NDR_NUM_LAYERS", 3)),
+            ndr_use_gn=bool(getattr(cfg, "NDR_USE_GN", True)),
+            ndr_gn_groups=int(getattr(cfg, "NDR_GN_GROUPS", 4)),
+            ndr_act=str(getattr(cfg, "NDR_ACT", "gelu")),
+            ndr_zero_init_out=bool(getattr(cfg, "NDR_ZERO_INIT_OUT", True)),
+            ndr_residual_clip=float(getattr(cfg, "NDR_RESIDUAL_CLIP", 2.0)),
+            ndr_beta_max=float(getattr(cfg, "NDR_BETA_MAX", 0.10)),
+            ndr_warmup_epoch=int(getattr(cfg, "NDR_WARMUP_EPOCH", 6)),
+            ndr_ramp_start_epoch=int(getattr(cfg, "NDR_RAMP_START_EPOCH", 7)),
+            ndr_ramp_end_epoch=int(getattr(cfg, "NDR_RAMP_END_EPOCH", 15)),
+            ndr_use_uncertainty_gate=bool(getattr(cfg, "NDR_USE_UNCERTAINTY_GATE", True)),
+            ndr_use_edge_gate=bool(getattr(cfg, "NDR_USE_EDGE_GATE", True)),
+            ndr_gate_mode=str(getattr(cfg, "NDR_GATE_MODE", "uncertainty_edge_boost")),
         )
     if head_type == "context_residual":
         hidden = int(getattr(cfg, "CONTEXT_HEAD_HIDDEN", 64))

@@ -52,6 +52,10 @@ def use_raw_feature_head(cfg):
     return str(getattr(cfg, "HEAD_TYPE", "simple")).lower() in {"dagp", "dagp_safe"}
 
 
+def use_ndr_branch(cfg):
+    return bool(getattr(cfg, "USE_NDR_BRANCH", False))
+
+
 def make_model_input(cfg, batch, device):
     if use_multi_level_feature(cfg):
         return {
@@ -62,6 +66,14 @@ def make_model_input(cfg, batch, device):
     if use_raw_feature_head(cfg):
         return feature
     return F.interpolate(feature, size=(cfg.LOSS_SIZE, cfg.LOSS_SIZE), mode="bilinear")
+
+
+def make_image_68(cfg, batch, device):
+    if not use_ndr_branch(cfg):
+        return None
+    if "image_68" not in batch:
+        raise KeyError("USE_NDR_BRANCH=True requires batch['image_68'].")
+    return batch["image_68"].to(device, non_blocking=True).float()
 
 
 def extract_logits(output):
@@ -109,7 +121,11 @@ def eval_dataset(cfg, student, dataset_name, device, out_dir, logger):
         gt = batch["gt"].to(device, non_blocking=True).float()
         stem = batch["stem"][0]
         model_input = make_model_input(cfg, batch, device)
-        logits = extract_logits(student(model_input))
+        image_68 = make_image_68(cfg, batch, device)
+        if str(getattr(cfg, "HEAD_TYPE", "simple")).lower() == "dagp_safe":
+            logits = extract_logits(student(model_input, image_68=image_68, return_aux=False))
+        else:
+            logits = extract_logits(student(model_input))
         # 当前实现保存的 pred 与计算指标用的是同一张原图尺寸二值 mask。
         logits = F.interpolate(logits, size=gt.shape[-2:], mode="bilinear")
         pred = (logits.sigmoid() > float(cfg.THRESHOLD)).float()

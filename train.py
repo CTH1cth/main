@@ -1,5 +1,6 @@
 import argparse
 import csv
+import math
 from datetime import datetime
 from pathlib import Path
 
@@ -50,6 +51,49 @@ def get_teacher_weight(epoch):
     return 1.0
 
 
+def get_reset_epoch(cfg):
+    return int(getattr(cfg, "FINETUNE_RESET_EPOCH", 21))
+
+
+def get_fusion_weights(epoch, cfg):
+    reset_epoch = get_reset_epoch(cfg)
+    mode = str(getattr(cfg, "TEACHER_FUSION_MODE", "")).lower()
+    if mode == "orig20_hold_until_reset":
+        if epoch >= reset_epoch:
+            return 0.0, 1.0
+        decay_epochs = int(getattr(cfg, "FUSION_ORIG_DECAY_EPOCHS", 20))
+        hold_fixed = float(getattr(cfg, "FUSION_HOLD_FIXED_WEIGHT", 0.05))
+        hold_fixed = max(0.0, min(1.0, hold_fixed))
+        if epoch <= decay_epochs:
+            fixed_weight = 1.0 - 0.05 * float(epoch - 1)
+            fixed_weight = max(hold_fixed, fixed_weight)
+        else:
+            fixed_weight = hold_fixed
+        fixed_weight = max(0.0, min(1.0, float(fixed_weight)))
+        return fixed_weight, 1.0 - fixed_weight
+
+    if mode == "linear_to_095_before_reset":
+        if epoch >= reset_epoch:
+            return 0.0, 1.0
+        pre_epochs = int(getattr(cfg, "TEACHER_FUSION_PRE_RESET_EPOCHS", reset_epoch - 1))
+        if hasattr(cfg, "FUSION_MIN_FIXED_WEIGHT"):
+            min_fixed = float(getattr(cfg, "FUSION_MIN_FIXED_WEIGHT"))
+        else:
+            max_teacher = float(getattr(cfg, "TEACHER_FUSION_MAX_WEIGHT", 0.95))
+            min_fixed = 1.0 - max_teacher
+        min_fixed = max(0.0, min(1.0, min_fixed))
+        if pre_epochs <= 1:
+            fixed_weight = min_fixed
+        else:
+            progress = float(epoch - 1) / float(max(1, pre_epochs - 1))
+            fixed_weight = 1.0 - (1.0 - min_fixed) * progress
+        fixed_weight = max(min_fixed, min(1.0, float(fixed_weight)))
+        return fixed_weight, 1.0 - fixed_weight
+
+    teacher_weight = get_teacher_weight(epoch)
+    return 1.0 - teacher_weight, teacher_weight
+
+
 def get_fixed_teacher_weights(cfg, epoch):
     use_fast = bool(getattr(cfg, "USE_FAST_TEACHER_FUSION", False))
     mode = str(getattr(cfg, "TEACHER_FUSION_MODE", "")).lower()
@@ -70,13 +114,86 @@ def get_fixed_teacher_weights(cfg, epoch):
         teacher_weight = max(0.0, min(1.0, float(teacher_weight)))
         return 1.0 - teacher_weight, teacher_weight, "fast_t10"
 
-    teacher_weight = get_teacher_weight(epoch)
-    return 1.0 - teacher_weight, teacher_weight, "default"
+    fixed_weight, teacher_weight = get_fusion_weights(epoch, cfg)
+    if mode in {"linear_to_095_before_reset", "orig20_hold_until_reset"}:
+        return fixed_weight, teacher_weight, mode
+    return fixed_weight, teacher_weight, "default"
 
 
-def build_optimizer_scheduler(cfg, student):
+def get_hold_cosine_lr(epoch, cfg):
+    base_lr = float(getattr(cfg, "COMPLEX_HEAD_PRE_RESET_LR", 3e-4))
+    min_lr = float(getattr(cfg, "COMPLEX_HEAD_LR_MIN", 3e-5))
+    hold_epochs = int(getattr(cfg, "COMPLEX_HEAD_LR_HOLD_EPOCHS", 10))
+    reset_epoch = get_reset_epoch(cfg)
+    pre_epochs = reset_epoch - 1
+    if epoch <= hold_epochs:
+        return base_lr
+    progress = float(epoch - hold_epochs) / float(max(1, pre_epochs - hold_epochs))
+    progress = max(0.0, min(1.0, progress))
+    return min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * progress))
+
+
+def use_complex_head_lr_policy(cfg):
+    return str(getattr(cfg, "COMPLEX_HEAD_LR_POLICY", "")).lower() == "hold_cosine_before_reset"
+
+
+def apply_complex_head_lr_policy(optimizer, epoch, cfg):
+    if not use_complex_head_lr_policy(cfg) or epoch >= get_reset_epoch(cfg):
+        return None
+    lr = get_hold_cosine_lr(epoch, cfg)
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+    return lr
+
+
+def should_step_iter_scheduler(epoch, cfg):
+    return not (
+        use_linear_floor_two_stage_lr(cfg)
+        or (use_complex_head_lr_policy(cfg) and epoch < get_reset_epoch(cfg))
+    )
+
+
+def complex_head_post_reset_lr(cfg):
+    return float(getattr(cfg, "COMPLEX_HEAD_POST_RESET_LR", cfg.DINO["lr"]))
+
+
+def set_optimizer_lr(optimizer, lr):
+    for group in optimizer.param_groups:
+        group["lr"] = float(lr)
+
+
+def get_base_lr(cfg):
+    return float(getattr(cfg, "LR", cfg.DINO["lr"]))
+
+
+def use_linear_floor_two_stage_lr(cfg):
+    return str(getattr(cfg, "LR_POLICY", "")).lower() == "linear_floor_two_stage"
+
+
+def compute_linear_floor_two_stage_lr(epoch, iter_idx, num_iters_per_epoch, cfg):
+    lr0 = get_base_lr(cfg)
+    lr_floor = float(getattr(cfg, "LR_FLOOR", 2e-5))
+    reset_epoch = get_reset_epoch(cfg)
+    num_iters_per_epoch = max(1, int(num_iters_per_epoch))
+
+    if epoch < reset_epoch:
+        stage_epochs = int(getattr(cfg, "LR_LINEAR_STAGE1_EPOCHS", reset_epoch - 1))
+        stage_epoch_idx = epoch - 1
+    else:
+        stage_epochs = int(getattr(cfg, "LR_LINEAR_STAGE2_EPOCHS", 10))
+        stage_epoch_idx = epoch - reset_epoch
+
+    stage_epochs = max(1, stage_epochs)
+    total_steps = max(1, stage_epochs * num_iters_per_epoch - 1)
+    stage_step = stage_epoch_idx * num_iters_per_epoch + int(iter_idx)
+    progress = min(1.0, max(0.0, float(stage_step) / float(total_steps)))
+    lr = lr_floor + (lr0 - lr_floor) * (1.0 - progress)
+    return max(lr_floor, float(lr))
+
+
+def build_optimizer_scheduler(cfg, student, lr=None):
     # 与 UCOD-DPL 对齐：AdamW + 每 iteration StepLR。
-    optimizer = torch.optim.AdamW(student.parameters(), lr=float(cfg.DINO["lr"]))
+    optimizer = torch.optim.AdamW(student.parameters(), lr=float(cfg.DINO["lr"] if lr is None else lr))
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer,
         step_size=25,
@@ -123,15 +240,27 @@ def use_raw_feature_head(cfg):
     return str(getattr(cfg, "HEAD_TYPE", "simple")).lower() in {"dagp", "dagp_safe"}
 
 
+def use_ndr_branch(cfg):
+    return bool(getattr(cfg, "USE_NDR_BRANCH", False))
+
+
 def set_model_epoch(model, epoch):
     target = model.module if hasattr(model, "module") else model
     if hasattr(target, "set_epoch"):
         target.set_epoch(epoch)
 
 
-def forward_seg_head(model, model_input, cfg, return_aux=False):
+def make_image_68(cfg, batch, device):
+    if not use_ndr_branch(cfg):
+        return None
+    if "image_68" not in batch:
+        raise KeyError("USE_NDR_BRANCH=True requires batch['image_68'].")
+    return batch["image_68"].to(device, non_blocking=True).float()
+
+
+def forward_seg_head(model, model_input, cfg, image_68=None, return_aux=False):
     if use_dagp_safe_head(cfg):
-        return model(model_input, return_aux=return_aux)
+        return model(model_input, image_68=image_68, return_aux=return_aux)
     return model(model_input)
 
 
@@ -225,6 +354,30 @@ def log_dagp_safe_first_batch(logger, student, model_input, raw_logits, loss_log
     )
 
 
+def log_ndr_first_batch(logger, image_68, output, pseudo):
+    logger.log(f"[NDR FirstBatch] image_68 shape = {list(image_68.shape)}")
+    logger.log(f"[NDR FirstBatch] sobel_68 shape = {list(output['sobel_68'].shape)}")
+    logger.log(f"[NDR FirstBatch] coarse_logits_37 shape = {list(output['coarse_logits_37'].shape)}")
+    logger.log(f"[NDR FirstBatch] coarse_logits_68 shape = {list(output['coarse_logits_68'].shape)}")
+    logger.log(f"[NDR FirstBatch] residual_logits_68 shape = {list(output['residual_logits_68'].shape)}")
+    logger.log(f"[NDR FirstBatch] final_logits_68 shape = {list(output['logits'].shape)}")
+    logger.log(f"[NDR FirstBatch] pseudo shape = {list(pseudo.shape)}")
+    logger.log(f"[NDR FirstBatch] beta_eff = {output_scalar(output, 'ndr_beta_eff'):.8f}")
+    gate_mean = output_scalar(output, "ndr_detail_gate_mean")
+    gate_min = output_scalar(output, "ndr_detail_gate_min")
+    gate_max = output_scalar(output, "ndr_detail_gate_max")
+    logger.log(
+        f"[NDR FirstBatch] detail_gate mean/min/max = "
+        f"{gate_mean:.8f}/{gate_min:.8f}/{gate_max:.8f}"
+    )
+    residual_abs_mean = output_scalar(output, "ndr_residual_abs_mean")
+    residual_abs_max = output_scalar(output, "ndr_residual_abs_max")
+    logger.log(
+        f"[NDR FirstBatch] residual abs mean/max = "
+        f"{residual_abs_mean:.8f}/{residual_abs_max:.8f}"
+    )
+
+
 def output_tensor_abs_mean(output, name):
     if not isinstance(output, dict) or name not in output:
         return 0.0
@@ -301,7 +454,8 @@ def validate_one_dataset(cfg, student, dataset_name, device, max_samples=-1):
     for batch in loader:
         gt = batch["gt"].to(device, non_blocking=True).float()
         model_input = make_model_input(cfg, batch, device)
-        logits = extract_logits(forward_seg_head(student, model_input, cfg, return_aux=False))
+        image_68 = make_image_68(cfg, batch, device)
+        logits = extract_logits(forward_seg_head(student, model_input, cfg, image_68=image_68, return_aux=False))
         logits = F.interpolate(logits, size=gt.shape[-2:], mode="bilinear")
         pred = (logits.sigmoid() > float(cfg.THRESHOLD)).float()
         metrics.step(gt, pred)
@@ -331,7 +485,9 @@ def current_time_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def should_save_epoch_checkpoint(epoch, max_epoch, save_interval):
+def should_save_epoch_checkpoint(epoch, max_epoch, save_interval, reset_epoch=None):
+    if reset_epoch is not None and int(epoch) == int(reset_epoch):
+        return True
     last_checkpoint_start = max(1, int(max_epoch) - 4)
     interval = int(save_interval)
     interval_due = interval > 0 and int(epoch) % interval == 0
@@ -1867,6 +2023,7 @@ def main():
         raise RuntimeError("USE_DESPL_PSEUDO=True cannot be combined with --pseudo_cache_override.")
     cfg.PSEUDO_CACHE_OVERRIDE = args.pseudo_cache_override
     max_epoch = int(args.max_epochs) if args.max_epochs is not None else int(cfg.MAX_EPOCH)
+    reset_epoch = get_reset_epoch(cfg)
     set_seed(int(cfg.SEED))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -1883,14 +2040,22 @@ def main():
     with Logger(train_dir / "train.log") as logger:
         gkd_mode = get_gkd_mode(cfg)
         logger.log(f"train_start_time = {current_time_text()}")
+        logger.log(f"EXP_NAME = {cfg.EXP_NAME}")
         logger.log(f"device = {device}")
         logger.log("optimizer = AdamW")
         logger.log(f"lr = {cfg.DINO['lr']}")
-        logger.log("scheduler = StepLR(step_size=25, gamma=0.95)")
-        logger.log("scheduler_step = iter")
+        logger.log(f"lr0 = {get_base_lr(cfg):.8f}")
+        if use_linear_floor_two_stage_lr(cfg):
+            logger.log("scheduler = manual linear_floor_two_stage (StepLR object retained for checkpoint)")
+            logger.log("scheduler_step = manual_iter")
+        else:
+            logger.log("scheduler = StepLR(step_size=25, gamma=0.95)")
+            logger.log("scheduler_step = iter")
         logger.log(f"lr_policy = {getattr(cfg, 'LR_POLICY', 'step')}")
         logger.log(f"use_lr_floor = {bool(getattr(cfg, 'USE_LR_FLOOR', False))}")
         logger.log(f"lr_floor = {float(getattr(cfg, 'LR_FLOOR', 0.0)):.8f}")
+        logger.log(f"lr_linear_stage1_epochs = {int(getattr(cfg, 'LR_LINEAR_STAGE1_EPOCHS', reset_epoch - 1))}")
+        logger.log(f"lr_linear_stage2_epochs = {int(getattr(cfg, 'LR_LINEAR_STAGE2_EPOCHS', 0))}")
         logger.log(f"lr_floor_mode = {getattr(cfg, 'LR_FLOOR_MODE', 'global')}")
         logger.log(
             f"lr_floor_apply_after_scheduler_step = "
@@ -1903,11 +2068,32 @@ def main():
         logger.log(f"max_epoch = {max_epoch}")
         logger.log(f"max_samples = {sample_limit}")
         logger.log(f"ema_weight = {cfg.EMA_WEIGHT}")
-        logger.log("finetune_reset_epoch = 21")
+        logger.log(f"finetune_reset_epoch = {reset_epoch}")
         logger.log("finetune_reset_rebuild_optimizer = true")
         logger.log("finetune_reset_rebuild_scheduler = true")
         logger.log("finetune_reset_global_step = true")
         logger.log("finetune_reset_teacher = false")
+        logger.log(f"teacher_fusion_mode = {getattr(cfg, 'TEACHER_FUSION_MODE', 'default')}")
+        logger.log(f"fusion_orig_decay_epochs = {int(getattr(cfg, 'FUSION_ORIG_DECAY_EPOCHS', 20))}")
+        logger.log(f"fusion_hold_fixed_weight = {float(getattr(cfg, 'FUSION_HOLD_FIXED_WEIGHT', 0.05)):.6f}")
+        logger.log(
+            f"teacher_fusion_pre_reset_epochs = "
+            f"{int(getattr(cfg, 'TEACHER_FUSION_PRE_RESET_EPOCHS', reset_epoch - 1))}"
+        )
+        logger.log(
+            f"fusion_min_fixed_weight = "
+            f"{float(getattr(cfg, 'FUSION_MIN_FIXED_WEIGHT', 1.0 - float(getattr(cfg, 'TEACHER_FUSION_MAX_WEIGHT', 0.95)))):.6f}"
+        )
+        logger.log(f"teacher_fusion_max_weight = {float(getattr(cfg, 'TEACHER_FUSION_MAX_WEIGHT', 1.0)):.6f}")
+        logger.log(f"complex_head_lr_policy = {getattr(cfg, 'COMPLEX_HEAD_LR_POLICY', 'none')}")
+        logger.log(f"complex_head_pre_reset_lr = {float(getattr(cfg, 'COMPLEX_HEAD_PRE_RESET_LR', 0.0)):.6f}")
+        logger.log(f"complex_head_lr_hold_epochs = {int(getattr(cfg, 'COMPLEX_HEAD_LR_HOLD_EPOCHS', 0))}")
+        logger.log(f"complex_head_lr_min = {float(getattr(cfg, 'COMPLEX_HEAD_LR_MIN', 0.0)):.6f}")
+        logger.log(f"complex_head_post_reset_lr = {complex_head_post_reset_lr(cfg):.6f}")
+        logger.log(
+            f"complex_head_post_reset_scheduler = "
+            f"{getattr(cfg, 'COMPLEX_HEAD_POST_RESET_SCHEDULER', 'original_iter_steplr')}"
+        )
         logger.log("DINO_in_training_loop = false")
         logger.log("train_gt_in_train = false")
         logger.log(f"head_type = {getattr(cfg, 'HEAD_TYPE', 'simple')}")
@@ -1964,6 +2150,29 @@ def main():
             )
             logger.log(f"USE_LR_FLOOR = {bool(getattr(cfg, 'USE_LR_FLOOR', False))}")
             logger.log(f"LR_FLOOR = {float(getattr(cfg, 'LR_FLOOR', 0.0)):.8f}")
+        if use_ndr_branch(cfg):
+            logger.log(f"USE_NDR_BRANCH = {bool(getattr(cfg, 'USE_NDR_BRANCH', False))}")
+            logger.log(f"NDR_INPUT_RGB = {bool(getattr(cfg, 'NDR_INPUT_RGB', True))}")
+            logger.log(f"NDR_INPUT_SOBEL = {bool(getattr(cfg, 'NDR_INPUT_SOBEL', True))}")
+            logger.log(f"NDR_INPUT_COARSE_PROB = {bool(getattr(cfg, 'NDR_INPUT_COARSE_PROB', True))}")
+            logger.log(f"NDR_IN_CHANNELS = {int(getattr(cfg, 'NDR_IN_CHANNELS', 5))}")
+            logger.log(f"NDR_HIDDEN = {int(getattr(cfg, 'NDR_HIDDEN', 32))}")
+            logger.log(f"NDR_NUM_LAYERS = {int(getattr(cfg, 'NDR_NUM_LAYERS', 3))}")
+            logger.log(f"NDR_USE_GN = {bool(getattr(cfg, 'NDR_USE_GN', True))}")
+            logger.log(f"NDR_GN_GROUPS = {int(getattr(cfg, 'NDR_GN_GROUPS', 4))}")
+            logger.log(f"NDR_ACT = {getattr(cfg, 'NDR_ACT', 'gelu')}")
+            logger.log(f"NDR_BETA_MAX = {float(getattr(cfg, 'NDR_BETA_MAX', 0.10)):.6f}")
+            logger.log(f"NDR_WARMUP_EPOCH = {int(getattr(cfg, 'NDR_WARMUP_EPOCH', 6))}")
+            logger.log(f"NDR_RAMP_START_EPOCH = {int(getattr(cfg, 'NDR_RAMP_START_EPOCH', 7))}")
+            logger.log(f"NDR_RAMP_END_EPOCH = {int(getattr(cfg, 'NDR_RAMP_END_EPOCH', 15))}")
+            logger.log(f"NDR_RESIDUAL_CLIP = {float(getattr(cfg, 'NDR_RESIDUAL_CLIP', 2.0)):.6f}")
+            logger.log(f"NDR_USE_UNCERTAINTY_GATE = {bool(getattr(cfg, 'NDR_USE_UNCERTAINTY_GATE', True))}")
+            logger.log(f"NDR_USE_EDGE_GATE = {bool(getattr(cfg, 'NDR_USE_EDGE_GATE', True))}")
+            logger.log(f"NDR_GATE_MODE = {getattr(cfg, 'NDR_GATE_MODE', 'uncertainty_edge_boost')}")
+            logger.log(f"USE_NDR_COARSE_AUX = {bool(getattr(cfg, 'USE_NDR_COARSE_AUX', False))}")
+            logger.log(f"LAMBDA_NDR_COARSE_AUX = {float(getattr(cfg, 'LAMBDA_NDR_COARSE_AUX', 0.0)):.6f}")
+            logger.log(f"NDR_USE_RES_REG = {bool(getattr(cfg, 'NDR_USE_RES_REG', False))}")
+            logger.log(f"NDR_RES_REG_WEIGHT = {float(getattr(cfg, 'NDR_RES_REG_WEIGHT', 0.0)):.6f}")
         logger.log(f"use_multi_level_feature = {use_multi_level_feature(cfg)}")
         logger.log(f"multi_level_layers = {list(getattr(cfg, 'MULTI_LEVEL_LAYERS', []))}")
         logger.log(f"multi_level_feature_dtype = {getattr(cfg, 'MULTI_LEVEL_FEATURE_DTYPE', 'float32')}")
@@ -2051,6 +2260,14 @@ def main():
         use_gkd_lite = use_despl and is_gkd_enabled(cfg)
         use_gkd_v3 = use_gkd_lite and is_gkd_v3_enabled(cfg)
         teacher_fusion_mode = str(getattr(cfg, "TEACHER_FUSION_MODE", "default")).lower()
+        complex_post_reset_scheduler = str(
+            getattr(cfg, "COMPLEX_HEAD_POST_RESET_SCHEDULER", "original_iter_steplr")
+        ).lower()
+        if use_complex_head_lr_policy(cfg) and complex_post_reset_scheduler != "original_iter_steplr":
+            raise RuntimeError(
+                "COMPLEX_HEAD_POST_RESET_SCHEDULER currently supports only "
+                f"'original_iter_steplr', got {complex_post_reset_scheduler}."
+            )
         if use_anchor_pbce:
             if str(getattr(cfg, "ANCHOR_PBCE_SOURCE", "p_despl")) != "p_despl":
                 raise RuntimeError("DESPL Anchor-PBCE currently supports ANCHOR_PBCE_SOURCE='p_despl' only.")
@@ -2171,7 +2388,7 @@ def main():
         in_channels = train_dataset.in_channels
         student = build_seg_head(in_channels, cfg).to(device)
         teacher = build_seg_head(in_channels, cfg).to(device)
-        # 初始 teacher 与 student 对齐；第 21 轮 finetune reset 不显式重置 teacher。
+        # 初始 teacher 与 student 对齐；finetune reset 不显式重置 teacher。
         teacher.load_state_dict(student.state_dict())
         for p in teacher.parameters():
             p.requires_grad_(False)
@@ -2187,6 +2404,7 @@ def main():
         gkd_first_batch_logged = False
         dagp_first_batch_logged = False
         dagp_safe_first_batch_logged = False
+        ndr_first_batch_logged = False
         lr_floor_activated_logged = False
         gkd_first_batch_path = train_dir / "gkd_first_batch.csv"
         gkd_audit_csv_path = train_dir / "gkd_audit_epoch.csv"
@@ -2198,8 +2416,8 @@ def main():
 
         for epoch in range(1, max_epoch + 1):
             # 对齐 UCOD-DPL：teacher-only 阶段首轮第一个 batch 前重置优化器状态和 EMA 步数。
-            if epoch == 21:
-                optimizer, scheduler = build_optimizer_scheduler(cfg, student)
+            if epoch == reset_epoch:
+                optimizer, scheduler = build_optimizer_scheduler(cfg, student, lr=complex_head_post_reset_lr(cfg))
                 global_step = 0
                 if bool(getattr(cfg, "LR_FLOOR_APPLY_AFTER_FINETUNE_RESET", True)):
                     lr_floor_clamped, scheduler_lr, clamped_lr = apply_lr_floor(optimizer, cfg)
@@ -2212,13 +2430,14 @@ def main():
                         )
                         lr_floor_activated_logged = True
                 logger.log(
-                    "[Finetune Reset] epoch=021 | "
+                    f"[Finetune Reset] epoch={epoch:03d} | "
                     "rebuild_optimizer=True | "
                     "rebuild_scheduler=True | "
                     "reset_global_step=True | "
                     "reset_teacher=False | "
                     f"lr={current_lr(optimizer):.8f}"
                 )
+            apply_complex_head_lr_policy(optimizer, epoch, cfg)
 
             set_model_epoch(student, epoch)
             set_model_epoch(teacher, epoch)
@@ -2289,6 +2508,11 @@ def main():
             sap_final_abs_sum = 0.0
             sap_debug_sums = {name: 0.0 for name in SAP_DEBUG_KEYS}
             sap_stat_batches = 0
+            student_prob_mean_sum = 0.0
+            teacher_prob_mean_sum = 0.0
+            student_pred_area_sum = 0.0
+            teacher_pred_area_sum = 0.0
+            mixed_target_area_sum = 0.0
             dagp_safe_scale_sum = 0.0
             dagp_safe_alpha_sum = 0.0
             dagp_safe_gamma_sum = 0.0
@@ -2296,6 +2520,15 @@ def main():
             dagp_safe_unc_gate_min = None
             dagp_safe_unc_gate_max = None
             dagp_safe_stat_batches = 0
+            ndr_beta_sum = 0.0
+            ndr_gate_mean_sum = 0.0
+            ndr_gate_min = None
+            ndr_gate_max = None
+            ndr_residual_abs_mean_sum = 0.0
+            ndr_residual_abs_max = None
+            ndr_stat_batches = 0
+            total_ndr_coarse_aux_loss = 0.0
+            total_ndr_res_reg_loss = 0.0
             anchor_pbce_lambda_epoch = get_anchor_pbce_lambda(cfg, epoch) if use_anchor_pbce else 0.0
             anchor_pbce_loss_sum = 0.0
             anchor_pbce_valid_ratio_sum = 0.0
@@ -2310,15 +2543,17 @@ def main():
             )
             gkd_branch_epoch = init_gkd_branch_accumulator() if gkd_mode == "branch" else None
 
-            for batch in train_loader:
+            for iter_idx, batch in enumerate(train_loader):
                 pseudo = batch["pseudo"].to(device, non_blocking=True).float()
                 model_input = make_model_input(cfg, batch, device)
+                image_68 = make_image_68(cfg, batch, device)
                 pseudo_68 = F.interpolate(pseudo, size=(cfg.LOSS_SIZE, cfg.LOSS_SIZE), mode="bilinear").float()
 
                 student_out = forward_seg_head(
                     student,
                     model_input,
                     cfg,
+                    image_68=image_68,
                     return_aux=use_dagp_safe_head(cfg),
                 )
                 raw_student_logits = extract_logits(student_out)
@@ -2335,18 +2570,37 @@ def main():
                     and bool(getattr(cfg, "DAGP_SAFE_DEBUG_FIRST_BATCH", True))
                     and not dagp_safe_first_batch_logged
                 ):
+                    dagp_safe_raw_logits_for_log = (
+                        student_out.get("coarse_logits_37", raw_student_logits)
+                        if isinstance(student_out, dict)
+                        else raw_student_logits
+                    )
                     log_dagp_safe_first_batch(
                         logger,
                         student,
                         model_input,
-                        raw_student_logits,
+                        dagp_safe_raw_logits_for_log,
                         student_logits,
                         pseudo_68,
                         student_out,
                     )
                     dagp_safe_first_batch_logged = True
+                if (
+                    use_ndr_branch(cfg)
+                    and bool(getattr(cfg, "NDR_DEBUG_FIRST_BATCH", True))
+                    and not ndr_first_batch_logged
+                    and isinstance(student_out, dict)
+                ):
+                    log_ndr_first_batch(logger, image_68, student_out, pseudo_68)
+                    ndr_first_batch_logged = True
                 with torch.no_grad():
-                    teacher_out = forward_seg_head(teacher, model_input, cfg, return_aux=False)
+                    teacher_out = forward_seg_head(
+                        teacher,
+                        model_input,
+                        cfg,
+                        image_68=image_68,
+                        return_aux=False,
+                    )
                     teacher_logits = resize_logits_for_loss(extract_logits(teacher_out), cfg)
                     teacher_prob = teacher_logits.sigmoid()
                     teacher_binary = (teacher_prob > float(cfg.THRESHOLD)).float()
@@ -2354,7 +2608,7 @@ def main():
                 fixed_target = pseudo_68
                 if use_ccr:
                     fixed_target = batch["ccr_p_corr"].to(device, non_blocking=True).float()
-                elif use_qra and epoch <= 20:
+                elif use_qra and epoch < reset_epoch:
                     qra_quality = batch["qra_quality"].to(device, non_blocking=True).long()
                     qra_fused = batch["qra_p_fused"].to(device, non_blocking=True).float()
                     blend = qra_fixed_blend(cfg, qra_quality, device).view(-1, 1, 1, 1)
@@ -2387,7 +2641,7 @@ def main():
                     else:
                         fixed_local = batch["drepp_fixed_local_recall"].to(device, non_blocking=True).bool()
                         memory_target = drepp_apply_fixed_local(current_memory, fixed_local, core_fg, core_bg, cfg)
-                        if epoch <= 20:
+                        if epoch < reset_epoch:
                             drepp_beta = min(
                                 teacher_weight,
                                 float(getattr(cfg, "DREPP_TEACHER_BETA_MAX", 0.35)),
@@ -2406,7 +2660,7 @@ def main():
                     drepp_beta_epoch = drepp_beta
                 elif use_pure_despl:
                     mixed_target = fixed_target.float()
-                elif epoch <= 20:
+                elif epoch < reset_epoch:
                     mixed_target = fixed_weight * fixed_target + teacher_weight * teacher_binary
                 else:
                     mixed_target = teacher_binary
@@ -2418,6 +2672,15 @@ def main():
                             batch,
                             device,
                         )
+                with torch.no_grad():
+                    student_prob_for_area = student_logits.detach().sigmoid()
+                    student_prob_mean_sum += float(student_prob_for_area.mean().item())
+                    teacher_prob_mean_sum += float(teacher_prob.mean().item())
+                    student_pred_area_sum += float(
+                        (student_prob_for_area > float(cfg.THRESHOLD)).float().mean().item()
+                    )
+                    teacher_pred_area_sum += float(teacher_binary.mean().item())
+                    mixed_target_area_sum += float(mixed_target.detach().mean().item())
                 if gkd_mode != "off":
                     p_despl_for_quality = batch.get("pseudo_despl", fixed_target)
                     p_fixed_for_quality = batch.get("pseudo_fixed", None)
@@ -2507,6 +2770,8 @@ def main():
                 else:
                     loss_base = criterion(student_logits, mixed_target)
                 loss_aux_base = student_logits.sum() * 0.0
+                loss_ndr_coarse_aux = student_logits.sum() * 0.0
+                loss_ndr_res_reg = student_logits.sum() * 0.0
                 if use_qra:
                     loss_anchor, loss_soft = compute_qra_losses(
                         cfg,
@@ -2517,7 +2782,7 @@ def main():
                         criterion_none,
                     )
                     loss = loss_base + loss_anchor + loss_soft
-                elif use_ccr and epoch <= 20 and bool(getattr(cfg, "CCR_USE_ANCHOR_LOSS", False)):
+                elif use_ccr and epoch < reset_epoch and bool(getattr(cfg, "CCR_USE_ANCHOR_LOSS", False)):
                     loss_anchor = compute_ccr_anchor_loss(
                         cfg,
                         student_logits,
@@ -2531,7 +2796,38 @@ def main():
                     loss_anchor = student_logits.sum() * 0.0
                     loss_soft = student_logits.sum() * 0.0
                     loss = loss_base
-                if (
+                if use_ndr_branch(cfg):
+                    if not isinstance(student_out, dict) or "coarse_logits_68" not in student_out:
+                        raise RuntimeError("USE_NDR_BRANCH=True requires coarse_logits_68 in student output.")
+                    ndr_terms = [loss_base]
+                    ndr_weights = [1.0]
+                    if bool(getattr(cfg, "USE_NDR_COARSE_AUX", True)):
+                        coarse_logits = resize_logits_for_loss(student_out["coarse_logits_68"], cfg)
+                        loss_ndr_coarse_aux = criterion(coarse_logits, mixed_target)
+                        ndr_terms.append(loss_ndr_coarse_aux)
+                        ndr_weights.append(float(getattr(cfg, "LAMBDA_NDR_COARSE_AUX", 0.5)))
+                    if (
+                        bool(getattr(cfg, "USE_BASE_AUX_LOSS", False))
+                        and "base_logits" in student_out
+                    ):
+                        reset_epoch = int(getattr(cfg, "FINETUNE_RESET_EPOCH", 21))
+                        aux_lambda = (
+                            float(getattr(cfg, "LAMBDA_BASE_AUX", 0.3))
+                            if epoch < reset_epoch
+                            else float(getattr(cfg, "LAMBDA_BASE_AUX_AFTER_RESET", 0.1))
+                        )
+                        base_logits = resize_logits_for_loss(student_out["base_logits"], cfg)
+                        loss_aux_base = criterion(base_logits, mixed_target)
+                        ndr_terms.append(loss_aux_base)
+                        ndr_weights.append(aux_lambda)
+                    weight_sum = max(1e-12, sum(ndr_weights))
+                    loss = sum(w * term for w, term in zip(ndr_weights, ndr_terms)) / weight_sum
+                    if bool(getattr(cfg, "NDR_USE_RES_REG", False)):
+                        detail_gate = student_out["detail_gate"].detach()
+                        residual_logits = student_out["residual_logits_68"]
+                        loss_ndr_res_reg = torch.mean(torch.abs(detail_gate * residual_logits))
+                        loss = loss + float(getattr(cfg, "NDR_RES_REG_WEIGHT", 0.001)) * loss_ndr_res_reg
+                elif (
                     bool(getattr(cfg, "USE_BASE_AUX_LOSS", False))
                     and isinstance(student_out, dict)
                     and "base_logits" in student_out
@@ -2551,7 +2847,7 @@ def main():
                 if (
                     use_despl
                     and bool(getattr(cfg, "USE_LATE_DESPL_ANCHOR_LOSS", False))
-                    and epoch > 20
+                    and epoch >= reset_epoch
                 ):
                     loss_anchor = loss_anchor + compute_late_despl_anchor_loss(
                         cfg,
@@ -2602,20 +2898,32 @@ def main():
                     loss = loss + loss_local + loss_anchor
                     drepp_local_ratio_sum += float(local_ratio)
 
+                if use_linear_floor_two_stage_lr(cfg):
+                    set_optimizer_lr(
+                        optimizer,
+                        compute_linear_floor_two_stage_lr(
+                            epoch,
+                            iter_idx,
+                            len(train_loader),
+                            cfg,
+                        ),
+                    )
+
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
-                scheduler.step()
-                if bool(getattr(cfg, "LR_FLOOR_APPLY_AFTER_SCHEDULER_STEP", True)):
-                    lr_floor_clamped, scheduler_lr, clamped_lr = apply_lr_floor(optimizer, cfg)
-                    if lr_floor_clamped and not lr_floor_activated_logged:
-                        logger.log(
-                            "[LR Floor] activated | "
-                            f"global_step={global_step} | "
-                            f"scheduler_lr={scheduler_lr:.8f} | "
-                            f"clamped_lr={clamped_lr:.8f}"
-                        )
-                        lr_floor_activated_logged = True
+                if should_step_iter_scheduler(epoch, cfg):
+                    scheduler.step()
+                    if bool(getattr(cfg, "LR_FLOOR_APPLY_AFTER_SCHEDULER_STEP", True)):
+                        lr_floor_clamped, scheduler_lr, clamped_lr = apply_lr_floor(optimizer, cfg)
+                        if lr_floor_clamped and not lr_floor_activated_logged:
+                            logger.log(
+                                "[LR Floor] activated | "
+                                f"global_step={global_step} | "
+                                f"scheduler_lr={scheduler_lr:.8f} | "
+                                f"clamped_lr={clamped_lr:.8f}"
+                            )
+                            lr_floor_activated_logged = True
                 # teacher pseudo 已在本轮 EMA 更新前生成，避免当前 student 更新泄漏进 target。
                 update_ema(student, teacher, global_step, ema_weight=float(cfg.EMA_WEIGHT))
                 global_step += 1
@@ -2626,6 +2934,8 @@ def main():
                 total_soft_loss += float(loss_soft.item())
                 total_local_loss += float(loss_local.item())
                 total_aux_base_loss += float(loss_aux_base.item())
+                total_ndr_coarse_aux_loss += float(loss_ndr_coarse_aux.item())
+                total_ndr_res_reg_loss += float(loss_ndr_res_reg.item())
                 if isinstance(student_out, dict):
                     scale_value = output_context_scale(student_out)
                     if scale_value is not None:
@@ -2660,6 +2970,30 @@ def main():
                             else max(dagp_safe_unc_gate_max, unc_gate_max)
                         )
                         dagp_safe_stat_batches += 1
+                    if use_ndr_branch(cfg):
+                        ndr_beta_sum += output_scalar(student_out, "ndr_beta_eff")
+                        ndr_gate_mean = output_scalar(student_out, "ndr_detail_gate_mean")
+                        ndr_gate_min_value = output_scalar(student_out, "ndr_detail_gate_min")
+                        ndr_gate_max_value = output_scalar(student_out, "ndr_detail_gate_max")
+                        ndr_residual_abs_mean_sum += output_scalar(student_out, "ndr_residual_abs_mean")
+                        ndr_residual_abs_max_value = output_scalar(student_out, "ndr_residual_abs_max")
+                        ndr_gate_mean_sum += ndr_gate_mean
+                        ndr_gate_min = (
+                            ndr_gate_min_value
+                            if ndr_gate_min is None
+                            else min(ndr_gate_min, ndr_gate_min_value)
+                        )
+                        ndr_gate_max = (
+                            ndr_gate_max_value
+                            if ndr_gate_max is None
+                            else max(ndr_gate_max, ndr_gate_max_value)
+                        )
+                        ndr_residual_abs_max = (
+                            ndr_residual_abs_max_value
+                            if ndr_residual_abs_max is None
+                            else max(ndr_residual_abs_max, ndr_residual_abs_max_value)
+                        )
+                        ndr_stat_batches += 1
                 num_batches += 1
                 if use_qra:
                     quality_cpu = batch["qra_quality"]
@@ -2713,6 +3047,15 @@ def main():
                 f"teacher_weight={effective_teacher_weight:.2f} | "
                 f"schedule_fixed_weight={fixed_weight:.2f} | "
                 f"schedule_teacher_weight={teacher_weight:.2f}"
+            )
+            stat_batches = max(num_batches, 1)
+            logger.log(
+                f"[PredArea] epoch={epoch:03d} | "
+                f"student_prob_mean={student_prob_mean_sum / stat_batches:.6f} | "
+                f"teacher_prob_mean={teacher_prob_mean_sum / stat_batches:.6f} | "
+                f"student_pred_area_mean={student_pred_area_sum / stat_batches:.6f} | "
+                f"teacher_pred_area_mean={teacher_pred_area_sum / stat_batches:.6f} | "
+                f"mixed_target_area_mean={mixed_target_area_sum / stat_batches:.6f}"
             )
             if use_qra:
                 logger.log(
@@ -2812,7 +3155,7 @@ def main():
                     f"effective_despl_weight={effective_despl_weight:.4f} | "
                     f"effective_teacher_weight={effective_teacher_weight:.4f} | "
                     f"teacher_binary_used={teacher_binary_used} | "
-                    "reset_epoch=21"
+                    f"reset_epoch={reset_epoch}"
                 )
             if use_anchor_pbce:
                 logger.log(
@@ -2880,6 +3223,21 @@ def main():
                     f"unc_gate_max={(dagp_safe_unc_gate_max if dagp_safe_unc_gate_max is not None else -1.0):.8f} | "
                     f"loss_main={total_base_loss / max(num_batches, 1):.6f} | "
                     f"loss_aux_base={total_aux_base_loss / max(num_batches, 1):.6f}"
+                )
+            if use_ndr_branch(cfg):
+                stat_batches = max(ndr_stat_batches, 1)
+                logger.log(
+                    f"[NDR] epoch={epoch:03d} | "
+                    f"ndr_beta_eff={ndr_beta_sum / stat_batches:.8f} | "
+                    f"ndr_gate_mean={ndr_gate_mean_sum / stat_batches:.8f} | "
+                    f"ndr_gate_min={(ndr_gate_min if ndr_gate_min is not None else -1.0):.8f} | "
+                    f"ndr_gate_max={(ndr_gate_max if ndr_gate_max is not None else -1.0):.8f} | "
+                    f"ndr_residual_abs_mean={ndr_residual_abs_mean_sum / stat_batches:.8f} | "
+                    f"ndr_residual_abs_max={(ndr_residual_abs_max if ndr_residual_abs_max is not None else -1.0):.8f} | "
+                    f"loss_final={total_base_loss / max(num_batches, 1):.6f} | "
+                    f"loss_coarse_aux={total_ndr_coarse_aux_loss / max(num_batches, 1):.6f} | "
+                    f"loss_base_aux={total_aux_base_loss / max(num_batches, 1):.6f} | "
+                    f"loss_res_reg={total_ndr_res_reg_loss / max(num_batches, 1):.6f}"
                 )
             if use_dre_safe:
                 logger.log(
@@ -2967,7 +3325,7 @@ def main():
             logger.log(f"best MAE so far = {best_metric:.6f}")
             logger.log(f"best epoch = {best_epoch}")
 
-            if should_save_epoch_checkpoint(epoch, max_epoch, cfg.SAVE_INTERVAL):
+            if should_save_epoch_checkpoint(epoch, max_epoch, cfg.SAVE_INTERVAL, reset_epoch=reset_epoch):
                 save_checkpoint(
                     ckpt_dir / f"epoch_{epoch:03d}.pth",
                     epoch,
