@@ -244,6 +244,15 @@ def pseudo_manifest_path(cfg):
     return Path(cfg.CACHE_ROOT) / "pseudo_label_cache" / cfg.BACKBONE_KEY / "manifest_train.jsonl"
 
 
+def ml_feature_cache_dir(cfg):
+    root = getattr(cfg, "MULTI_LEVEL_FEATURE_ROOT", "../datasets/cache/features_cache_ml")
+    return Path(root) / cfg.BACKBONE_KEY
+
+
+def ml_feature_cache_manifest_path(cfg, split):
+    return ml_feature_cache_dir(cfg) / f"manifest_{split}.jsonl"
+
+
 def qra_cache_dir(cfg):
     return Path(cfg.QRA_CACHE_ROOT) / cfg.BACKBONE_KEY
 
@@ -297,6 +306,20 @@ def despl_light_cache_manifest_path(cfg):
     return despl_light_cache_dir(cfg) / "manifest_train.jsonl"
 
 
+def despl_paper_cache_dir(cfg, sign_mode=None):
+    root = Path(cfg.DESPL_PAPER_CACHE_ROOT)
+    backbone = getattr(cfg, "DESPL_PAPER_BACKBONE_KEY", cfg.BACKBONE_KEY)
+    mode = sign_mode
+    if mode is None:
+        mode = getattr(cfg, "DESPL_PAPER_SIGN_MODE", getattr(cfg, "DESPL_SIGN_MODE", "paper"))
+    suffix = backbone if str(mode) == "paper" else f"{backbone}__{mode}"
+    return root / suffix
+
+
+def despl_paper_manifest_path(cfg, sign_mode=None):
+    return despl_paper_cache_dir(cfg, sign_mode=sign_mode) / "manifest_train.jsonl"
+
+
 def split_dataset_names(cfg, split):
     # 根据 split 选择配置里的数据集列表。
     if split == "train":
@@ -317,6 +340,208 @@ def _cache_shape_ok(kind, shape):
     if kind == "pseudo":
         return len(shape) == 3 and shape[0] == 1 and all(isinstance(x, int) and x > 0 for x in shape)
     raise ValueError(f"Unknown cache kind: {kind}")
+
+
+def _ml_feature_error(split, reason):
+    return (
+        f"Multi-level feature cache {split} missing or incomplete: {reason}\n"
+        "Please run:\n"
+        "python common/cache_features_ml.py --config <your_multi_level_config.py> "
+        f"--split {split}"
+    )
+
+
+def _feature_shape3_ok(shape):
+    return (
+        isinstance(shape, list)
+        and len(shape) == 3
+        and all(isinstance(value, int) and value > 0 for value in shape)
+    )
+
+
+def _sample_ordered_keys(keys, max_samples):
+    keys = list(keys)
+    if max_samples is None or int(max_samples) < 0 or int(max_samples) >= len(keys):
+        return keys
+    max_samples = int(max_samples)
+    if max_samples <= 0:
+        return []
+    if max_samples == 1:
+        return [keys[0]]
+    last = len(keys) - 1
+    indices = sorted({round(i * last / (max_samples - 1)) for i in range(max_samples)})
+    return [keys[index] for index in indices]
+
+
+def check_ml_feature_cache(cfg, split, max_samples=None):
+    if split not in {"train", "val", "test"}:
+        raise ValueError(f"Unknown split: {split}")
+    manifest_path = ml_feature_cache_manifest_path(cfg, split)
+    if not manifest_path.exists():
+        raise RuntimeError(_ml_feature_error(split, f"missing manifest: {manifest_path}"))
+
+    expected_items = build_image_items(cfg.DATA_ROOT, split_dataset_names(cfg, split), require_gt=False)
+    if max_samples is not None and int(max_samples) >= 0:
+        expected_items = expected_items[: int(max_samples)]
+    expected_keys = [(item["dataset"], item["stem"]) for item in expected_items]
+    expected_key_set = set(expected_keys)
+
+    rows = read_jsonl(manifest_path)
+    row_map = {}
+    for row in rows:
+        if "dataset" not in row or "stem" not in row:
+            raise RuntimeError(_ml_feature_error(split, f"bad manifest row without dataset/stem in {manifest_path}"))
+        key = (row["dataset"], row["stem"])
+        if key in row_map:
+            raise RuntimeError(_ml_feature_error(split, f"duplicate manifest key in {manifest_path}: {key}"))
+        row_map[key] = row
+
+    actual_key_set = set(row_map)
+    if max_samples is None or int(max_samples) < 0:
+        extra = sorted(actual_key_set - expected_key_set)
+        if extra:
+            raise RuntimeError(_ml_feature_error(split, f"manifest has unexpected keys first 10: {extra[:10]}"))
+    missing = sorted(expected_key_set - actual_key_set)
+    if missing:
+        raise RuntimeError(_ml_feature_error(split, f"missing manifest rows first 10: {missing[:10]}"))
+
+    layers = [int(layer) for layer in getattr(cfg, "MULTI_LEVEL_LAYERS", [4, 8, 12])]
+    labels = [f"l{layer}" for layer in layers]
+    feature_type = str(getattr(cfg, "MULTI_LEVEL_FEATURE_TYPE", "key"))
+    expected_dtype = getattr(cfg, "MULTI_LEVEL_FEATURE_DTYPE", None)
+    if expected_dtype is not None:
+        expected_dtype = str(expected_dtype).lower()
+    for key in expected_keys:
+        row = row_map[key]
+        if row.get("backbone_key", cfg.BACKBONE_KEY) != cfg.BACKBONE_KEY:
+            raise RuntimeError(
+                _ml_feature_error(
+                    split,
+                    f"backbone mismatch for {key}: {row.get('backbone_key')} != {cfg.BACKBONE_KEY}",
+                )
+            )
+        if str(row.get("feature_type", feature_type)) != feature_type:
+            raise RuntimeError(
+                _ml_feature_error(split, f"feature_type mismatch for {key}: {row.get('feature_type')} != {feature_type}")
+            )
+        if expected_dtype is not None and str(row.get("dtype", "float32")).lower() != expected_dtype:
+            raise RuntimeError(
+                _ml_feature_error(split, f"dtype mismatch for {key}: {row.get('dtype', 'float32')} != {expected_dtype}")
+            )
+        row_layers = [int(layer) for layer in row.get("layers", layers)]
+        if row_layers != layers:
+            raise RuntimeError(_ml_feature_error(split, f"layers mismatch for {key}: {row_layers} != {layers}"))
+        cache_path = row.get("cache_path")
+        if not cache_path:
+            raise RuntimeError(_ml_feature_error(split, f"missing cache_path for {key}"))
+        if not Path(cache_path).exists():
+            raise RuntimeError(_ml_feature_error(split, f"missing cache file: {cache_path}"))
+        row_shape = row.get("shape")
+        if not isinstance(row_shape, dict):
+            raise RuntimeError(_ml_feature_error(split, f"missing or invalid shape dict for {key}"))
+        row_spatial = None
+        row_channels = None
+        for label in labels:
+            shape = row_shape.get(label)
+            if not _feature_shape3_ok(shape):
+                raise RuntimeError(
+                    _ml_feature_error(split, f"invalid manifest shape for {key} {label}: {shape}")
+                )
+            if row_spatial is None:
+                row_spatial = tuple(shape[-2:])
+                row_channels = int(shape[0])
+            elif tuple(shape[-2:]) != row_spatial or int(shape[0]) != row_channels:
+                raise RuntimeError(_ml_feature_error(split, f"manifest multi-level shapes are inconsistent for {key}"))
+
+    preflight_mode = str(getattr(cfg, "ML_FEATURE_PREFLIGHT_MODE", "sample")).lower()
+    if preflight_mode not in {"sample", "full"}:
+        raise RuntimeError(_ml_feature_error(split, f"unknown ML_FEATURE_PREFLIGHT_MODE: {preflight_mode}"))
+    if preflight_mode == "full":
+        payload_keys = expected_keys
+    else:
+        payload_keys = _sample_ordered_keys(
+            expected_keys,
+            int(getattr(cfg, "ML_FEATURE_PREFLIGHT_SAMPLES", 32)),
+        )
+
+    for key in payload_keys:
+        row = row_map[key]
+        row_shape = row.get("shape")
+        cache_path = row.get("cache_path")
+        payload = torch_load(cache_path, map_location="cpu")
+        if not isinstance(payload, dict):
+            raise RuntimeError(_ml_feature_error(split, f"payload must be dict for {key}: {cache_path}"))
+        if payload.get("dataset") != key[0] or payload.get("stem") != key[1]:
+            raise RuntimeError(_ml_feature_error(split, f"payload key mismatch for {key}: {cache_path}"))
+        if payload.get("backbone_key") != cfg.BACKBONE_KEY:
+            raise RuntimeError(
+                _ml_feature_error(
+                    split,
+                    f"payload backbone mismatch for {key}: {payload.get('backbone_key')} != {cfg.BACKBONE_KEY}",
+                )
+            )
+        payload_layers = [int(layer) for layer in payload.get("layers", row.get("layers", layers))]
+        if payload_layers != layers:
+            raise RuntimeError(_ml_feature_error(split, f"payload layers mismatch for {key}: {payload_layers} != {layers}"))
+        if str(payload.get("feature_type", row.get("feature_type", feature_type))) != feature_type:
+            raise RuntimeError(
+                _ml_feature_error(
+                    split,
+                    f"payload feature_type mismatch for {key}: "
+                    f"{payload.get('feature_type', row.get('feature_type'))} != {feature_type}",
+                )
+            )
+        if expected_dtype is not None and str(payload.get("dtype", row.get("dtype", "float32"))).lower() != expected_dtype:
+            raise RuntimeError(
+                _ml_feature_error(
+                    split,
+                    f"payload dtype mismatch for {key}: "
+                    f"{payload.get('dtype', row.get('dtype', 'float32'))} != {expected_dtype}",
+                )
+            )
+        features = payload.get("features")
+        if not isinstance(features, dict):
+            raise RuntimeError(_ml_feature_error(split, f"payload missing features dict for {key}: {cache_path}"))
+        spatial = None
+        channels = None
+        for label in labels:
+            tensor = features.get(label)
+            if not torch.is_tensor(tensor):
+                raise RuntimeError(_ml_feature_error(split, f"payload missing tensor features/{label} for {key}: {cache_path}"))
+            if tensor.ndim != 3:
+                raise RuntimeError(_ml_feature_error(split, f"features/{label} must be [C,H,W], got {list(tensor.shape)}"))
+            shape = list(tensor.shape)
+            if row_shape.get(label) != shape:
+                raise RuntimeError(
+                    _ml_feature_error(
+                        split,
+                        f"shape mismatch for {key} {label}: manifest {row_shape.get(label)} != payload {shape}",
+                    )
+                )
+            if expected_dtype == "float16" and tensor.dtype != torch.float16:
+                raise RuntimeError(
+                    _ml_feature_error(split, f"features/{label} dtype must be float16 for {key}: {tensor.dtype}")
+                )
+            if expected_dtype == "float32" and tensor.dtype != torch.float32:
+                raise RuntimeError(
+                    _ml_feature_error(split, f"features/{label} dtype must be float32 for {key}: {tensor.dtype}")
+                )
+            if spatial is None:
+                spatial = tuple(shape[-2:])
+                channels = int(shape[0])
+            elif tuple(shape[-2:]) != spatial or int(shape[0]) != channels:
+                raise RuntimeError(_ml_feature_error(split, f"multi-level feature shapes are inconsistent for {key}"))
+        tensor = payload.get("tensor")
+        if not torch.is_tensor(tensor):
+            raise RuntimeError(_ml_feature_error(split, f"payload missing tensor field for {key}: {cache_path}"))
+        if list(tensor.shape) != list(features[labels[-1]].shape):
+            raise RuntimeError(_ml_feature_error(split, f"payload tensor must match {labels[-1]} for {key}: {cache_path}"))
+        if expected_dtype == "float16" and tensor.dtype != torch.float16:
+            raise RuntimeError(_ml_feature_error(split, f"payload tensor dtype must be float16 for {key}: {tensor.dtype}"))
+        if expected_dtype == "float32" and tensor.dtype != torch.float32:
+            raise RuntimeError(_ml_feature_error(split, f"payload tensor dtype must be float32 for {key}: {tensor.dtype}"))
+
+    return True, f"complete: {manifest_path} | payload_check={preflight_mode}:{len(payload_keys)}/{len(expected_keys)}"
 
 
 def _qra_required_shapes(cfg):
@@ -783,6 +1008,82 @@ def check_despl_light_cache(cfg, max_samples=None):
                         f"invalid p_despl_68 shape for {key}: {list(tensor.shape)} != {expected_shape}"
                     )
                 )
+
+    return True, f"complete: {manifest_path}"
+
+
+def _despl_paper_error(reason):
+    return (
+        f"DESPL-paper cache missing or incomplete: {reason}\n"
+        "Please run:\n"
+        "python common/cache_despl_paper.py --config configs/despl_paper_dinov1_s8.py --overwrite"
+    )
+
+
+def check_despl_paper_cache(cfg, max_samples=None):
+    sign_mode = getattr(cfg, "DESPL_PAPER_SIGN_MODE", getattr(cfg, "DESPL_SIGN_MODE", "paper"))
+    manifest_path = despl_paper_manifest_path(cfg, sign_mode=sign_mode)
+    if not manifest_path.exists():
+        raise RuntimeError(_despl_paper_error(f"missing manifest: {manifest_path}"))
+
+    expected_items = build_image_items(cfg.DATA_ROOT, cfg.TRAIN_DATASETS, require_gt=False)
+    if max_samples is not None and int(max_samples) >= 0:
+        expected_items = expected_items[: int(max_samples)]
+    expected_keys = [(item["dataset"], item["stem"]) for item in expected_items]
+    expected_key_set = set(expected_keys)
+
+    rows = read_jsonl(manifest_path)
+    row_map = {}
+    for row in rows:
+        if "dataset" not in row or "stem" not in row:
+            raise RuntimeError(_despl_paper_error(f"bad manifest row without dataset/stem in {manifest_path}"))
+        key = (row["dataset"], row["stem"])
+        if key in row_map:
+            raise RuntimeError(_despl_paper_error(f"duplicate manifest key in {manifest_path}: {key}"))
+        row_map[key] = row
+
+    actual_key_set = set(row_map)
+    if max_samples is None or int(max_samples) < 0:
+        extra = sorted(actual_key_set - expected_key_set)
+        if extra:
+            raise RuntimeError(_despl_paper_error(f"manifest has unexpected keys first 10: {extra[:10]}"))
+    missing = sorted(expected_key_set - actual_key_set)
+    if missing:
+        raise RuntimeError(_despl_paper_error(f"missing manifest rows first 10: {missing[:10]}"))
+
+    grid = int(getattr(cfg, "DESPL_GRID", 34))
+    expected_shape = [1, grid, grid]
+    expected_backbone = getattr(cfg, "DESPL_PAPER_BACKBONE_KEY", cfg.BACKBONE_KEY)
+    for key in expected_keys:
+        row = row_map[key]
+        if row.get("backbone_key", expected_backbone) != expected_backbone:
+            raise RuntimeError(
+                _despl_paper_error(
+                    f"backbone mismatch for {key}: {row.get('backbone_key')} != {expected_backbone}"
+                )
+            )
+        if row.get("sign_mode", sign_mode) != sign_mode:
+            raise RuntimeError(
+                _despl_paper_error(f"sign_mode mismatch for {key}: {row.get('sign_mode')} != {sign_mode}")
+            )
+        cache_path = row.get("cache_path")
+        if not cache_path:
+            raise RuntimeError(_despl_paper_error(f"missing cache_path for {key}"))
+        if not Path(cache_path).exists():
+            raise RuntimeError(_despl_paper_error(f"missing cache file: {cache_path}"))
+        shape = row.get("shape")
+        if shape != expected_shape:
+            raise RuntimeError(_despl_paper_error(f"invalid shape for {key}: {shape} != {expected_shape}"))
+        payload = torch_load(cache_path, map_location="cpu")
+        tensor = payload.get("p_despl_paper_soft") if isinstance(payload, dict) else None
+        if not torch.is_tensor(tensor):
+            raise RuntimeError(_despl_paper_error(f"missing p_despl_paper_soft for {key}: {cache_path}"))
+        if list(tensor.shape) != expected_shape:
+            raise RuntimeError(
+                _despl_paper_error(
+                    f"invalid p_despl_paper_soft shape for {key}: {list(tensor.shape)} != {expected_shape}"
+                )
+            )
 
     return True, f"complete: {manifest_path}"
 

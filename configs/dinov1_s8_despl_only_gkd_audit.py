@@ -1,0 +1,56 @@
+from configs.dinov1_s8_despl_only_teacher_cache import *  # noqa: F401,F403
+
+
+EXP_NAME = "dinov1_s8_despl_only_gkd_audit"
+
+# Audit only: compute GKD statistics but do not change loss.
+GKD_MODE = "audit"
+USE_GKD_LITE = False
+
+# Keep DESPL-only path unchanged.
+HEAD_TYPE = "simple"
+USE_GATED_CONTEXT_HEAD = False
+
+USE_DESPL_PSEUDO = True
+USE_DESPL_LIGHT_CACHE = True
+P_INIT_MODE = "despl_only"
+P_INIT_DESPL_WEIGHT = 1.0
+P_INIT_FIXED_WEIGHT = 0.0
+
+USE_QRA = False
+USE_CCR = False
+USE_DREPP = False
+USE_DRE_SAFE_PRIOR = False
+USE_DESPL_PAPER_CACHE = False
+
+PSEUDO_USE_GCM = False
+USE_GCM = False
+PSEUDO_USE_TEACHER = False
+PSEUDO_USE_LOCAL_ATTN = False
+
+USE_PSTA = False
+USE_MNP = False
+DINO_USE_LORA = False
+USE_CNN_DETAIL_BRANCH = False
+USE_AFF = False
+USE_DUAL_FG_BG_HEAD = False
+USE_BOUNDARY_HEAD = False
+
+LAMBDA_MNP = 0.0
+LAMBDA_LOCAL = 0.0
+LAMBDA_PSTA = 0.0
+LAMBDA_CONTRAST = 0.0
+LAMBDA_BOUNDARY = 0.0
+LAMBDA_ENTROPY = 0.0
+LAMBDA_ANCHOR = 0.0
+
+USE_DESPL_ANCHOR_PBCE = False
+USE_LATE_DESPL_ANCHOR_LOSS = False
+USE_PURE_DESPL_SUPERVISION = False
+USE_FAST_TEACHER_FUSION = False
+TEACHER_FUSION_MODE = "default"
+
+GKD_AUDIT_WRITE_CSV = True
+GKD_AUDIT_LOG_FIRST_BATCH = True
+GKD_AUDIT_LOG_LOSS_DELTA = True
+GKD_AUDIT_LOG_PIXEL_HIST = True

@@ -12,9 +12,11 @@ from common.utils import (
     ccr_manifest_path,
     check_exact_keys,
     despl_light_cache_manifest_path,
+    despl_paper_manifest_path,
     despl_pseudo_bank_manifest_path,
     drepp_manifest_path,
     manifest_to_map,
+    ml_feature_cache_manifest_path,
     qra_manifest_path,
     read_jsonl,
     torch_load,
@@ -99,6 +101,62 @@ def _load_feature(row, expected_dataset, expected_stem):
     if tensor.ndim != 3:
         raise RuntimeError(f"Feature tensor must be [C,H,W], got {list(tensor.shape)}")
     return tensor, payload
+
+
+def _expected_feature_channels(cfg):
+    if cfg.BACKBONE_KEY == "dinov1-s8":
+        return 384
+    if cfg.BACKBONE_KEY in {"dinov1-b8", "dinov2-b14"}:
+        return 768
+    return None
+
+
+def _load_multi_level_feature(row, expected_dataset, expected_stem, cfg):
+    payload = torch_load(row["cache_path"], map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(f"Multi-level feature cache must be a dict: {row['cache_path']}")
+    if payload.get("dataset") != expected_dataset:
+        raise RuntimeError(
+            f"Multi-level feature dataset mismatch for {row['cache_path']}: "
+            f"{payload.get('dataset')} != {expected_dataset}"
+        )
+    if payload.get("stem") != expected_stem:
+        raise RuntimeError(
+            f"Multi-level feature stem mismatch for {row['cache_path']}: "
+            f"{payload.get('stem')} != {expected_stem}"
+        )
+    if payload.get("backbone_key") != cfg.BACKBONE_KEY:
+        raise RuntimeError(
+            f"Multi-level feature backbone mismatch for {row['cache_path']}: "
+            f"{payload.get('backbone_key')} != {cfg.BACKBONE_KEY}"
+        )
+    features = payload.get("features")
+    if not isinstance(features, dict):
+        raise KeyError(f"Multi-level feature payload missing features dict: {row['cache_path']}")
+    labels = [f"l{int(layer)}" for layer in getattr(cfg, "MULTI_LEVEL_LAYERS", [4, 8, 12])]
+    expected_channels = _expected_feature_channels(cfg)
+    out = {}
+    spatial = None
+    for label in labels:
+        tensor = features.get(label)
+        if not torch.is_tensor(tensor):
+            raise KeyError(f"Multi-level feature payload missing features/{label}: {row['cache_path']}")
+        if tensor.ndim != 3:
+            raise RuntimeError(f"Multi-level feature {label} must be [C,H,W], got {list(tensor.shape)}")
+        if expected_channels is not None and int(tensor.shape[0]) != expected_channels:
+            raise RuntimeError(
+                f"Multi-level feature {label} channel mismatch: "
+                f"{int(tensor.shape[0])} != {expected_channels} | {row['cache_path']}"
+            )
+        if spatial is None:
+            spatial = tuple(tensor.shape[-2:])
+        elif tuple(tensor.shape[-2:]) != spatial:
+            raise RuntimeError(f"Multi-level feature spatial mismatch in {row['cache_path']}")
+        out[label] = tensor
+    result = {f"feature_{label}": out[label] for label in labels}
+    result["feature"] = out[labels[-1]]
+    result["payload"] = payload
+    return result
 
 
 def _load_pseudo(row, expected_dataset, expected_stem):
@@ -228,6 +286,65 @@ def _load_despl_light_pseudo(row, expected_dataset, expected_stem, cfg):
         "p_despl_area": float(payload.get("p_despl_area", pseudo_despl.float().mean().item())),
         "_has_p_fixed_68": bool(has_pseudo_fixed),
         "_has_p_despl_68": bool(has_pseudo_despl),
+    }
+
+
+def _load_despl_paper(row, expected_dataset, expected_stem, cfg):
+    payload = torch_load(row["cache_path"], map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(f"DESPL-paper cache payload must be a dict: {row['cache_path']}")
+    if payload.get("dataset") != expected_dataset:
+        raise RuntimeError(
+            f"DESPL-paper dataset mismatch for {row['cache_path']}: "
+            f"{payload.get('dataset')} != {expected_dataset}"
+        )
+    if payload.get("stem") != expected_stem:
+        raise RuntimeError(
+            f"DESPL-paper stem mismatch for {row['cache_path']}: "
+            f"{payload.get('stem')} != {expected_stem}"
+        )
+    expected_backbone = getattr(cfg, "DESPL_PAPER_BACKBONE_KEY", cfg.BACKBONE_KEY)
+    if payload.get("backbone_key") != expected_backbone:
+        raise RuntimeError(
+            f"DESPL-paper backbone mismatch for {row['cache_path']}: "
+            f"{payload.get('backbone_key')} != {expected_backbone}"
+        )
+    expected_sign = getattr(cfg, "DESPL_PAPER_SIGN_MODE", "paper")
+    if payload.get("sign_mode") != expected_sign:
+        raise RuntimeError(
+            f"DESPL-paper sign_mode mismatch for {row['cache_path']}: "
+            f"{payload.get('sign_mode')} != {expected_sign}"
+        )
+    if "p_despl_paper_soft" not in payload:
+        raise KeyError(f"DESPL-paper cache missing p_despl_paper_soft: {row['cache_path']}")
+    pseudo = payload["p_despl_paper_soft"]
+    if not torch.is_tensor(pseudo):
+        raise TypeError(f"DESPL-paper p_despl_paper_soft must be tensor: {row['cache_path']}")
+    pseudo = pseudo.float()
+    grid = int(getattr(cfg, "DESPL_GRID", pseudo.shape[-1]))
+    expected_shape = [1, grid, grid]
+    if list(pseudo.shape) != expected_shape:
+        raise RuntimeError(
+            f"DESPL-paper p_despl_paper_soft shape mismatch: "
+            f"{list(pseudo.shape)} != {expected_shape} | {row['cache_path']}"
+        )
+    _validate_unit_range(pseudo, "p_despl_paper_soft", row["cache_path"])
+    binary = payload.get("p_despl_paper", (pseudo > 0.5).float())
+    if not torch.is_tensor(binary):
+        raise TypeError(f"DESPL-paper p_despl_paper must be tensor: {row['cache_path']}")
+    binary = binary.float()
+    if list(binary.shape) != expected_shape:
+        raise RuntimeError(
+            f"DESPL-paper p_despl_paper shape mismatch: "
+            f"{list(binary.shape)} != {expected_shape} | {row['cache_path']}"
+        )
+    return {
+        "pseudo": pseudo,
+        "binary": binary,
+        "area": float(payload.get("area", pseudo.mean().item())),
+        "view_consistency": float(payload.get("view_consistency", 0.0)),
+        "sign_mode": str(payload.get("sign_mode", expected_sign)),
+        "cache_path": row["cache_path"],
     }
 
 
@@ -383,8 +500,11 @@ class CachedTrainDataset(Dataset):
         self.use_despl_pseudo = bool(getattr(cfg, "USE_DESPL_PSEUDO", False))
         self.p_init_mode = str(getattr(cfg, "P_INIT_MODE", ""))
         self.use_despl_only = self.use_despl_pseudo and self.p_init_mode == "despl_only"
+        self.use_despl_paper = self.use_despl_pseudo and self.p_init_mode == "despl_paper_only"
         self.use_dre_safe_prior = self.use_despl_pseudo and bool(getattr(cfg, "USE_DRE_SAFE_PRIOR", False))
         self.use_despl_light_cache = self.use_despl_pseudo and bool(getattr(cfg, "USE_DESPL_LIGHT_CACHE", False))
+        self.use_multi_level_feature = bool(getattr(cfg, "USE_MULTI_LEVEL_FEATURE", False))
+        self.multi_level_layers = [int(layer) for layer in getattr(cfg, "MULTI_LEVEL_LAYERS", [4, 8, 12])]
         if self.use_qra and self.use_ccr:
             raise RuntimeError("USE_QRA=True and USE_CCR=True cannot be combined.")
         if self.use_drepp and (self.use_qra or self.use_ccr or self.use_despl_pseudo):
@@ -399,8 +519,13 @@ class CachedTrainDataset(Dataset):
             raise RuntimeError("Training dataset is empty.")
         self.keys = [(item["dataset"], item["stem"]) for item in self.items]
 
-        feature_rows = read_jsonl(_feature_manifest_path(cfg, "train"))
-        self.feature_map = manifest_to_map(feature_rows, _feature_manifest_path(cfg, "train"))
+        feature_manifest = (
+            ml_feature_cache_manifest_path(cfg, "train")
+            if self.use_multi_level_feature
+            else _feature_manifest_path(cfg, "train")
+        )
+        feature_rows = read_jsonl(feature_manifest)
+        self.feature_map = manifest_to_map(feature_rows, feature_manifest)
         if max_samples < 0:
             check_exact_keys(
                 "feature train cache", self.feature_map.keys(), self.keys
@@ -434,6 +559,7 @@ class CachedTrainDataset(Dataset):
         self.despl_map = None
         self.despl_cache_root = None
         self.despl_first_cache_path = None
+        self.despl_paper_map = None
         self.drepp_map = None
         self.drepp_cache_root = None
         self.drepp_first_cache_path = None
@@ -454,26 +580,38 @@ class CachedTrainDataset(Dataset):
             self.actual_pseudo_cache_pattern = f"{self.drepp_cache_root}/<dataset>/<stem>.pt"
             self.pseudo_map = {}
         elif self.use_despl_pseudo:
-            despl_manifest = (
-                despl_light_cache_manifest_path(cfg)
-                if self.use_despl_light_cache
-                else despl_pseudo_bank_manifest_path(cfg)
-            )
+            if self.use_despl_paper:
+                despl_manifest = despl_paper_manifest_path(
+                    cfg,
+                    sign_mode=getattr(cfg, "DESPL_PAPER_SIGN_MODE", "paper"),
+                )
+            else:
+                despl_manifest = (
+                    despl_light_cache_manifest_path(cfg)
+                    if self.use_despl_light_cache
+                    else despl_pseudo_bank_manifest_path(cfg)
+                )
             despl_rows = read_jsonl(despl_manifest)
             self.despl_map = manifest_to_map(despl_rows, despl_manifest)
             if max_samples < 0:
-                cache_name = "DESPL light cache" if self.use_despl_light_cache else "DESPL pseudo bank"
+                if self.use_despl_paper:
+                    cache_name = "DESPL-paper cache"
+                else:
+                    cache_name = "DESPL light cache" if self.use_despl_light_cache else "DESPL pseudo bank"
                 check_exact_keys(cache_name, self.despl_map.keys(), self.keys)
             else:
                 missing_despl = sorted(set(self.keys) - set(self.despl_map))
                 if missing_despl:
-                    cache_name = "DESPL light cache" if self.use_despl_light_cache else "DESPL pseudo bank"
+                    if self.use_despl_paper:
+                        cache_name = "DESPL-paper cache"
+                    else:
+                        cache_name = "DESPL light cache" if self.use_despl_light_cache else "DESPL pseudo bank"
                     raise RuntimeError(f"{cache_name} missing first 10: {missing_despl[:10]}")
             self.despl_cache_root = str(despl_manifest.parent.resolve())
             self.actual_pseudo_cache_root = self.despl_cache_root
             self.actual_pseudo_cache_pattern = f"{self.despl_cache_root}/<dataset>/<stem>.pt"
             self.pseudo_map = {}
-            if not self.use_despl_light_cache:
+            if not self.use_despl_light_cache and not self.use_despl_paper:
                 pseudo_manifest = _pseudo_manifest_path(cfg)
                 if pseudo_manifest.exists():
                     pseudo_rows = read_jsonl(pseudo_manifest)
@@ -529,7 +667,16 @@ class CachedTrainDataset(Dataset):
             )
 
         first_dataset, first_stem = self.keys[0]
-        feature, _ = _load_feature(self.feature_map[(first_dataset, first_stem)], first_dataset, first_stem)
+        if self.use_multi_level_feature:
+            ml_payload = _load_multi_level_feature(
+                self.feature_map[(first_dataset, first_stem)],
+                first_dataset,
+                first_stem,
+                cfg,
+            )
+            feature = ml_payload["feature"]
+        else:
+            feature, _ = _load_feature(self.feature_map[(first_dataset, first_stem)], first_dataset, first_stem)
         self.feature_shape = list(feature.shape)
         self.in_channels = int(feature.shape[0])
         if self.use_drepp:
@@ -545,7 +692,16 @@ class CachedTrainDataset(Dataset):
             self.first_pseudo_cache_path = self.drepp_first_cache_path
             self.pseudo_final_candidate = "p_despl memory anchor + fixed-local recall (global_blend=false)"
         elif self.use_despl_pseudo:
-            if self.use_despl_light_cache:
+            if self.use_despl_paper:
+                despl_payload = _load_despl_paper(
+                    self.despl_map[(first_dataset, first_stem)],
+                    first_dataset,
+                    first_stem,
+                    cfg,
+                )
+                self.pseudo_shape = list(despl_payload["pseudo"].shape)
+                self.pseudo_source = "despl_paper_cache"
+            elif self.use_despl_light_cache:
                 despl_payload = _load_despl_light_pseudo(
                     self.despl_map[(first_dataset, first_stem)],
                     first_dataset,
@@ -573,6 +729,8 @@ class CachedTrainDataset(Dataset):
             self.first_pseudo_cache_path = self.despl_first_cache_path
             if self.use_dre_safe_prior:
                 self.pseudo_final_candidate = "safe_despl_residual"
+            elif self.use_despl_paper:
+                self.pseudo_final_candidate = "p_despl_paper_soft"
             elif self.use_despl_only:
                 self.pseudo_final_candidate = "p_despl"
             else:
@@ -672,12 +830,33 @@ class CachedTrainDataset(Dataset):
         stem = item["stem"]
         key = (dataset, stem)
 
-        feature, feature_payload = _load_feature(self.feature_map[key], dataset, stem)
+        if self.use_multi_level_feature:
+            ml_feature_payload = _load_multi_level_feature(self.feature_map[key], dataset, stem, self.cfg)
+            feature = ml_feature_payload["feature"]
+            feature_payload = ml_feature_payload["payload"]
+        else:
+            feature, feature_payload = _load_feature(self.feature_map[key], dataset, stem)
         if self.use_drepp:
             drepp_payload = _load_drepp(self.drepp_map[key], dataset, stem, self.cfg)
             pseudo = drepp_payload["p_despl"].float()
         elif self.use_despl_pseudo:
-            if self.use_despl_light_cache:
+            if self.use_despl_paper:
+                paper_payload = _load_despl_paper(self.despl_map[key], dataset, stem, self.cfg)
+                pseudo = paper_payload["pseudo"].float()
+                pseudo_fixed = torch.zeros_like(pseudo)
+                pseudo_despl = pseudo
+                pseudo_base = pseudo
+                pseudo_safe = pseudo
+                dre_safe = None
+                use_fixed_in_pseudo = False
+                p_init_area = float(pseudo.mean().item())
+                p_fixed_area = 0.0
+                p_despl_area = p_init_area
+                p_despl_paper_area = float(paper_payload["area"])
+                p_despl_paper_view_consistency = float(paper_payload["view_consistency"])
+                p_despl_paper_binary = paper_payload["binary"].float()
+                p_despl_paper_sign_mode = paper_payload["sign_mode"]
+            elif self.use_despl_light_cache:
                 light_payload = _load_despl_light_pseudo(self.despl_map[key], dataset, stem, self.cfg)
                 pseudo_fixed = light_payload["pseudo_fixed"]
                 pseudo_despl = light_payload["pseudo_despl"]
@@ -753,6 +932,11 @@ class CachedTrainDataset(Dataset):
             p_init_area = float(pseudo.mean().item())
             p_fixed_area = float(pseudo_fixed.mean().item())
             p_despl_area = float(pseudo_despl.mean().item())
+            if not self.use_despl_paper:
+                p_despl_paper_area = 0.0
+                p_despl_paper_view_consistency = 0.0
+                p_despl_paper_binary = torch.zeros_like(pseudo)
+                p_despl_paper_sign_mode = ""
         else:
             pseudo, pseudo_payload = _load_pseudo(self.pseudo_map[key], dataset, stem)
             if (
@@ -776,6 +960,13 @@ class CachedTrainDataset(Dataset):
             "stem": stem,
             "image_path": item["image_path"],
         }
+        if self.use_multi_level_feature:
+            sample.update(
+                {
+                    f"feature_l{int(layer)}": ml_feature_payload[f"feature_l{int(layer)}"]
+                    for layer in self.multi_level_layers
+                }
+            )
         if self.use_despl_pseudo:
             sample.update(
                 {
@@ -788,6 +979,16 @@ class CachedTrainDataset(Dataset):
                     "fixed_used_for_training": bool(use_fixed_in_pseudo),
                 }
             )
+            if self.use_despl_paper:
+                sample.update(
+                    {
+                        "pseudo_despl_paper": pseudo.float(),
+                        "pseudo_despl_paper_binary": p_despl_paper_binary.float(),
+                        "p_despl_paper_area": p_despl_paper_area,
+                        "p_despl_paper_view_consistency": p_despl_paper_view_consistency,
+                        "despl_paper_sign_mode": p_despl_paper_sign_mode,
+                    }
+                )
             if self.use_dre_safe_prior:
                 sample.update(
                     {
@@ -884,15 +1085,31 @@ class CachedEvalDataset(Dataset):
         if not self.items:
             raise RuntimeError(f"{split} dataset is empty.")
         self.keys = [(item["dataset"], item["stem"]) for item in self.items]
+        self.use_multi_level_feature = bool(getattr(cfg, "USE_MULTI_LEVEL_FEATURE", False))
+        self.multi_level_layers = [int(layer) for layer in getattr(cfg, "MULTI_LEVEL_LAYERS", [4, 8, 12])]
 
-        feature_rows = read_jsonl(_feature_manifest_path(cfg, split))
-        self.feature_map = manifest_to_map(feature_rows, _feature_manifest_path(cfg, split))
+        feature_manifest = (
+            ml_feature_cache_manifest_path(cfg, split)
+            if self.use_multi_level_feature
+            else _feature_manifest_path(cfg, split)
+        )
+        feature_rows = read_jsonl(feature_manifest)
+        self.feature_map = manifest_to_map(feature_rows, feature_manifest)
         missing = sorted(set(self.keys) - set(self.feature_map.keys()))
         if missing:
             raise RuntimeError(f"feature {split} cache missing first 10: {missing[:10]}")
 
         first_dataset, first_stem = self.keys[0]
-        feature, _ = _load_feature(self.feature_map[(first_dataset, first_stem)], first_dataset, first_stem)
+        if self.use_multi_level_feature:
+            ml_payload = _load_multi_level_feature(
+                self.feature_map[(first_dataset, first_stem)],
+                first_dataset,
+                first_stem,
+                cfg,
+            )
+            feature = ml_payload["feature"]
+        else:
+            feature, _ = _load_feature(self.feature_map[(first_dataset, first_stem)], first_dataset, first_stem)
         self.feature_shape = list(feature.shape)
         self.in_channels = int(feature.shape[0])
 
@@ -904,10 +1121,15 @@ class CachedEvalDataset(Dataset):
         dataset = item["dataset"]
         stem = item["stem"]
         key = (dataset, stem)
-        feature, payload = _load_feature(self.feature_map[key], dataset, stem)
+        if self.use_multi_level_feature:
+            ml_feature_payload = _load_multi_level_feature(self.feature_map[key], dataset, stem, self.cfg)
+            feature = ml_feature_payload["feature"]
+            payload = ml_feature_payload["payload"]
+        else:
+            feature, payload = _load_feature(self.feature_map[key], dataset, stem)
         gt = _load_gt(item["gt_path"])
         original_size = tuple(payload.get("original_size", gt.shape[-2:]))
-        return {
+        sample = {
             "feature": feature,
             "gt": gt,
             "dataset": dataset,
@@ -916,3 +1138,11 @@ class CachedEvalDataset(Dataset):
             "gt_path": item["gt_path"],
             "original_size": original_size,
         }
+        if self.use_multi_level_feature:
+            sample.update(
+                {
+                    f"feature_l{int(layer)}": ml_feature_payload[f"feature_l{int(layer)}"]
+                    for layer in self.multi_level_layers
+                }
+            )
+        return sample
