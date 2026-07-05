@@ -2727,7 +2727,9 @@ def current_time_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def should_save_epoch_checkpoint(epoch, max_epoch, save_interval, reset_epoch=None):
+def should_save_epoch_checkpoint(epoch, max_epoch, save_interval, reset_epoch=None, save_every_epoch=False):
+    if bool(save_every_epoch):
+        return True
     if reset_epoch is not None and int(epoch) == int(reset_epoch):
         return True
     last_checkpoint_start = max(1, int(max_epoch) - 4)
@@ -4615,6 +4617,8 @@ def main():
             f"{bool(getattr(cfg, 'LR_FLOOR_APPLY_AFTER_FINETUNE_RESET', True))}"
         )
         logger.log(f"max_epoch = {max_epoch}")
+        logger.log(f"SAVE_EVERY_EPOCH = {bool(getattr(cfg, 'SAVE_EVERY_EPOCH', False))}")
+        logger.log(f"SAVE_INTERVAL = {int(getattr(cfg, 'SAVE_INTERVAL', 0))}")
         logger.log(f"max_samples = {sample_limit}")
         logger.log(f"ema_weight = {cfg.EMA_WEIGHT}")
         logger.log(f"finetune_reset_epoch = {reset_epoch}")
@@ -8276,7 +8280,13 @@ def main():
             logger.log(f"best MAE so far = {best_metric:.6f}")
             logger.log(f"best epoch = {best_epoch}")
 
-            if should_save_epoch_checkpoint(epoch, max_epoch, cfg.SAVE_INTERVAL, reset_epoch=reset_epoch):
+            if should_save_epoch_checkpoint(
+                epoch,
+                max_epoch,
+                cfg.SAVE_INTERVAL,
+                reset_epoch=reset_epoch,
+                save_every_epoch=bool(getattr(cfg, "SAVE_EVERY_EPOCH", False)),
+            ):
                 save_checkpoint(
                     ckpt_dir / f"epoch_{epoch:03d}.pth",
                     epoch,

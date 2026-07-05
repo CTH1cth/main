@@ -145,7 +145,7 @@ def main():
 
     cfg = load_config(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    out_dir = Path(cfg.WORK_ROOT) / cfg.EXP_NAME / "eval"
+    out_dir = Path(cfg.WORK_ROOT) / cfg.EXP_NAME / "eval35"
     ensure_dir(out_dir)
     write_yaml(out_dir / "config.yaml", config_to_dict(cfg))
 
