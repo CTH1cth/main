@@ -259,6 +259,21 @@ def get_rast_scale(cfg, epoch):
     )
 
 
+def get_esa_asym_scale(cfg, epoch):
+    if not bool(getattr(cfg, "USE_ESA_ASYM", False)):
+        return 0.0
+    start = int(getattr(cfg, "ESA_ASYM_START_EPOCH", 7))
+    ramp_end = int(getattr(cfg, "ESA_ASYM_RAMP_END_EPOCH", 15))
+    stop = int(getattr(cfg, "ESA_ASYM_STOP_EPOCH", 21))
+    epoch = int(epoch)
+    if epoch < start or epoch >= stop:
+        return 0.0
+    if epoch <= ramp_end:
+        denom = max(1, ramp_end - start + 1)
+        return float(epoch - start + 1) / float(denom)
+    return 1.0
+
+
 def get_dabe_oem_schedule(epoch, cfg):
     epoch = int(epoch)
     stage1_end = int(getattr(cfg, "OEM_STAGE1_END", 3))
@@ -1372,6 +1387,60 @@ def _rast_mask_mean(value, mask):
     return float((value * mask_f).sum().detach().item() / (denom.detach().item() + 1e-6))
 
 
+def compute_dino_core_margin_68(cfg, batch, fg_core, bg_core, output_size, device, prefix="ESA"):
+    feat = batch["feature"].to(device, non_blocking=True).float()
+    if feat.ndim != 4 or feat.shape[1] != 384:
+        raise RuntimeError(f"{prefix} expects cached DINO feature [B,384,H,W], got {list(feat.shape)}.")
+    feature_size = int(getattr(cfg, f"{prefix}_FEATURE_SIZE", feat.shape[-1]))
+    if feat.shape[-2:] != (feature_size, feature_size):
+        raise RuntimeError(
+            f"{prefix} expects feature spatial {feature_size}x{feature_size}, got {list(feat.shape[-2:])}."
+        )
+
+    feat_norm = F.normalize(feat, dim=1)
+    fg_core_feat = F.interpolate(fg_core.float(), size=feat.shape[-2:], mode="nearest") > 0.5
+    bg_core_feat = F.interpolate(bg_core.float(), size=feat.shape[-2:], mode="nearest") > 0.5
+
+    margin_feat = torch.zeros(
+        (feat.shape[0], 1, feat.shape[-2], feat.shape[-1]),
+        device=device,
+        dtype=feat.dtype,
+    )
+    skipped_no_fg = 0
+    skipped_no_bg = 0
+    for idx in range(int(feat.shape[0])):
+        fg_mask = fg_core_feat[idx, 0]
+        bg_mask = bg_core_feat[idx, 0]
+        if int(fg_mask.sum().detach().item()) <= 0:
+            skipped_no_fg += 1
+            continue
+        if int(bg_mask.sum().detach().item()) <= 0:
+            skipped_no_bg += 1
+            continue
+        fg_proto = F.normalize(feat_norm[idx, :, fg_mask].mean(dim=1), dim=0)
+        bg_proto = F.normalize(feat_norm[idx, :, bg_mask].mean(dim=1), dim=0)
+        if bool(getattr(cfg, f"{prefix}_DETACH_PROTO", True)):
+            fg_proto = fg_proto.detach()
+            bg_proto = bg_proto.detach()
+        sim_fg = (feat_norm[idx] * fg_proto.view(-1, 1, 1)).sum(dim=0, keepdim=True)
+        sim_bg = (feat_norm[idx] * bg_proto.view(-1, 1, 1)).sum(dim=0, keepdim=True)
+        margin_feat[idx] = sim_fg - sim_bg
+
+    margin_68 = F.interpolate(
+        margin_feat,
+        size=output_size,
+        mode="bilinear",
+        align_corners=False,
+    )
+    if bool(getattr(cfg, f"{prefix}_DETACH_MASK", True)):
+        margin_68 = margin_68.detach()
+    stats = {
+        f"{prefix.lower()}_skipped_no_fg_proto": skipped_no_fg,
+        f"{prefix.lower()}_skipped_no_bg_proto": skipped_no_bg,
+    }
+    return margin_68, stats
+
+
 def build_rast_teacher_weight_map(cfg, batch, teacher_binary, epoch, device):
     masks = build_rast_region_masks(batch, device)
     fg_core = masks["fg_core"]
@@ -1399,6 +1468,65 @@ def build_rast_teacher_weight_map(cfg, batch, teacher_binary, epoch, device):
     conflict_mult = float(getattr(cfg, "RAST_CONFLICT_TEACHER_MULT", 0.20))
     teacher_map_region = torch.where(fg_conflict, teacher_map_region * conflict_mult, teacher_map_region)
     teacher_map_region = torch.where(bg_conflict, teacher_map_region * conflict_mult, teacher_map_region)
+
+    use_esa_asym = bool(getattr(cfg, "USE_ESA_ASYM", False))
+    esa_margin_68 = torch.zeros_like(teacher_binary, dtype=torch.float32, device=device)
+    esa_margin_stats = {
+        "esa_skipped_no_fg_proto": 0,
+        "esa_skipped_no_bg_proto": 0,
+    }
+    extent_teacher_fg = extent & teacher_fg
+    extent_teacher_bg = extent & teacher_bg
+    extent_teacher_bg_fg_like = torch.zeros_like(extent_teacher_bg)
+    extent_teacher_bg_bg_like = torch.zeros_like(extent_teacher_bg)
+    extent_teacher_bg_ambig = torch.zeros_like(extent_teacher_bg)
+    if use_esa_asym:
+        if not bool(getattr(cfg, "ESA_USE_DINO_MARGIN", True)):
+            raise RuntimeError("USE_ESA_ASYM=True currently requires ESA_USE_DINO_MARGIN=True.")
+        esa_margin_68, esa_margin_stats = compute_dino_core_margin_68(
+            cfg,
+            batch,
+            fg_core,
+            bg_core,
+            teacher_binary.shape[-2:],
+            device,
+            prefix="ESA",
+        )
+        margin_fg_like = float(getattr(cfg, "ESA_MARGIN_FG_LIKE", 0.05))
+        margin_bg_like = float(getattr(cfg, "ESA_MARGIN_BG_LIKE", -0.05))
+        extent_teacher_bg_fg_like = extent_teacher_bg & (esa_margin_68 >= margin_fg_like)
+        extent_teacher_bg_bg_like = extent_teacher_bg & (esa_margin_68 <= margin_bg_like)
+        extent_teacher_bg_ambig = extent_teacher_bg & (~extent_teacher_bg_fg_like) & (~extent_teacher_bg_bg_like)
+
+        teacher_map_esa = torch.ones_like(teacher_binary, dtype=torch.float32, device=device)
+        teacher_map_esa = teacher_map_esa * float(getattr(cfg, "RAST_OTHER_TEACHER_MULT", 1.0))
+        unknown_mult = float(getattr(cfg, "RAST_UNKNOWN_TEACHER_MULT", 0.50))
+        if bool(getattr(cfg, "ESA_TOUCH_UNKNOWN", False)):
+            unknown_mult = float(getattr(cfg, "ESA_UNKNOWN_TEACHER_MULT", unknown_mult))
+        teacher_map_esa = torch.where(unknown, teacher_map_esa * unknown_mult, teacher_map_esa)
+        teacher_map_esa = torch.where(
+            extent_teacher_fg,
+            teacher_map_esa * float(getattr(cfg, "ESA_EXTENT_TEACHER_FG_MULT", 1.0)),
+            teacher_map_esa,
+        )
+        teacher_map_esa = torch.where(
+            extent_teacher_bg_fg_like,
+            teacher_map_esa * float(getattr(cfg, "ESA_EXTENT_TEACHER_BG_FG_LIKE_MULT", 0.25)),
+            teacher_map_esa,
+        )
+        teacher_map_esa = torch.where(
+            extent_teacher_bg_ambig,
+            teacher_map_esa * float(getattr(cfg, "ESA_EXTENT_TEACHER_BG_AMBIG_MULT", 0.50)),
+            teacher_map_esa,
+        )
+        teacher_map_esa = torch.where(
+            extent_teacher_bg_bg_like,
+            teacher_map_esa * float(getattr(cfg, "ESA_EXTENT_TEACHER_BG_BG_LIKE_MULT", 1.0)),
+            teacher_map_esa,
+        )
+        teacher_map_esa = torch.where(fg_conflict, teacher_map_esa * conflict_mult, teacher_map_esa)
+        teacher_map_esa = torch.where(bg_conflict, teacher_map_esa * conflict_mult, teacher_map_esa)
+        teacher_map_region = teacher_map_esa
 
     teacher_map_post = torch.ones_like(teacher_binary, dtype=torch.float32, device=device)
     post_conflict_mult = float(getattr(cfg, "RAST_POST_RESET_CONFLICT_TEACHER_MULT", 0.30))
@@ -1453,6 +1581,34 @@ def build_rast_teacher_weight_map(cfg, batch, teacher_binary, epoch, device):
         "teacher_map_bg_core_mean": _rast_mask_mean(teacher_map_eff, bg_core),
         "teacher_map_extent_mean": _rast_mask_mean(teacher_map_eff, extent),
         "teacher_map_unknown_mean": _rast_mask_mean(teacher_map_eff, unknown),
+        "esa_asym_enable": use_esa_asym,
+        "esa_asym_scale": float(get_esa_asym_scale(cfg, epoch)),
+        "esa_margin_shape": list(esa_margin_68.shape),
+        "esa_margin_mean": float(esa_margin_68.mean().detach().item()),
+        "esa_margin_min": float(esa_margin_68.min().detach().item()),
+        "esa_margin_max": float(esa_margin_68.max().detach().item()),
+        "esa_margin_extent_mean": _rast_mask_mean(esa_margin_68, extent),
+        "esa_margin_extent_teacher_fg_mean": _rast_mask_mean(esa_margin_68, extent_teacher_fg),
+        "esa_margin_extent_teacher_bg_mean": _rast_mask_mean(esa_margin_68, extent_teacher_bg),
+        "esa_extent_teacher_fg_ratio": float(extent_teacher_fg.float().mean().detach().item()),
+        "esa_extent_teacher_bg_ratio": float(extent_teacher_bg.float().mean().detach().item()),
+        "esa_extent_teacher_bg_fg_like_ratio": float(extent_teacher_bg_fg_like.float().mean().detach().item()),
+        "esa_extent_teacher_bg_ambig_ratio": float(extent_teacher_bg_ambig.float().mean().detach().item()),
+        "esa_extent_teacher_bg_bg_like_ratio": float(extent_teacher_bg_bg_like.float().mean().detach().item()),
+        "esa_teacher_map_extent_mean": _rast_mask_mean(teacher_map_eff, extent),
+        "esa_teacher_map_extent_teacher_fg_mean": _rast_mask_mean(teacher_map_eff, extent_teacher_fg),
+        "esa_teacher_map_extent_teacher_bg_mean": _rast_mask_mean(teacher_map_eff, extent_teacher_bg),
+        "esa_teacher_map_extent_teacher_bg_fg_like_mean": _rast_mask_mean(
+            teacher_map_eff, extent_teacher_bg_fg_like
+        ),
+        "esa_teacher_map_extent_teacher_bg_ambig_mean": _rast_mask_mean(
+            teacher_map_eff, extent_teacher_bg_ambig
+        ),
+        "esa_teacher_map_extent_teacher_bg_bg_like_mean": _rast_mask_mean(
+            teacher_map_eff, extent_teacher_bg_bg_like
+        ),
+        "esa_skipped_no_fg_proto": int(esa_margin_stats.get("esa_skipped_no_fg_proto", 0)),
+        "esa_skipped_no_bg_proto": int(esa_margin_stats.get("esa_skipped_no_bg_proto", 0)),
     }
     return teacher_map_eff, stats
 
@@ -1474,6 +1630,270 @@ def rast_teacher_bce_with_logits(logits, target, teacher_map_eff, cfg, rast_scal
         )
     loss = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
     return (loss * teacher_map_eff.to(device=logits.device, dtype=logits.dtype)).mean()
+
+
+def get_hbns_scale(cfg, epoch):
+    if not bool(getattr(cfg, "USE_HBNS_LITE", False)):
+        return 0.0
+    start = int(getattr(cfg, "HBNS_START_EPOCH", 7))
+    ramp_end = int(getattr(cfg, "HBNS_RAMP_END_EPOCH", 15))
+    stop = int(getattr(cfg, "HBNS_STOP_EPOCH", 21))
+    epoch = int(epoch)
+    if epoch < start or epoch >= stop:
+        return 0.0
+    if epoch <= ramp_end:
+        denom = max(1, ramp_end - start + 1)
+        return float(epoch - start + 1) / float(denom)
+    return 1.0
+
+
+def get_epr_scale(cfg, epoch):
+    if not bool(getattr(cfg, "USE_EPR_POS", False)):
+        return 0.0
+    start = int(getattr(cfg, "EPR_START_EPOCH", 7))
+    ramp_end = int(getattr(cfg, "EPR_RAMP_END_EPOCH", 15))
+    stop = int(getattr(cfg, "EPR_STOP_EPOCH", 21))
+    epoch = int(epoch)
+    if epoch < start or epoch >= stop:
+        return 0.0
+    if epoch <= ramp_end:
+        denom = max(1, ramp_end - start + 1)
+        return float(epoch - start + 1) / float(denom)
+    return 1.0
+
+
+def cap_mask_by_score_per_image(mask, score, max_ratio, min_pixels):
+    capped = torch.zeros_like(mask, dtype=torch.bool)
+    batch_size = int(mask.shape[0])
+    num_pixels = int(mask.shape[-2] * mask.shape[-1])
+    max_pixels = max(1, int(float(max_ratio) * float(num_pixels)))
+    min_pixels = max(0, int(min_pixels))
+    for idx in range(batch_size):
+        flat_mask = mask[idx].flatten()
+        candidate_idx = torch.nonzero(flat_mask, as_tuple=False).flatten()
+        num_candidates = int(candidate_idx.numel())
+        if num_candidates < min_pixels or num_candidates <= 0:
+            continue
+        if num_candidates <= max_pixels:
+            keep_idx = candidate_idx
+        else:
+            flat_score = score[idx].flatten()
+            topk = torch.topk(flat_score.index_select(0, candidate_idx), k=max_pixels, largest=True)
+            keep_idx = candidate_idx[topk.indices]
+        capped[idx].flatten().index_fill_(0, keep_idx, True)
+    return capped
+
+
+def build_hbns_hard_bg_mask(cfg, batch, logits, teacher_binary, region_masks, device):
+    student_prob_source = logits.detach() if bool(getattr(cfg, "HBNS_DETACH_MASK", True)) else logits
+    student_prob = torch.sigmoid(student_prob_source)
+    student_fg = student_prob > float(getattr(cfg, "HBNS_STUDENT_PROB_THRESH", 0.50))
+
+    pu_target_soft = _batch_pu_tensor(batch, "pu_target_soft", device)
+    pu_weight_map = _batch_pu_tensor(batch, "pu_weight_map", device)
+    bg_core = region_masks["bg_core"]
+    unknown = region_masks["unknown"]
+
+    bg_core_region = bg_core if bool(getattr(cfg, "HBNS_USE_BG_CORE", True)) else torch.zeros_like(bg_core)
+    low_target_bg = (
+        (pu_target_soft < float(getattr(cfg, "HBNS_LOW_TARGET_THRESH", 0.15)))
+        & (pu_weight_map > float(getattr(cfg, "HBNS_LOW_TARGET_WEIGHT_THRESH", 0.50)))
+    )
+    if not bool(getattr(cfg, "HBNS_USE_LOW_TARGET_BG", True)):
+        low_target_bg = torch.zeros_like(bg_core)
+    unknown_bg_like = unknown & (teacher_binary < 0.5) & student_fg
+    if not bool(getattr(cfg, "HBNS_USE_UNKNOWN_BG_LIKE", True)):
+        unknown_bg_like = torch.zeros_like(bg_core)
+
+    hard_bg_raw = student_fg & (bg_core_region | low_target_bg | unknown_bg_like)
+    hard_bg = cap_mask_by_score_per_image(
+        hard_bg_raw,
+        student_prob.detach(),
+        float(getattr(cfg, "HBNS_MAX_RATIO_PER_IMAGE", 0.05)),
+        int(getattr(cfg, "HBNS_MIN_PIXELS_PER_IMAGE", 8)),
+    )
+
+    num_pixels = float(hard_bg.shape[-2] * hard_bg.shape[-1])
+    raw_pixels_per_image = hard_bg_raw.float().flatten(1).sum(dim=1)
+    capped_pixels_per_image = hard_bg.float().flatten(1).sum(dim=1)
+    stats = {
+        "hard_bg_ratio": float(hard_bg.float().mean().detach().item()),
+        "hard_bg_raw_ratio": float(hard_bg_raw.float().mean().detach().item()),
+        "hard_bg_ratio_bg_core": float((student_fg & bg_core_region).float().mean().detach().item()),
+        "hard_bg_ratio_low_target": float((student_fg & low_target_bg).float().mean().detach().item()),
+        "hard_bg_ratio_unknown_bg_like": float(unknown_bg_like.float().mean().detach().item()),
+        "hard_bg_pixels_mean": float(capped_pixels_per_image.mean().detach().item()),
+        "hard_bg_raw_pixels_mean": float(raw_pixels_per_image.mean().detach().item()),
+        "hard_bg_skipped_images": int((capped_pixels_per_image <= 0).sum().detach().item()),
+        "hard_bg_max_pixels_per_image": float(
+            max(1, int(float(getattr(cfg, "HBNS_MAX_RATIO_PER_IMAGE", 0.05)) * num_pixels))
+        ),
+    }
+    return hard_bg, stats
+
+
+def build_epr_pos_mask(cfg, batch, region_masks, teacher_prob, teacher_binary, device):
+    extent = region_masks["extent"]
+    fg_core = region_masks["fg_core"]
+    bg_core = region_masks["bg_core"]
+    unknown = region_masks["unknown"]
+    if str(getattr(cfg, "EPR_REGION", "extent")).lower() != "extent":
+        raise RuntimeError("EPR_REGION currently supports only 'extent'.")
+    if bool(getattr(cfg, "EPR_USE_UNKNOWN", False)):
+        raise RuntimeError("EPR_USE_UNKNOWN=True is not supported for EPR-pos-lite.")
+    if not bool(getattr(cfg, "EPR_POSITIVE_ONLY", True)):
+        raise RuntimeError("EPR_POSITIVE_ONLY must be True.")
+    if str(getattr(cfg, "EPR_FEATURE_SOURCE", "cached_dino")).lower() != "cached_dino":
+        raise RuntimeError("EPR_FEATURE_SOURCE currently supports only 'cached_dino'.")
+
+    feat = batch["feature"].to(device, non_blocking=True).float()
+    if feat.ndim != 4 or feat.shape[1] != 384:
+        raise RuntimeError(f"EPR expects cached DINO feature [B,384,H,W], got {list(feat.shape)}.")
+    feature_size = int(getattr(cfg, "EPR_FEATURE_SIZE", feat.shape[-1]))
+    if feat.shape[-2:] != (feature_size, feature_size):
+        raise RuntimeError(
+            f"EPR expects feature spatial {feature_size}x{feature_size}, got {list(feat.shape[-2:])}."
+        )
+    loss_size = int(getattr(cfg, "EPR_LOSS_SIZE", teacher_prob.shape[-1]))
+    if teacher_prob.shape[-2:] != (loss_size, loss_size):
+        raise RuntimeError(
+            f"EPR expects teacher/logit spatial {loss_size}x{loss_size}, got {list(teacher_prob.shape[-2:])}."
+        )
+
+    feat_norm = F.normalize(feat, dim=1)
+    fg_core_37 = F.interpolate(fg_core.float(), size=feat.shape[-2:], mode="nearest") > 0.5
+    bg_core_37 = F.interpolate(bg_core.float(), size=feat.shape[-2:], mode="nearest") > 0.5
+
+    margin_37 = torch.zeros(
+        (feat.shape[0], 1, feat.shape[-2], feat.shape[-1]),
+        device=device,
+        dtype=feat.dtype,
+    )
+    min_pixels = int(getattr(cfg, "EPR_MIN_PIXELS_PER_IMAGE", 8))
+    skipped_no_fg = 0
+    skipped_no_bg = 0
+    for idx in range(int(feat.shape[0])):
+        fg_mask = fg_core_37[idx, 0]
+        bg_mask = bg_core_37[idx, 0]
+        fg_count = int(fg_mask.sum().detach().item())
+        bg_count = int(bg_mask.sum().detach().item())
+        if fg_count < min_pixels:
+            skipped_no_fg += 1
+            continue
+        if bg_count < min_pixels:
+            skipped_no_bg += 1
+            continue
+        fg_pixels = feat_norm[idx, :, fg_mask]
+        bg_pixels = feat_norm[idx, :, bg_mask]
+        fg_proto = F.normalize(fg_pixels.mean(dim=1), dim=0)
+        bg_proto = F.normalize(bg_pixels.mean(dim=1), dim=0)
+        if bool(getattr(cfg, "EPR_DETACH_PROTO", True)):
+            fg_proto = fg_proto.detach()
+            bg_proto = bg_proto.detach()
+        sim_fg = (feat_norm[idx] * fg_proto.view(-1, 1, 1)).sum(dim=0, keepdim=True)
+        sim_bg = (feat_norm[idx] * bg_proto.view(-1, 1, 1)).sum(dim=0, keepdim=True)
+        margin_37[idx] = sim_fg - sim_bg
+
+    margin_68 = F.interpolate(
+        margin_37,
+        size=teacher_prob.shape[-2:],
+        mode="bilinear",
+        align_corners=False,
+    )
+    if bool(getattr(cfg, "EPR_DETACH_MASK", True)):
+        margin_68 = margin_68.detach()
+    teacher_prob_detached = teacher_prob.detach()
+    teacher_binary_detached = teacher_binary.detach()
+    teacher_conf = 2.0 * torch.abs(teacher_prob_detached - 0.5)
+    teacher_fg_cond = teacher_binary_detached >= 0.5
+    if not bool(getattr(cfg, "EPR_REQUIRE_TEACHER_FG", True)):
+        teacher_fg_cond = torch.ones_like(teacher_fg_cond, dtype=torch.bool)
+    teacher_conf_cond = teacher_conf >= float(getattr(cfg, "EPR_TEACHER_CONF_THRESH", 0.75))
+    if bool(getattr(cfg, "EPR_USE_DINO_PROTO_MARGIN", True)):
+        margin_cond = margin_68 >= float(getattr(cfg, "EPR_MARGIN_THRESH", 0.05))
+    else:
+        margin_cond = torch.ones_like(extent, dtype=torch.bool)
+    raw_mask = extent & teacher_fg_cond & teacher_conf_cond & margin_cond
+    raw_mask = raw_mask & (~fg_core) & (~bg_core) & (~unknown)
+    score = teacher_conf + margin_68
+    epr_pos_mask = cap_mask_by_score_per_image(
+        raw_mask,
+        score.detach(),
+        float(getattr(cfg, "EPR_MAX_RATIO_PER_IMAGE", 0.03)),
+        min_pixels,
+    )
+
+    raw_pixels = raw_mask.float().flatten(1).sum(dim=1)
+    capped_pixels = epr_pos_mask.float().flatten(1).sum(dim=1)
+    pos_count = float(epr_pos_mask.float().sum().detach().item())
+    raw_count = float(raw_mask.float().sum().detach().item())
+    margin_pos_mean = _rast_mask_mean(margin_68, epr_pos_mask) if pos_count > 0.0 else 0.0
+    teacher_conf_pos_mean = _rast_mask_mean(teacher_conf, epr_pos_mask) if pos_count > 0.0 else 0.0
+    stats = {
+        "epr_pos_ratio": float(epr_pos_mask.float().mean().detach().item()),
+        "epr_pos_raw_ratio": float(raw_mask.float().mean().detach().item()),
+        "epr_pos_pixels_mean": float(capped_pixels.mean().detach().item()),
+        "epr_pos_raw_pixels_mean": float(raw_pixels.mean().detach().item()),
+        "epr_valid_image_ratio": float((capped_pixels > 0).float().mean().detach().item()),
+        "epr_margin_mean": float(margin_68.mean().detach().item()),
+        "epr_margin_min": float(margin_68.min().detach().item()),
+        "epr_margin_max": float(margin_68.max().detach().item()),
+        "epr_margin_pos_mean": margin_pos_mean,
+        "epr_teacher_conf_pos_mean": teacher_conf_pos_mean,
+        "epr_extent_area": float(extent.float().mean().detach().item()),
+        "epr_unknown_overlap_ratio": float((epr_pos_mask & unknown).float().mean().detach().item()),
+        "epr_skipped_no_fg_proto": skipped_no_fg,
+        "epr_skipped_no_bg_proto": skipped_no_bg,
+        "epr_max_pixels_per_image": float(
+            max(1, int(float(getattr(cfg, "EPR_MAX_RATIO_PER_IMAGE", 0.03)) * float(extent.shape[-2] * extent.shape[-1])))
+        ),
+        "epr_raw_count": raw_count,
+        "epr_pos_count": pos_count,
+    }
+    return epr_pos_mask, margin_68, stats
+
+
+def hbns_lite_loss_for_logits(cfg, logits, hard_bg_mask):
+    if hard_bg_mask is None or float(hard_bg_mask.float().sum().detach().item()) <= 0.0:
+        return logits.sum() * 0.0
+    target_bg = torch.zeros_like(logits)
+    loss_map = F.binary_cross_entropy_with_logits(logits, target_bg, reduction="none")
+    weight = hard_bg_mask.to(device=logits.device, dtype=logits.dtype)
+    if bool(getattr(cfg, "HBNS_WEIGHTED_NORMALIZE", True)):
+        return (loss_map * weight).sum() / weight.sum().clamp_min(1e-6)
+    return (loss_map * weight).mean()
+
+
+def epr_pos_loss_for_logits(cfg, logits, epr_pos_mask):
+    if epr_pos_mask is None or float(epr_pos_mask.float().sum().detach().item()) <= 0.0:
+        return logits.sum() * 0.0
+    target_pos = torch.ones_like(logits)
+    loss_map = F.binary_cross_entropy_with_logits(logits, target_pos, reduction="none")
+    weight = epr_pos_mask.to(device=logits.device, dtype=logits.dtype)
+    if bool(getattr(cfg, "EPR_WEIGHTED_NORMALIZE", True)):
+        return (loss_map * weight).sum() / weight.sum().clamp_min(1e-6)
+    return (loss_map * weight).mean()
+
+
+def compute_esa_region_diagnostics(batch, region_masks, student_logits, teacher_prob, teacher_binary):
+    student_prob = torch.sigmoid(student_logits.detach())
+    teacher_prob_detached = teacher_prob.detach()
+    teacher_binary_detached = teacher_binary.detach()
+    teacher_conf = 2.0 * torch.abs(teacher_prob_detached - 0.5)
+    teacher_loss_map = F.binary_cross_entropy_with_logits(
+        student_logits.detach(),
+        teacher_binary_detached,
+        reduction="none",
+    )
+    stats = {}
+    for name in ("fg_core", "bg_core", "extent", "unknown"):
+        mask = region_masks[name]
+        stats[f"student_prob_{name}"] = _masked_mean_for_log(student_prob, mask)
+        stats[f"teacher_fg_{name}"] = _masked_mean_for_log(teacher_binary_detached, mask)
+        stats[f"teacher_conf_{name}"] = _masked_mean_for_log(teacher_conf, mask)
+        stats[f"teacher_loss_{name}"] = _masked_mean_for_log(teacher_loss_map, mask)
+        stats[f"area_{name}"] = float(mask.float().mean().detach().item())
+    return stats
 
 
 def build_pu_static_group_loss(logits, batch, cfg):
@@ -4066,8 +4486,47 @@ def main():
                     raise RuntimeError("USE_RAST=True requires binary teacher target in dabe_pu_despl_sched.")
                 if static_target_mode != "soft":
                     raise RuntimeError("USE_RAST=True requires DABE-PU static target mode 'soft'.")
+            if bool(getattr(cfg, "USE_HBNS_LITE", False)):
+                if teacher_target_mode != "binary":
+                    raise RuntimeError("USE_HBNS_LITE=True requires binary teacher target in dabe_pu_despl_sched.")
+                if static_target_mode != "soft":
+                    raise RuntimeError("USE_HBNS_LITE=True requires DABE-PU static target mode 'soft'.")
+            if bool(getattr(cfg, "USE_EPR_POS", False)):
+                if bool(getattr(cfg, "USE_HBNS_LITE", False)):
+                    raise RuntimeError("USE_EPR_POS=True cannot be combined with USE_HBNS_LITE=True.")
+                if teacher_target_mode != "binary":
+                    raise RuntimeError("USE_EPR_POS=True requires binary teacher target in dabe_pu_despl_sched.")
+                if static_target_mode != "soft":
+                    raise RuntimeError("USE_EPR_POS=True requires DABE-PU static target mode 'soft'.")
+                if str(getattr(cfg, "EPR_REGION", "extent")).lower() != "extent":
+                    raise RuntimeError("USE_EPR_POS=True currently requires EPR_REGION='extent'.")
+                if bool(getattr(cfg, "EPR_USE_UNKNOWN", False)):
+                    raise RuntimeError("USE_EPR_POS=True requires EPR_USE_UNKNOWN=False.")
+                if not bool(getattr(cfg, "EPR_POSITIVE_ONLY", True)):
+                    raise RuntimeError("USE_EPR_POS=True requires EPR_POSITIVE_ONLY=True.")
+                if str(getattr(cfg, "EPR_FEATURE_SOURCE", "cached_dino")).lower() != "cached_dino":
+                    raise RuntimeError("USE_EPR_POS=True currently requires EPR_FEATURE_SOURCE='cached_dino'.")
+            if bool(getattr(cfg, "USE_ESA_ASYM", False)):
+                if bool(getattr(cfg, "USE_HBNS_LITE", False)) or bool(getattr(cfg, "USE_EPR_POS", False)):
+                    raise RuntimeError("USE_ESA_ASYM=True cannot be combined with HBNS-lite or EPR-pos.")
+                if teacher_target_mode != "binary":
+                    raise RuntimeError("USE_ESA_ASYM=True requires binary teacher target in dabe_pu_despl_sched.")
+                if static_target_mode != "soft":
+                    raise RuntimeError("USE_ESA_ASYM=True requires DABE-PU static target mode 'soft'.")
+                if not bool(getattr(cfg, "USE_RAST", False)):
+                    raise RuntimeError("USE_ESA_ASYM=True requires USE_RAST=True.")
+                if bool(getattr(cfg, "ESA_TOUCH_UNKNOWN", False)):
+                    raise RuntimeError("USE_ESA_ASYM=True currently requires ESA_TOUCH_UNKNOWN=False.")
+                if not bool(getattr(cfg, "ESA_USE_DINO_MARGIN", True)):
+                    raise RuntimeError("USE_ESA_ASYM=True requires ESA_USE_DINO_MARGIN=True.")
         elif bool(getattr(cfg, "USE_RAST", False)):
             raise RuntimeError("USE_RAST=True requires TEACHER_FUSION_MODE='dabe_pu_despl_sched'.")
+        elif bool(getattr(cfg, "USE_HBNS_LITE", False)):
+            raise RuntimeError("USE_HBNS_LITE=True requires TEACHER_FUSION_MODE='dabe_pu_despl_sched'.")
+        elif bool(getattr(cfg, "USE_EPR_POS", False)):
+            raise RuntimeError("USE_EPR_POS=True requires TEACHER_FUSION_MODE='dabe_pu_despl_sched'.")
+        elif bool(getattr(cfg, "USE_ESA_ASYM", False)):
+            raise RuntimeError("USE_ESA_ASYM=True requires TEACHER_FUSION_MODE='dabe_pu_despl_sched'.")
         if bool(getattr(cfg, "USE_QRA", False)) or bool(getattr(cfg, "USE_CCR", False)):
             raise RuntimeError("USE_DABE_PU=True cannot be combined with USE_QRA=True or USE_CCR=True.")
         if bool(getattr(cfg, "USE_DABE_AWARE_LOSS", False)):
@@ -4080,6 +4539,12 @@ def main():
             raise RuntimeError("USE_DABE_PU=True cannot be combined with proto contrast or multi-view feature.")
         if bool(getattr(cfg, "USE_VIEW_CONSISTENCY", False)) or bool(getattr(cfg, "USE_TADR_ROUTER", False)):
             raise RuntimeError("USE_DABE_PU=True cannot be combined with view consistency or TADR router.")
+    elif bool(getattr(cfg, "USE_HBNS_LITE", False)):
+        raise RuntimeError("USE_HBNS_LITE=True requires USE_DABE_PU=True.")
+    elif bool(getattr(cfg, "USE_EPR_POS", False)):
+        raise RuntimeError("USE_EPR_POS=True requires USE_DABE_PU=True.")
+    elif bool(getattr(cfg, "USE_ESA_ASYM", False)):
+        raise RuntimeError("USE_ESA_ASYM=True requires USE_DABE_PU=True.")
     if bool(getattr(cfg, "USE_DABE_AWARE_LOSS", False)):
         if not bool(getattr(cfg, "USE_DABE_PSEUDO", False)):
             raise RuntimeError("USE_DABE_AWARE_LOSS=True requires USE_DABE_PSEUDO=True.")
@@ -4276,6 +4741,81 @@ def main():
             logger.log(f"RAST_POST_RESET_CONFLICT_ONLY = {bool(getattr(cfg, 'RAST_POST_RESET_CONFLICT_ONLY', False))}")
             logger.log(f"RAST_POST_RESET_USE_STATIC_LOSS = {bool(getattr(cfg, 'RAST_POST_RESET_USE_STATIC_LOSS', False))}")
             logger.log(f"RAST_WEIGHTED_LOSS_NORMALIZE = {bool(getattr(cfg, 'RAST_WEIGHTED_LOSS_NORMALIZE', True))}")
+            logger.log(f"USE_HBNS_LITE = {bool(getattr(cfg, 'USE_HBNS_LITE', False))}")
+            logger.log(f"HBNS_VERSION = {getattr(cfg, 'HBNS_VERSION', 'lite_v1')}")
+            logger.log(f"HBNS_START_EPOCH = {int(getattr(cfg, 'HBNS_START_EPOCH', 7))}")
+            logger.log(f"HBNS_RAMP_END_EPOCH = {int(getattr(cfg, 'HBNS_RAMP_END_EPOCH', 15))}")
+            logger.log(f"HBNS_STOP_EPOCH = {int(getattr(cfg, 'HBNS_STOP_EPOCH', 21))}")
+            logger.log(f"HBNS_LAMBDA_MAX = {float(getattr(cfg, 'HBNS_LAMBDA_MAX', 0.01)):.8f}")
+            logger.log(f"HBNS_APPLY_TO_FINAL = {bool(getattr(cfg, 'HBNS_APPLY_TO_FINAL', True))}")
+            logger.log(f"HBNS_APPLY_TO_COARSE_AUX = {bool(getattr(cfg, 'HBNS_APPLY_TO_COARSE_AUX', True))}")
+            logger.log(f"HBNS_APPLY_TO_BASE_AUX = {bool(getattr(cfg, 'HBNS_APPLY_TO_BASE_AUX', False))}")
+            logger.log(f"HBNS_STUDENT_PROB_THRESH = {float(getattr(cfg, 'HBNS_STUDENT_PROB_THRESH', 0.50)):.6f}")
+            logger.log(f"HBNS_LOW_TARGET_THRESH = {float(getattr(cfg, 'HBNS_LOW_TARGET_THRESH', 0.15)):.6f}")
+            logger.log(f"HBNS_LOW_TARGET_WEIGHT_THRESH = {float(getattr(cfg, 'HBNS_LOW_TARGET_WEIGHT_THRESH', 0.50)):.6f}")
+            logger.log(f"HBNS_USE_BG_CORE = {bool(getattr(cfg, 'HBNS_USE_BG_CORE', True))}")
+            logger.log(f"HBNS_USE_LOW_TARGET_BG = {bool(getattr(cfg, 'HBNS_USE_LOW_TARGET_BG', True))}")
+            logger.log(f"HBNS_USE_UNKNOWN_BG_LIKE = {bool(getattr(cfg, 'HBNS_USE_UNKNOWN_BG_LIKE', True))}")
+            logger.log(f"HBNS_USE_BG_DILATION_RING = {bool(getattr(cfg, 'HBNS_USE_BG_DILATION_RING', False))}")
+            logger.log(f"HBNS_BG_RING_RADIUS = {int(getattr(cfg, 'HBNS_BG_RING_RADIUS', 3))}")
+            logger.log(f"HBNS_MAX_RATIO_PER_IMAGE = {float(getattr(cfg, 'HBNS_MAX_RATIO_PER_IMAGE', 0.05)):.6f}")
+            logger.log(f"HBNS_MIN_PIXELS_PER_IMAGE = {int(getattr(cfg, 'HBNS_MIN_PIXELS_PER_IMAGE', 8))}")
+            logger.log(f"HBNS_DETACH_MASK = {bool(getattr(cfg, 'HBNS_DETACH_MASK', True))}")
+            logger.log(f"HBNS_WEIGHTED_NORMALIZE = {bool(getattr(cfg, 'HBNS_WEIGHTED_NORMALIZE', True))}")
+            logger.log(f"USE_EPR_POS = {bool(getattr(cfg, 'USE_EPR_POS', False))}")
+            logger.log(f"EPR_VERSION = {getattr(cfg, 'EPR_VERSION', 'pos_lite_v1')}")
+            logger.log(f"EPR_START_EPOCH = {int(getattr(cfg, 'EPR_START_EPOCH', 7))}")
+            logger.log(f"EPR_RAMP_END_EPOCH = {int(getattr(cfg, 'EPR_RAMP_END_EPOCH', 15))}")
+            logger.log(f"EPR_STOP_EPOCH = {int(getattr(cfg, 'EPR_STOP_EPOCH', 21))}")
+            logger.log(f"EPR_LAMBDA_MAX = {float(getattr(cfg, 'EPR_LAMBDA_MAX', 0.005)):.8f}")
+            logger.log(f"EPR_APPLY_TO_FINAL = {bool(getattr(cfg, 'EPR_APPLY_TO_FINAL', True))}")
+            logger.log(f"EPR_APPLY_TO_COARSE_AUX = {bool(getattr(cfg, 'EPR_APPLY_TO_COARSE_AUX', True))}")
+            logger.log(f"EPR_APPLY_TO_BASE_AUX = {bool(getattr(cfg, 'EPR_APPLY_TO_BASE_AUX', False))}")
+            logger.log(f"EPR_REGION = {getattr(cfg, 'EPR_REGION', 'extent')}")
+            logger.log(f"EPR_USE_UNKNOWN = {bool(getattr(cfg, 'EPR_USE_UNKNOWN', False))}")
+            logger.log(f"EPR_POSITIVE_ONLY = {bool(getattr(cfg, 'EPR_POSITIVE_ONLY', True))}")
+            logger.log(f"EPR_REQUIRE_TEACHER_FG = {bool(getattr(cfg, 'EPR_REQUIRE_TEACHER_FG', True))}")
+            logger.log(f"EPR_TEACHER_CONF_THRESH = {float(getattr(cfg, 'EPR_TEACHER_CONF_THRESH', 0.75)):.6f}")
+            logger.log(f"EPR_USE_DINO_PROTO_MARGIN = {bool(getattr(cfg, 'EPR_USE_DINO_PROTO_MARGIN', True))}")
+            logger.log(f"EPR_MARGIN_THRESH = {float(getattr(cfg, 'EPR_MARGIN_THRESH', 0.05)):.6f}")
+            logger.log(f"EPR_MAX_RATIO_PER_IMAGE = {float(getattr(cfg, 'EPR_MAX_RATIO_PER_IMAGE', 0.03)):.6f}")
+            logger.log(f"EPR_MIN_PIXELS_PER_IMAGE = {int(getattr(cfg, 'EPR_MIN_PIXELS_PER_IMAGE', 8))}")
+            logger.log(f"EPR_FEATURE_SOURCE = {getattr(cfg, 'EPR_FEATURE_SOURCE', 'cached_dino')}")
+            logger.log(f"EPR_FEATURE_SIZE = {int(getattr(cfg, 'EPR_FEATURE_SIZE', 37))}")
+            logger.log(f"EPR_LOSS_SIZE = {int(getattr(cfg, 'EPR_LOSS_SIZE', int(getattr(cfg, 'LOSS_SIZE', 68))))}")
+            logger.log(f"EPR_DETACH_MASK = {bool(getattr(cfg, 'EPR_DETACH_MASK', True))}")
+            logger.log(f"EPR_DETACH_PROTO = {bool(getattr(cfg, 'EPR_DETACH_PROTO', True))}")
+            logger.log(f"EPR_WEIGHTED_NORMALIZE = {bool(getattr(cfg, 'EPR_WEIGHTED_NORMALIZE', True))}")
+            logger.log(f"USE_EPR_DIAGNOSTIC = {bool(getattr(cfg, 'USE_EPR_DIAGNOSTIC', False))}")
+            logger.log(f"USE_ESA_ASYM = {bool(getattr(cfg, 'USE_ESA_ASYM', False))}")
+            logger.log(f"ESA_ASYM_VERSION = {getattr(cfg, 'ESA_ASYM_VERSION', 'extent_teacher_bg_routing_v1')}")
+            logger.log(f"ESA_ASYM_START_EPOCH = {int(getattr(cfg, 'ESA_ASYM_START_EPOCH', 7))}")
+            logger.log(f"ESA_ASYM_RAMP_END_EPOCH = {int(getattr(cfg, 'ESA_ASYM_RAMP_END_EPOCH', 15))}")
+            logger.log(f"ESA_ASYM_STOP_EPOCH = {int(getattr(cfg, 'ESA_ASYM_STOP_EPOCH', 21))}")
+            logger.log(f"ESA_EXTENT_TEACHER_FG_MULT = {float(getattr(cfg, 'ESA_EXTENT_TEACHER_FG_MULT', 1.0)):.6f}")
+            logger.log(f"ESA_EXTENT_TEACHER_BG_MULT = {float(getattr(cfg, 'ESA_EXTENT_TEACHER_BG_MULT', 0.50)):.6f}")
+            logger.log(f"ESA_USE_DINO_MARGIN = {bool(getattr(cfg, 'ESA_USE_DINO_MARGIN', True))}")
+            logger.log(f"ESA_MARGIN_FG_LIKE = {float(getattr(cfg, 'ESA_MARGIN_FG_LIKE', 0.05)):.6f}")
+            logger.log(f"ESA_MARGIN_BG_LIKE = {float(getattr(cfg, 'ESA_MARGIN_BG_LIKE', -0.05)):.6f}")
+            logger.log(
+                "ESA_EXTENT_TEACHER_BG_FG_LIKE_MULT = "
+                f"{float(getattr(cfg, 'ESA_EXTENT_TEACHER_BG_FG_LIKE_MULT', 0.25)):.6f}"
+            )
+            logger.log(
+                "ESA_EXTENT_TEACHER_BG_AMBIG_MULT = "
+                f"{float(getattr(cfg, 'ESA_EXTENT_TEACHER_BG_AMBIG_MULT', 0.50)):.6f}"
+            )
+            logger.log(
+                "ESA_EXTENT_TEACHER_BG_BG_LIKE_MULT = "
+                f"{float(getattr(cfg, 'ESA_EXTENT_TEACHER_BG_BG_LIKE_MULT', 1.0)):.6f}"
+            )
+            logger.log(f"ESA_TOUCH_UNKNOWN = {bool(getattr(cfg, 'ESA_TOUCH_UNKNOWN', False))}")
+            logger.log(f"ESA_UNKNOWN_TEACHER_MULT = {float(getattr(cfg, 'ESA_UNKNOWN_TEACHER_MULT', 0.50)):.6f}")
+            logger.log(f"ESA_FEATURE_SIZE = {int(getattr(cfg, 'ESA_FEATURE_SIZE', 37))}")
+            logger.log(f"ESA_DETACH_MASK = {bool(getattr(cfg, 'ESA_DETACH_MASK', True))}")
+            logger.log(f"ESA_DETACH_PROTO = {bool(getattr(cfg, 'ESA_DETACH_PROTO', True))}")
+            logger.log(f"USE_ESA_DIAGNOSTIC = {bool(getattr(cfg, 'USE_ESA_DIAGNOSTIC', False))}")
+            logger.log(f"ESA_DIAG_LOG_INTERVAL_EPOCH = {int(getattr(cfg, 'ESA_DIAG_LOG_INTERVAL_EPOCH', 1))}")
         if str(getattr(cfg, "TEACHER_FUSION_MODE", "")).lower() == "dabe_pu_balanced_v2":
             logger.log(f"USE_DABE_PU = {bool(getattr(cfg, 'USE_DABE_PU', False))}")
             logger.log(f"DABE_PU_VERSION = {getattr(cfg, 'DABE_PU_VERSION', 'pu_v11')}")
@@ -4672,6 +5212,10 @@ def main():
         use_dabe_pu_balanced_v2 = use_dabe_pu and teacher_fusion_mode == "dabe_pu_balanced_v2"
         use_dabe_pu_despl_sched = use_dabe_pu and teacher_fusion_mode == "dabe_pu_despl_sched"
         use_rast = bool(getattr(cfg, "USE_RAST", False)) and use_dabe_pu_despl_sched
+        use_hbns_lite = bool(getattr(cfg, "USE_HBNS_LITE", False)) and use_dabe_pu_despl_sched
+        use_epr_pos = bool(getattr(cfg, "USE_EPR_POS", False)) and use_dabe_pu_despl_sched
+        use_esa_asym = bool(getattr(cfg, "USE_ESA_ASYM", False)) and use_dabe_pu_despl_sched
+        use_esa_diagnostic = bool(getattr(cfg, "USE_ESA_DIAGNOSTIC", False)) and use_dabe_pu_despl_sched
         dabe_pu_despl_teacher_target_mode = (
             get_dabe_pu_despl_teacher_target_mode(cfg) if use_dabe_pu_despl_sched else "binary"
         )
@@ -4876,6 +5420,9 @@ def main():
         mvflip_first_batch_logged = False
         mvproto_first_batch_logged = False
         rast_first_batch_logged = False
+        hbns_first_batch_logged = False
+        epr_first_batch_logged = False
+        esa_asym_first_batch_logged = False
         lr_floor_activated_logged = False
         gkd_first_batch_path = train_dir / "gkd_first_batch.csv"
         gkd_audit_csv_path = train_dir / "gkd_audit_epoch.csv"
@@ -5026,6 +5573,75 @@ def main():
             rast_teacher_map_extent_mean_sum = 0.0
             rast_teacher_map_unknown_mean_sum = 0.0
             rast_stat_batches = 0
+            hbns_scale_sum = 0.0
+            hbns_lambda_sum = 0.0
+            hbns_hard_bg_ratio_sum = 0.0
+            hbns_hard_bg_raw_ratio_sum = 0.0
+            hbns_hard_bg_ratio_bg_core_sum = 0.0
+            hbns_hard_bg_ratio_low_target_sum = 0.0
+            hbns_hard_bg_ratio_unknown_bg_like_sum = 0.0
+            hbns_hard_bg_pixels_mean_sum = 0.0
+            hbns_loss_final_sum = 0.0
+            hbns_loss_coarse_sum = 0.0
+            hbns_loss_base_sum = 0.0
+            hbns_loss_sum = 0.0
+            hbns_stat_batches = 0
+            epr_scale_sum = 0.0
+            epr_lambda_sum = 0.0
+            epr_pos_ratio_sum = 0.0
+            epr_pos_raw_ratio_sum = 0.0
+            epr_pos_pixels_mean_sum = 0.0
+            epr_valid_image_ratio_sum = 0.0
+            epr_margin_mean_sum = 0.0
+            epr_margin_min = None
+            epr_margin_max = None
+            epr_margin_pos_mean_sum = 0.0
+            epr_teacher_conf_pos_mean_sum = 0.0
+            epr_extent_area_sum = 0.0
+            epr_unknown_overlap_ratio_sum = 0.0
+            epr_loss_final_sum = 0.0
+            epr_loss_coarse_sum = 0.0
+            epr_loss_base_sum = 0.0
+            epr_loss_sum = 0.0
+            epr_stat_batches = 0
+            esa_asym_scale_sum = 0.0
+            esa_margin_mean_sum = 0.0
+            esa_margin_min = None
+            esa_margin_max = None
+            esa_margin_extent_mean_sum = 0.0
+            esa_margin_extent_teacher_fg_mean_sum = 0.0
+            esa_margin_extent_teacher_bg_mean_sum = 0.0
+            esa_extent_teacher_fg_ratio_sum = 0.0
+            esa_extent_teacher_bg_ratio_sum = 0.0
+            esa_extent_teacher_bg_fg_like_ratio_sum = 0.0
+            esa_extent_teacher_bg_ambig_ratio_sum = 0.0
+            esa_extent_teacher_bg_bg_like_ratio_sum = 0.0
+            esa_teacher_map_extent_mean_sum = 0.0
+            esa_teacher_map_extent_teacher_fg_mean_sum = 0.0
+            esa_teacher_map_extent_teacher_bg_mean_sum = 0.0
+            esa_teacher_map_extent_teacher_bg_fg_like_mean_sum = 0.0
+            esa_teacher_map_extent_teacher_bg_ambig_mean_sum = 0.0
+            esa_teacher_map_extent_teacher_bg_bg_like_mean_sum = 0.0
+            esa_skipped_no_fg_proto_sum = 0
+            esa_skipped_no_bg_proto_sum = 0
+            esa_asym_stat_batches = 0
+            esa_student_prob_fg_core_sum = 0.0
+            esa_student_prob_bg_core_sum = 0.0
+            esa_student_prob_extent_sum = 0.0
+            esa_student_prob_unknown_sum = 0.0
+            esa_teacher_fg_fg_core_sum = 0.0
+            esa_teacher_fg_bg_core_sum = 0.0
+            esa_teacher_fg_extent_sum = 0.0
+            esa_teacher_fg_unknown_sum = 0.0
+            esa_teacher_conf_fg_core_sum = 0.0
+            esa_teacher_conf_bg_core_sum = 0.0
+            esa_teacher_conf_extent_sum = 0.0
+            esa_teacher_conf_unknown_sum = 0.0
+            esa_teacher_loss_fg_core_sum = 0.0
+            esa_teacher_loss_bg_core_sum = 0.0
+            esa_teacher_loss_extent_sum = 0.0
+            esa_teacher_loss_unknown_sum = 0.0
+            esa_stat_batches = 0
             dre_safe_p_base_area_sum = 0.0
             dre_safe_p_safe_area_sum = 0.0
             dre_safe_candidate_ratio_sum = 0.0
@@ -5408,6 +6024,40 @@ def main():
                             f"{float(rast_stats['bg_conflict_ratio']):.6f}"
                         )
                         rast_first_batch_logged = True
+                    if use_esa_asym and not esa_asym_first_batch_logged:
+                        logger.log(f"[ESA-Asym FirstBatch] USE_ESA_ASYM = {bool(getattr(cfg, 'USE_ESA_ASYM', False))}")
+                        logger.log(
+                            "[ESA-Asym FirstBatch] ESA_ASYM_VERSION = "
+                            f"{getattr(cfg, 'ESA_ASYM_VERSION', 'extent_teacher_bg_routing_v1')}"
+                        )
+                        logger.log(f"[ESA-Asym FirstBatch] esa_asym_scale = {float(rast_stats['esa_asym_scale']):.8f}")
+                        logger.log(f"[ESA-Asym FirstBatch] margin_68 shape = {list(rast_stats['esa_margin_shape'])}")
+                        logger.log(
+                            "[ESA-Asym FirstBatch] margin_68 min/mean/max = "
+                            f"{float(rast_stats['esa_margin_min']):.6f}/"
+                            f"{float(rast_stats['esa_margin_mean']):.6f}/"
+                            f"{float(rast_stats['esa_margin_max']):.6f}"
+                        )
+                        logger.log(
+                            "[ESA-Asym FirstBatch] extent teacher_fg/bg ratio = "
+                            f"{float(rast_stats['esa_extent_teacher_fg_ratio']):.6f}/"
+                            f"{float(rast_stats['esa_extent_teacher_bg_ratio']):.6f}"
+                        )
+                        logger.log(
+                            "[ESA-Asym FirstBatch] extent teacher_bg fg-like/ambig/bg-like ratio = "
+                            f"{float(rast_stats['esa_extent_teacher_bg_fg_like_ratio']):.6f}/"
+                            f"{float(rast_stats['esa_extent_teacher_bg_ambig_ratio']):.6f}/"
+                            f"{float(rast_stats['esa_extent_teacher_bg_bg_like_ratio']):.6f}"
+                        )
+                        logger.log(
+                            "[ESA-Asym FirstBatch] teacher_map extent fg/bg/fg-like/ambig/bg-like mean = "
+                            f"{float(rast_stats['esa_teacher_map_extent_teacher_fg_mean']):.6f}/"
+                            f"{float(rast_stats['esa_teacher_map_extent_teacher_bg_mean']):.6f}/"
+                            f"{float(rast_stats['esa_teacher_map_extent_teacher_bg_fg_like_mean']):.6f}/"
+                            f"{float(rast_stats['esa_teacher_map_extent_teacher_bg_ambig_mean']):.6f}/"
+                            f"{float(rast_stats['esa_teacher_map_extent_teacher_bg_bg_like_mean']):.6f}"
+                        )
+                        esa_asym_first_batch_logged = True
 
                 fixed_target = pseudo_68
                 if use_ccr:
@@ -6356,6 +7006,153 @@ def main():
                 if use_proto:
                     loss = loss + float(lambda_proto) * loss_proto
 
+                loss_hbns_final = student_logits.sum() * 0.0
+                loss_hbns_coarse = student_logits.sum() * 0.0
+                loss_hbns_base = student_logits.sum() * 0.0
+                loss_hbns = student_logits.sum() * 0.0
+                hbns_scale = 0.0
+                lambda_hbns_eff = 0.0
+                loss_epr_final = student_logits.sum() * 0.0
+                loss_epr_coarse = student_logits.sum() * 0.0
+                loss_epr_base = student_logits.sum() * 0.0
+                loss_epr = student_logits.sum() * 0.0
+                epr_scale = 0.0
+                lambda_epr_eff = 0.0
+                hbns_stats = {
+                    "hard_bg_ratio": 0.0,
+                    "hard_bg_raw_ratio": 0.0,
+                    "hard_bg_ratio_bg_core": 0.0,
+                    "hard_bg_ratio_low_target": 0.0,
+                    "hard_bg_ratio_unknown_bg_like": 0.0,
+                    "hard_bg_pixels_mean": 0.0,
+                }
+                epr_stats = {
+                    "epr_pos_ratio": 0.0,
+                    "epr_pos_raw_ratio": 0.0,
+                    "epr_pos_pixels_mean": 0.0,
+                    "epr_valid_image_ratio": 0.0,
+                    "epr_margin_mean": 0.0,
+                    "epr_margin_min": 0.0,
+                    "epr_margin_max": 0.0,
+                    "epr_margin_pos_mean": 0.0,
+                    "epr_teacher_conf_pos_mean": 0.0,
+                    "epr_extent_area": 0.0,
+                    "epr_unknown_overlap_ratio": 0.0,
+                }
+                esa_stats = {}
+                if use_hbns_lite or use_epr_pos or use_esa_diagnostic:
+                    aux_region_masks = build_rast_region_masks(batch, device)
+                else:
+                    aux_region_masks = None
+                if use_epr_pos:
+                    epr_scale = float(get_epr_scale(cfg, epoch))
+                    lambda_epr_eff = float(getattr(cfg, "EPR_LAMBDA_MAX", 0.005)) * epr_scale
+                    epr_pos_mask, epr_margin_68, epr_stats = build_epr_pos_mask(
+                        cfg,
+                        batch,
+                        aux_region_masks,
+                        teacher_prob,
+                        teacher_binary,
+                        device,
+                    )
+                    epr_terms = []
+                    if bool(getattr(cfg, "EPR_APPLY_TO_FINAL", True)):
+                        loss_epr_final = epr_pos_loss_for_logits(cfg, student_logits, epr_pos_mask)
+                        epr_terms.append(loss_epr_final)
+                    if (
+                        bool(getattr(cfg, "EPR_APPLY_TO_COARSE_AUX", True))
+                        and isinstance(student_out, dict)
+                        and "coarse_logits_68" in student_out
+                    ):
+                        epr_coarse_logits = resize_logits_for_loss(student_out["coarse_logits_68"], cfg)
+                        loss_epr_coarse = epr_pos_loss_for_logits(cfg, epr_coarse_logits, epr_pos_mask)
+                        epr_terms.append(loss_epr_coarse)
+                    if (
+                        bool(getattr(cfg, "EPR_APPLY_TO_BASE_AUX", False))
+                        and isinstance(student_out, dict)
+                        and "base_logits" in student_out
+                    ):
+                        epr_base_logits = resize_logits_for_loss(student_out["base_logits"], cfg)
+                        loss_epr_base = epr_pos_loss_for_logits(cfg, epr_base_logits, epr_pos_mask)
+                        epr_terms.append(loss_epr_base)
+                    if epr_terms:
+                        loss_epr = sum(epr_terms) / float(len(epr_terms))
+                    loss = loss + lambda_epr_eff * loss_epr
+                    if not epr_first_batch_logged:
+                        logger.log(f"[EPR-pos FirstBatch] USE_EPR_POS = {bool(getattr(cfg, 'USE_EPR_POS', False))}")
+                        logger.log(f"[EPR-pos FirstBatch] EPR_VERSION = {getattr(cfg, 'EPR_VERSION', 'pos_lite_v1')}")
+                        logger.log(f"[EPR-pos FirstBatch] epr_scale = {epr_scale:.8f}")
+                        logger.log(f"[EPR-pos FirstBatch] lambda_epr_eff = {lambda_epr_eff:.8f}")
+                        logger.log(f"[EPR-pos FirstBatch] epr_pos_mask shape = {list(epr_pos_mask.shape)}")
+                        logger.log(
+                            "[EPR-pos FirstBatch] epr_pos_ratio/raw_ratio/pixels_mean = "
+                            f"{float(epr_stats['epr_pos_ratio']):.6f}/"
+                            f"{float(epr_stats['epr_pos_raw_ratio']):.6f}/"
+                            f"{float(epr_stats['epr_pos_pixels_mean']):.6f}"
+                        )
+                        logger.log(
+                            "[EPR-pos FirstBatch] margin_68 min/mean/max = "
+                            f"{float(epr_stats['epr_margin_min']):.6f}/"
+                            f"{float(epr_stats['epr_margin_mean']):.6f}/"
+                            f"{float(epr_stats['epr_margin_max']):.6f}"
+                        )
+                        epr_first_batch_logged = True
+                if use_hbns_lite:
+                    hbns_scale = float(get_hbns_scale(cfg, epoch))
+                    lambda_hbns_eff = float(getattr(cfg, "HBNS_LAMBDA_MAX", 0.01)) * hbns_scale
+                    hard_bg_mask, hbns_stats = build_hbns_hard_bg_mask(
+                        cfg,
+                        batch,
+                        student_logits,
+                        teacher_binary,
+                        aux_region_masks,
+                        device,
+                    )
+                    hbns_terms = []
+                    if bool(getattr(cfg, "HBNS_APPLY_TO_FINAL", True)):
+                        loss_hbns_final = hbns_lite_loss_for_logits(cfg, student_logits, hard_bg_mask)
+                        hbns_terms.append(loss_hbns_final)
+                    if (
+                        bool(getattr(cfg, "HBNS_APPLY_TO_COARSE_AUX", True))
+                        and isinstance(student_out, dict)
+                        and "coarse_logits_68" in student_out
+                    ):
+                        hbns_coarse_logits = resize_logits_for_loss(student_out["coarse_logits_68"], cfg)
+                        loss_hbns_coarse = hbns_lite_loss_for_logits(cfg, hbns_coarse_logits, hard_bg_mask)
+                        hbns_terms.append(loss_hbns_coarse)
+                    if (
+                        bool(getattr(cfg, "HBNS_APPLY_TO_BASE_AUX", False))
+                        and isinstance(student_out, dict)
+                        and "base_logits" in student_out
+                    ):
+                        hbns_base_logits = resize_logits_for_loss(student_out["base_logits"], cfg)
+                        loss_hbns_base = hbns_lite_loss_for_logits(cfg, hbns_base_logits, hard_bg_mask)
+                        hbns_terms.append(loss_hbns_base)
+                    if hbns_terms:
+                        loss_hbns = sum(hbns_terms) / float(len(hbns_terms))
+                    loss = loss + lambda_hbns_eff * loss_hbns
+                    if not hbns_first_batch_logged:
+                        logger.log(f"[HBNS-lite FirstBatch] USE_HBNS_LITE = {bool(getattr(cfg, 'USE_HBNS_LITE', False))}")
+                        logger.log(f"[HBNS-lite FirstBatch] HBNS_VERSION = {getattr(cfg, 'HBNS_VERSION', 'lite_v1')}")
+                        logger.log(f"[HBNS-lite FirstBatch] hbns_scale = {hbns_scale:.8f}")
+                        logger.log(f"[HBNS-lite FirstBatch] lambda_hbns_eff = {lambda_hbns_eff:.8f}")
+                        logger.log(f"[HBNS-lite FirstBatch] hard_bg_mask shape = {list(hard_bg_mask.shape)}")
+                        logger.log(
+                            "[HBNS-lite FirstBatch] hard_bg_ratio/raw_ratio/pixels_mean = "
+                            f"{float(hbns_stats['hard_bg_ratio']):.6f}/"
+                            f"{float(hbns_stats['hard_bg_raw_ratio']):.6f}/"
+                            f"{float(hbns_stats['hard_bg_pixels_mean']):.6f}"
+                        )
+                        hbns_first_batch_logged = True
+                if use_esa_diagnostic:
+                    esa_stats = compute_esa_region_diagnostics(
+                        batch,
+                        aux_region_masks,
+                        student_logits,
+                        teacher_prob,
+                        teacher_binary,
+                    )
+
                 if use_linear_floor_two_stage_lr(cfg):
                     set_optimizer_lr(
                         optimizer,
@@ -6453,6 +7250,119 @@ def main():
                         rast_teacher_map_extent_mean_sum += float(rast_stats["teacher_map_extent_mean"])
                         rast_teacher_map_unknown_mean_sum += float(rast_stats["teacher_map_unknown_mean"])
                         rast_stat_batches += 1
+                        if use_esa_asym:
+                            esa_asym_scale_sum += float(rast_stats["esa_asym_scale"])
+                            esa_margin_mean_sum += float(rast_stats["esa_margin_mean"])
+                            esa_margin_min_value = float(rast_stats["esa_margin_min"])
+                            esa_margin_max_value = float(rast_stats["esa_margin_max"])
+                            esa_margin_min = (
+                                esa_margin_min_value
+                                if esa_margin_min is None
+                                else min(esa_margin_min, esa_margin_min_value)
+                            )
+                            esa_margin_max = (
+                                esa_margin_max_value
+                                if esa_margin_max is None
+                                else max(esa_margin_max, esa_margin_max_value)
+                            )
+                            esa_margin_extent_mean_sum += float(rast_stats["esa_margin_extent_mean"])
+                            esa_margin_extent_teacher_fg_mean_sum += float(
+                                rast_stats["esa_margin_extent_teacher_fg_mean"]
+                            )
+                            esa_margin_extent_teacher_bg_mean_sum += float(
+                                rast_stats["esa_margin_extent_teacher_bg_mean"]
+                            )
+                            esa_extent_teacher_fg_ratio_sum += float(rast_stats["esa_extent_teacher_fg_ratio"])
+                            esa_extent_teacher_bg_ratio_sum += float(rast_stats["esa_extent_teacher_bg_ratio"])
+                            esa_extent_teacher_bg_fg_like_ratio_sum += float(
+                                rast_stats["esa_extent_teacher_bg_fg_like_ratio"]
+                            )
+                            esa_extent_teacher_bg_ambig_ratio_sum += float(
+                                rast_stats["esa_extent_teacher_bg_ambig_ratio"]
+                            )
+                            esa_extent_teacher_bg_bg_like_ratio_sum += float(
+                                rast_stats["esa_extent_teacher_bg_bg_like_ratio"]
+                            )
+                            esa_teacher_map_extent_mean_sum += float(rast_stats["esa_teacher_map_extent_mean"])
+                            esa_teacher_map_extent_teacher_fg_mean_sum += float(
+                                rast_stats["esa_teacher_map_extent_teacher_fg_mean"]
+                            )
+                            esa_teacher_map_extent_teacher_bg_mean_sum += float(
+                                rast_stats["esa_teacher_map_extent_teacher_bg_mean"]
+                            )
+                            esa_teacher_map_extent_teacher_bg_fg_like_mean_sum += float(
+                                rast_stats["esa_teacher_map_extent_teacher_bg_fg_like_mean"]
+                            )
+                            esa_teacher_map_extent_teacher_bg_ambig_mean_sum += float(
+                                rast_stats["esa_teacher_map_extent_teacher_bg_ambig_mean"]
+                            )
+                            esa_teacher_map_extent_teacher_bg_bg_like_mean_sum += float(
+                                rast_stats["esa_teacher_map_extent_teacher_bg_bg_like_mean"]
+                            )
+                            esa_skipped_no_fg_proto_sum += int(rast_stats["esa_skipped_no_fg_proto"])
+                            esa_skipped_no_bg_proto_sum += int(rast_stats["esa_skipped_no_bg_proto"])
+                            esa_asym_stat_batches += 1
+                    if use_hbns_lite:
+                        hbns_scale_sum += float(hbns_scale)
+                        hbns_lambda_sum += float(lambda_hbns_eff)
+                        hbns_hard_bg_ratio_sum += float(hbns_stats["hard_bg_ratio"])
+                        hbns_hard_bg_raw_ratio_sum += float(hbns_stats["hard_bg_raw_ratio"])
+                        hbns_hard_bg_ratio_bg_core_sum += float(hbns_stats["hard_bg_ratio_bg_core"])
+                        hbns_hard_bg_ratio_low_target_sum += float(hbns_stats["hard_bg_ratio_low_target"])
+                        hbns_hard_bg_ratio_unknown_bg_like_sum += float(hbns_stats["hard_bg_ratio_unknown_bg_like"])
+                        hbns_hard_bg_pixels_mean_sum += float(hbns_stats["hard_bg_pixels_mean"])
+                        hbns_loss_final_sum += float(loss_hbns_final.detach().item())
+                        hbns_loss_coarse_sum += float(loss_hbns_coarse.detach().item())
+                        hbns_loss_base_sum += float(loss_hbns_base.detach().item())
+                        hbns_loss_sum += float(loss_hbns.detach().item())
+                        hbns_stat_batches += 1
+                    if use_epr_pos:
+                        epr_scale_sum += float(epr_scale)
+                        epr_lambda_sum += float(lambda_epr_eff)
+                        epr_pos_ratio_sum += float(epr_stats["epr_pos_ratio"])
+                        epr_pos_raw_ratio_sum += float(epr_stats["epr_pos_raw_ratio"])
+                        epr_pos_pixels_mean_sum += float(epr_stats["epr_pos_pixels_mean"])
+                        epr_valid_image_ratio_sum += float(epr_stats["epr_valid_image_ratio"])
+                        epr_margin_mean_sum += float(epr_stats["epr_margin_mean"])
+                        epr_margin_min_value = float(epr_stats["epr_margin_min"])
+                        epr_margin_max_value = float(epr_stats["epr_margin_max"])
+                        epr_margin_min = (
+                            epr_margin_min_value
+                            if epr_margin_min is None
+                            else min(epr_margin_min, epr_margin_min_value)
+                        )
+                        epr_margin_max = (
+                            epr_margin_max_value
+                            if epr_margin_max is None
+                            else max(epr_margin_max, epr_margin_max_value)
+                        )
+                        epr_margin_pos_mean_sum += float(epr_stats["epr_margin_pos_mean"])
+                        epr_teacher_conf_pos_mean_sum += float(epr_stats["epr_teacher_conf_pos_mean"])
+                        epr_extent_area_sum += float(epr_stats["epr_extent_area"])
+                        epr_unknown_overlap_ratio_sum += float(epr_stats["epr_unknown_overlap_ratio"])
+                        epr_loss_final_sum += float(loss_epr_final.detach().item())
+                        epr_loss_coarse_sum += float(loss_epr_coarse.detach().item())
+                        epr_loss_base_sum += float(loss_epr_base.detach().item())
+                        epr_loss_sum += float(loss_epr.detach().item())
+                        epr_stat_batches += 1
+                    if use_esa_diagnostic:
+                        esa_student_prob_fg_core_sum += float(esa_stats["student_prob_fg_core"])
+                        esa_student_prob_bg_core_sum += float(esa_stats["student_prob_bg_core"])
+                        esa_student_prob_extent_sum += float(esa_stats["student_prob_extent"])
+                        esa_student_prob_unknown_sum += float(esa_stats["student_prob_unknown"])
+                        esa_teacher_fg_fg_core_sum += float(esa_stats["teacher_fg_fg_core"])
+                        esa_teacher_fg_bg_core_sum += float(esa_stats["teacher_fg_bg_core"])
+                        esa_teacher_fg_extent_sum += float(esa_stats["teacher_fg_extent"])
+                        esa_teacher_fg_unknown_sum += float(esa_stats["teacher_fg_unknown"])
+                        esa_teacher_conf_fg_core_sum += float(esa_stats["teacher_conf_fg_core"])
+                        esa_teacher_conf_bg_core_sum += float(esa_stats["teacher_conf_bg_core"])
+                        esa_teacher_conf_extent_sum += float(esa_stats["teacher_conf_extent"])
+                        esa_teacher_conf_unknown_sum += float(esa_stats["teacher_conf_unknown"])
+                        esa_teacher_loss_fg_core_sum += float(esa_stats["teacher_loss_fg_core"])
+                        esa_teacher_loss_bg_core_sum += float(esa_stats["teacher_loss_bg_core"])
+                        esa_teacher_loss_extent_sum += float(esa_stats["teacher_loss_extent"])
+                        esa_teacher_loss_unknown_sum += float(esa_stats["teacher_loss_unknown"])
+                        esa_stat_batches += 1
                     if use_dabe_oem:
                         lambda_dyn_pos, lambda_dyn_bg = get_dabe_oem_schedule(epoch, cfg)
                         oem_lambda_dyn_pos_sum += float(lambda_dyn_pos)
@@ -6893,6 +7803,97 @@ def main():
                         f"loss_teacher_base={dabe_pu_teacher_base_loss_sum / stat_batches:.6f} | "
                         f"student_pred_area_mean={student_pred_area_sum / stat_batches:.6f} | "
                         f"teacher_pred_area_mean={teacher_pred_area_sum / stat_batches:.6f}"
+                    )
+                if use_esa_asym:
+                    esa_asym_batches = max(esa_asym_stat_batches, 1)
+                    logger.log(
+                        f"[ESA-Asym] epoch={epoch:03d} | "
+                        f"esa_asym_scale={esa_asym_scale_sum / esa_asym_batches:.6f} | "
+                        f"esa_margin_mean={esa_margin_mean_sum / esa_asym_batches:.6f} | "
+                        f"esa_margin_min={(esa_margin_min if esa_margin_min is not None else 0.0):.6f} | "
+                        f"esa_margin_max={(esa_margin_max if esa_margin_max is not None else 0.0):.6f} | "
+                        f"esa_margin_extent_mean={esa_margin_extent_mean_sum / esa_asym_batches:.6f} | "
+                        f"esa_margin_extent_teacher_fg_mean={esa_margin_extent_teacher_fg_mean_sum / esa_asym_batches:.6f} | "
+                        f"esa_margin_extent_teacher_bg_mean={esa_margin_extent_teacher_bg_mean_sum / esa_asym_batches:.6f} | "
+                        f"extent_teacher_fg_ratio={esa_extent_teacher_fg_ratio_sum / esa_asym_batches:.6f} | "
+                        f"extent_teacher_bg_ratio={esa_extent_teacher_bg_ratio_sum / esa_asym_batches:.6f} | "
+                        f"extent_teacher_bg_fg_like_ratio={esa_extent_teacher_bg_fg_like_ratio_sum / esa_asym_batches:.6f} | "
+                        f"extent_teacher_bg_ambig_ratio={esa_extent_teacher_bg_ambig_ratio_sum / esa_asym_batches:.6f} | "
+                        f"extent_teacher_bg_bg_like_ratio={esa_extent_teacher_bg_bg_like_ratio_sum / esa_asym_batches:.6f} | "
+                        f"teacher_map_extent_mean={esa_teacher_map_extent_mean_sum / esa_asym_batches:.6f} | "
+                        f"teacher_map_extent_teacher_fg_mean={esa_teacher_map_extent_teacher_fg_mean_sum / esa_asym_batches:.6f} | "
+                        f"teacher_map_extent_teacher_bg_mean={esa_teacher_map_extent_teacher_bg_mean_sum / esa_asym_batches:.6f} | "
+                        "teacher_map_extent_teacher_bg_fg_like_mean="
+                        f"{esa_teacher_map_extent_teacher_bg_fg_like_mean_sum / esa_asym_batches:.6f} | "
+                        "teacher_map_extent_teacher_bg_ambig_mean="
+                        f"{esa_teacher_map_extent_teacher_bg_ambig_mean_sum / esa_asym_batches:.6f} | "
+                        "teacher_map_extent_teacher_bg_bg_like_mean="
+                        f"{esa_teacher_map_extent_teacher_bg_bg_like_mean_sum / esa_asym_batches:.6f} | "
+                        f"skipped_no_fg_proto={esa_skipped_no_fg_proto_sum} | "
+                        f"skipped_no_bg_proto={esa_skipped_no_bg_proto_sum}"
+                    )
+                if use_hbns_lite:
+                    hbns_batches = max(hbns_stat_batches, 1)
+                    logger.log(
+                        f"[HBNS-lite] epoch={epoch:03d} | "
+                        f"hbns_scale={hbns_scale_sum / hbns_batches:.6f} | "
+                        f"lambda_hbns_eff={hbns_lambda_sum / hbns_batches:.8f} | "
+                        f"hard_bg_ratio={hbns_hard_bg_ratio_sum / hbns_batches:.6f} | "
+                        f"hard_bg_raw_ratio={hbns_hard_bg_raw_ratio_sum / hbns_batches:.6f} | "
+                        f"hard_bg_ratio_bg_core={hbns_hard_bg_ratio_bg_core_sum / hbns_batches:.6f} | "
+                        f"hard_bg_ratio_low_target={hbns_hard_bg_ratio_low_target_sum / hbns_batches:.6f} | "
+                        f"hard_bg_ratio_unknown_bg_like={hbns_hard_bg_ratio_unknown_bg_like_sum / hbns_batches:.6f} | "
+                        f"hard_bg_pixels_mean={hbns_hard_bg_pixels_mean_sum / hbns_batches:.6f} | "
+                        f"loss_hbns_final={hbns_loss_final_sum / hbns_batches:.6f} | "
+                        f"loss_hbns_coarse={hbns_loss_coarse_sum / hbns_batches:.6f} | "
+                        f"loss_hbns_base={hbns_loss_base_sum / hbns_batches:.6f} | "
+                        f"loss_hbns={hbns_loss_sum / hbns_batches:.6f}"
+                    )
+                if use_epr_pos:
+                    epr_batches = max(epr_stat_batches, 1)
+                    logger.log(
+                        f"[EPR-pos] epoch={epoch:03d} | "
+                        f"epr_scale={epr_scale_sum / epr_batches:.6f} | "
+                        f"lambda_epr_eff={epr_lambda_sum / epr_batches:.8f} | "
+                        f"epr_pos_ratio={epr_pos_ratio_sum / epr_batches:.6f} | "
+                        f"epr_pos_raw_ratio={epr_pos_raw_ratio_sum / epr_batches:.6f} | "
+                        f"epr_pos_pixels_mean={epr_pos_pixels_mean_sum / epr_batches:.6f} | "
+                        f"epr_valid_image_ratio={epr_valid_image_ratio_sum / epr_batches:.6f} | "
+                        f"epr_extent_area={epr_extent_area_sum / epr_batches:.6f} | "
+                        f"epr_unknown_overlap_ratio={epr_unknown_overlap_ratio_sum / epr_batches:.6f} | "
+                        f"epr_margin_mean={epr_margin_mean_sum / epr_batches:.6f} | "
+                        f"epr_margin_min={(epr_margin_min if epr_margin_min is not None else 0.0):.6f} | "
+                        f"epr_margin_max={(epr_margin_max if epr_margin_max is not None else 0.0):.6f} | "
+                        f"epr_margin_pos_mean={epr_margin_pos_mean_sum / epr_batches:.6f} | "
+                        f"epr_teacher_conf_pos_mean={epr_teacher_conf_pos_mean_sum / epr_batches:.6f} | "
+                        f"loss_epr_final={epr_loss_final_sum / epr_batches:.6f} | "
+                        f"loss_epr_coarse={epr_loss_coarse_sum / epr_batches:.6f} | "
+                        f"loss_epr_base={epr_loss_base_sum / epr_batches:.6f} | "
+                        f"loss_epr={epr_loss_sum / epr_batches:.6f}"
+                    )
+                if (
+                    use_esa_diagnostic
+                    and int(epoch) % max(1, int(getattr(cfg, "ESA_DIAG_LOG_INTERVAL_EPOCH", 1))) == 0
+                ):
+                    esa_batches = max(esa_stat_batches, 1)
+                    logger.log(
+                        f"[ESA-Diag] epoch={epoch:03d} | "
+                        f"student_prob_fg_core={esa_student_prob_fg_core_sum / esa_batches:.6f} | "
+                        f"student_prob_bg_core={esa_student_prob_bg_core_sum / esa_batches:.6f} | "
+                        f"student_prob_extent={esa_student_prob_extent_sum / esa_batches:.6f} | "
+                        f"student_prob_unknown={esa_student_prob_unknown_sum / esa_batches:.6f} | "
+                        f"teacher_fg_fg_core={esa_teacher_fg_fg_core_sum / esa_batches:.6f} | "
+                        f"teacher_fg_bg_core={esa_teacher_fg_bg_core_sum / esa_batches:.6f} | "
+                        f"teacher_fg_extent={esa_teacher_fg_extent_sum / esa_batches:.6f} | "
+                        f"teacher_fg_unknown={esa_teacher_fg_unknown_sum / esa_batches:.6f} | "
+                        f"teacher_conf_fg_core={esa_teacher_conf_fg_core_sum / esa_batches:.6f} | "
+                        f"teacher_conf_bg_core={esa_teacher_conf_bg_core_sum / esa_batches:.6f} | "
+                        f"teacher_conf_extent={esa_teacher_conf_extent_sum / esa_batches:.6f} | "
+                        f"teacher_conf_unknown={esa_teacher_conf_unknown_sum / esa_batches:.6f} | "
+                        f"teacher_loss_fg_core={esa_teacher_loss_fg_core_sum / esa_batches:.6f} | "
+                        f"teacher_loss_bg_core={esa_teacher_loss_bg_core_sum / esa_batches:.6f} | "
+                        f"teacher_loss_extent={esa_teacher_loss_extent_sum / esa_batches:.6f} | "
+                        f"teacher_loss_unknown={esa_teacher_loss_unknown_sum / esa_batches:.6f}"
                     )
                 if use_dabe_oem:
                     oem_batches = max(oem_stat_batches, 1)
