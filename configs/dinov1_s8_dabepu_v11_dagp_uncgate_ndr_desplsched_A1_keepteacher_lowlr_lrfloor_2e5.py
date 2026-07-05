@@ -1,0 +1,84 @@
+from configs.dinov1_s8_dabepu_v11_dagp_uncgate_ndr_desplsched_lrfloor_2e5 import *  # noqa: F401,F403
+
+
+EXP_NAME = "dinov1_s8_dabepu_v11_dagp_uncgate_ndr_desplsched_A1_keepteacher_lowlr_lrfloor_2e5"
+
+USE_DABE_PU = True
+DABE_PU_VERSION = "pu_v11"
+DABE_PU_ROOT = "../datasets/cache/dabe_pu_v11_pseudo_cache/dinov1-s8"
+P_INIT_MODE = "dabe_pu_v11_desplsched_A1_keepteacher_lowlr"
+
+P_INIT_DABE_WEIGHT = 1.0
+P_INIT_DESPL_WEIGHT = 0.0
+P_INIT_FIXED_WEIGHT = 0.0
+
+TEACHER_FUSION_MODE = "dabe_pu_despl_sched"
+USE_DABE_PU_DESPL_SCHEDULE = True
+USE_DABE_PU_STATIC_LOSS = True
+USE_TEACHER_BINARY_FULL_LOSS = True
+USE_TEACHER_CONF_LOSS = False
+
+USE_DABE_PSEUDO = False
+USE_DABE_AWARE_LOSS = False
+USE_DABE_TVERSKY_LOSS = False
+USE_DABE_AREA_GUARD = False
+
+use_despl_pseudo = False
+USE_DESPL_PSEUDO = False
+use_despl_light_cache = False
+USE_DESPL_LIGHT_CACHE = False
+use_despl_paper_cache = False
+USE_DESPL_PAPER_CACHE = False
+use_fixed_in_pseudo = False
+USE_FIXED_IN_PSEUDO = False
+fixed_used_for_training = False
+
+DABE_PU_DESPL_STAGE_START = 1
+DABE_PU_DESPL_STAGE_END = 20
+DABE_PU_DESPL_STATIC_START = 1.00
+DABE_PU_DESPL_STATIC_END = 0.05
+DABE_PU_DESPL_TEACHER_START = 0.00
+DABE_PU_DESPL_TEACHER_END = 0.95
+DABE_PU_DESPL_TEACHER_ONLY_START = 21
+
+FINETUNE_RESET_EPOCH = 20
+FINETUNE_RESET_TIMING = "after_epoch"
+FINETUNE_RESET_REBUILD_OPTIMIZER = True
+FINETUNE_RESET_REBUILD_SCHEDULER = True
+FINETUNE_RESET_GLOBAL_STEP = True
+FINETUNE_RESET_TEACHER = False
+FINETUNE_RESET_FORCE_LR_FLOOR = True
+FINETUNE_RESET_LR = 2e-5
+
+LR_POLICY = "step_floor"
+USE_LR_FLOOR = True
+LR_FLOOR = 2e-5
+LR_FLOOR_MODE = "global"
+LR_FLOOR_APPLY_AFTER_SCHEDULER_STEP = True
+LR_FLOOR_APPLY_AFTER_FINETUNE_RESET = True
+
+USE_DABE_PU_GROUP_BALANCED_STATIC = False
+USE_TEACHER_CONF_BALANCED = False
+USE_DABE_OEM = False
+USE_DABE_OEM_DYNAMIC_EXTENT = False
+USE_DABE_PU_SEED_STATIC_LOSS = False
+
+USE_DABE_AWARE_LOSS = False
+USE_DABE_TVERSKY_LOSS = False
+USE_DABE_AREA_GUARD = False
+
+USE_PROTO_CONTRAST = False
+LAMBDA_PROTO_MAX = 0.0
+
+use_multi_view_feature = False
+USE_MULTI_VIEW_FEATURE = False
+multi_view_types = []
+MULTI_VIEW_TYPES = []
+use_view_consistency = False
+USE_VIEW_CONSISTENCY = False
+lambda_view_max = 0.0
+LAMBDA_VIEW_MAX = 0.0
+
+GKD_MODE = "off"
+USE_GKD_LITE = False
+USE_TADR_ROUTER = False

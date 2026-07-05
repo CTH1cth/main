@@ -11,10 +11,13 @@ from common.utils import (
     build_image_items,
     ccr_manifest_path,
     check_exact_keys,
+    dabe_pu_manifest_path,
+    dabe_pseudo_manifest_path,
     despl_light_cache_manifest_path,
     despl_paper_manifest_path,
     despl_pseudo_bank_manifest_path,
     drepp_manifest_path,
+    hflip_feature_cache_manifest_path,
     manifest_to_map,
     ml_feature_cache_manifest_path,
     qra_manifest_path,
@@ -57,6 +60,24 @@ DREPP_TENSOR_FIELDS = {
     "memory_init": torch.float32,
     "feature_sim": torch.float32,
 }
+
+DABE_PU_REQUIRED_68_FIELDS = [
+    "target_soft_68",
+    "weight_map_68",
+    "fg_core_pu_68",
+    "fg_core_fallback_68",
+    "bg_core_pu_68",
+    "extent_candidate_68",
+    "unknown_68",
+]
+
+DABE_PU_REQUIRED_37_FIELDS = [
+    "fg_core_pu_37",
+    "fg_core_fallback_37",
+    "bg_core_pu_37",
+    "extent_candidate_37",
+    "unknown_37",
+]
 
 
 def _feature_manifest_path(cfg, split):
@@ -194,6 +215,72 @@ def _validate_unit_range(tensor, name, cache_path):
         )
 
 
+def _dabe_source_name(cfg):
+    version = str(getattr(cfg, "DABE_VERSION", "v2")).lower()
+    if version == "gc":
+        return "dabe_gc_cache"
+    return f"dabe_{version}_cache"
+
+
+def _dabe_pseudo_tensor_keys(cfg):
+    version = str(getattr(cfg, "DABE_VERSION", "v2")).lower()
+    keys = ["p_dabe_68"]
+    if version == "gc":
+        keys.append("p_dabe_gc_68")
+    keys.append("p_dabe_37")
+    if version == "gc":
+        keys.append("p_dabe_gc_37")
+    return keys
+
+
+def _select_dabe_pseudo_tensor(payload, row, cfg):
+    expected_shape = [1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE)]
+    raw_shape = [1, 37, 37]
+    found_bad_shapes = []
+    for key in _dabe_pseudo_tensor_keys(cfg):
+        value = payload.get(key)
+        if not torch.is_tensor(value):
+            continue
+        tensor = value.float()
+        shape = list(tensor.shape)
+        if shape == expected_shape:
+            _validate_unit_range(tensor, key, row["cache_path"])
+            return {
+                "tensor": tensor,
+                "source_key": key,
+                "resized_from_37": False,
+                "resized_from": shape,
+                "resized_to": shape,
+            }
+        if shape == raw_shape:
+            _validate_unit_range(tensor, key, row["cache_path"])
+            resized = F.interpolate(
+                tensor.unsqueeze(0),
+                size=(int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE)),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0).clamp(0.0, 1.0)
+            _validate_unit_range(resized, f"{key}->p_dabe_68", row["cache_path"])
+            return {
+                "tensor": resized,
+                "source_key": key,
+                "resized_from_37": True,
+                "resized_from": shape,
+                "resized_to": expected_shape,
+            }
+        found_bad_shapes.append((key, shape))
+    if found_bad_shapes:
+        raise RuntimeError(
+            "DABE pseudo tensor shape mismatch | "
+            f"cache_path={row['cache_path']} | expected={expected_shape} or {raw_shape} | "
+            f"found={found_bad_shapes}"
+        )
+    raise TypeError(
+        "DABE pseudo payload missing usable pseudo tensor | "
+        f"cache_path={row['cache_path']} | tried={_dabe_pseudo_tensor_keys(cfg)}"
+    )
+
+
 def _load_despl_pseudo(row, expected_dataset, expected_stem, cfg):
     payload = torch_load(row["cache_path"], map_location="cpu")
     if not isinstance(payload, dict):
@@ -286,6 +373,216 @@ def _load_despl_light_pseudo(row, expected_dataset, expected_stem, cfg):
         "p_despl_area": float(payload.get("p_despl_area", pseudo_despl.float().mean().item())),
         "_has_p_fixed_68": bool(has_pseudo_fixed),
         "_has_p_despl_68": bool(has_pseudo_despl),
+    }
+
+
+def _load_dabe_pseudo(row, expected_dataset, expected_stem, cfg):
+    payload = torch_load(row["cache_path"], map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(f"DABE pseudo payload must be a dict: {row['cache_path']}")
+    if payload.get("dataset") != expected_dataset:
+        raise RuntimeError(
+            f"DABE pseudo dataset mismatch for {row['cache_path']}: "
+            f"{payload.get('dataset')} != {expected_dataset}"
+        )
+    if payload.get("stem") != expected_stem:
+        raise RuntimeError(
+            f"DABE pseudo stem mismatch for {row['cache_path']}: "
+            f"{payload.get('stem')} != {expected_stem}"
+        )
+    if payload.get("backbone_key") != cfg.BACKBONE_KEY:
+        raise RuntimeError(
+            f"DABE pseudo backbone mismatch for {row['cache_path']}: "
+            f"{payload.get('backbone_key')} != {cfg.BACKBONE_KEY}"
+        )
+    expected_version = str(getattr(cfg, "DABE_VERSION", "v2")).lower()
+    if str(payload.get("dabe_version", "")).lower() != expected_version:
+        raise RuntimeError(
+            f"DABE pseudo version mismatch for {row['cache_path']}: "
+            f"{payload.get('dabe_version')} != {expected_version}"
+        )
+    selection = _select_dabe_pseudo_tensor(payload, row, cfg)
+    tensor = selection["tensor"]
+    out = {
+        "pseudo_dabe": tensor,
+        "p_dabe_area": float(payload.get("area", tensor.mean().item())),
+        "dabe_fallback_flag": bool(payload.get("fallback_flag", False)),
+        "dabe_large_area_flag": bool(payload.get("large_area_flag", False)),
+        "dabe_num_components": int(payload.get("num_components", 0)),
+        "dabe_source_key": selection["source_key"],
+        "dabe_resized_from_37": bool(selection["resized_from_37"]),
+        "dabe_resized_from": selection["resized_from"],
+        "dabe_resized_to": selection["resized_to"],
+    }
+    if bool(getattr(cfg, "USE_DABE_AWARE_LOSS", False)):
+        out.update(_load_dabe_aware_fields(payload, row, expected_dataset, expected_stem, cfg))
+    return out
+
+
+def _dabe_payload_first_tensor(payload, keys):
+    for key in keys:
+        value = payload.get(key)
+        if torch.is_tensor(value):
+            return key, value.float()
+    return None, None
+
+
+def _resize_dabe_aware_field(tensor, field_name, row, loss_size, mode, threshold=None):
+    if list(tensor.shape) != [1, 37, 37]:
+        raise RuntimeError(
+            f"DABE aware {field_name} shape mismatch: {list(tensor.shape)} != [1, 37, 37] | "
+            f"{row['cache_path']}"
+        )
+    tensor4 = tensor.unsqueeze(0)
+    if mode == "nearest":
+        resized = F.interpolate(tensor4, size=(int(loss_size), int(loss_size)), mode="nearest")
+    else:
+        resized = F.interpolate(
+            tensor4,
+            size=(int(loss_size), int(loss_size)),
+            mode="bilinear",
+            align_corners=False,
+        )
+    resized = resized.squeeze(0).float()
+    if threshold is not None:
+        resized = (resized > float(threshold)).float()
+    else:
+        resized = resized.clamp(0.0, 1.0)
+    return resized
+
+
+def _load_dabe_aware_fields(payload, row, expected_dataset, expected_stem, cfg):
+    field_keys = {
+        "fg_core": ["fg_core_37", "fg_core"],
+        "bg_core": ["bg_core_37", "bg_core"],
+        "evidence": ["evidence_37", "evidence"],
+    }
+    missing = []
+    tensors = {}
+    for field_name, keys in field_keys.items():
+        _, tensor = _dabe_payload_first_tensor(payload, keys)
+        if tensor is None:
+            missing.append(field_name)
+        else:
+            tensors[field_name] = tensor
+    if missing:
+        raise RuntimeError(
+            "DABE aware payload missing required fields | "
+            f"dataset={expected_dataset} | stem={expected_stem} | "
+            f"cache_path={row['cache_path']} | missing_keys={missing}"
+        )
+
+    loss_size = int(cfg.LOSS_SIZE)
+    core_thresh = float(getattr(cfg, "DABE_CORE_THRESH", 0.5))
+    fg_core_68 = _resize_dabe_aware_field(
+        tensors["fg_core"],
+        "fg_core",
+        row,
+        loss_size,
+        mode="nearest",
+        threshold=core_thresh,
+    )
+    bg_core_68 = _resize_dabe_aware_field(
+        tensors["bg_core"],
+        "bg_core",
+        row,
+        loss_size,
+        mode="nearest",
+        threshold=core_thresh,
+    )
+    evidence_68 = _resize_dabe_aware_field(
+        tensors["evidence"],
+        "evidence",
+        row,
+        loss_size,
+        mode="bilinear",
+    )
+    uncertain_68 = (1.0 - torch.clamp(fg_core_68 + bg_core_68, 0.0, 1.0)).float()
+    return {
+        "dabe_fg_core_68": fg_core_68,
+        "dabe_bg_core_68": bg_core_68,
+        "dabe_evidence_68": evidence_68,
+        "dabe_uncertain_68": uncertain_68,
+    }
+
+
+def _load_dabe_pu_v11(row, expected_dataset, expected_stem, cfg):
+    payload = torch_load(row["cache_path"], map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(f"DABE-PU payload must be a dict: {row['cache_path']}")
+    if payload.get("dataset") != expected_dataset:
+        raise RuntimeError(
+            f"DABE-PU dataset mismatch for {row['cache_path']}: "
+            f"{payload.get('dataset')} != {expected_dataset}"
+        )
+    if payload.get("stem") != expected_stem:
+        raise RuntimeError(
+            f"DABE-PU stem mismatch for {row['cache_path']}: "
+            f"{payload.get('stem')} != {expected_stem}"
+        )
+    if payload.get("backbone_key") != cfg.BACKBONE_KEY:
+        raise RuntimeError(
+            f"DABE-PU backbone mismatch for {row['cache_path']}: "
+            f"{payload.get('backbone_key')} != {cfg.BACKBONE_KEY}"
+        )
+    expected_version = str(getattr(cfg, "DABE_PU_VERSION", "pu_v11")).lower()
+    if str(payload.get("dabe_version", "")).lower() != expected_version:
+        raise RuntimeError(
+            f"DABE-PU version mismatch for {row['cache_path']}: "
+            f"{payload.get('dabe_version')} != {expected_version}"
+        )
+
+    expected_shape = [1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE)]
+    expected_shape_37 = [1, 37, 37]
+    use_oem = bool(getattr(cfg, "USE_DABE_OEM", False)) or str(
+        getattr(cfg, "P_INIT_MODE", "")
+    ) == "dabe_pu_v11_oem"
+    out = {}
+    missing = []
+    required_fields = list(DABE_PU_REQUIRED_68_FIELDS)
+    if use_oem:
+        required_fields.extend(DABE_PU_REQUIRED_37_FIELDS)
+    for field in required_fields:
+        tensor = payload.get(field)
+        if not torch.is_tensor(tensor):
+            missing.append(field)
+            continue
+        tensor = tensor.float()
+        shape = expected_shape_37 if field.endswith("_37") else expected_shape
+        if list(tensor.shape) != shape:
+            raise RuntimeError(
+                "DABE-PU tensor shape mismatch | "
+                f"dataset={expected_dataset} | stem={expected_stem} | "
+                f"cache_path={row['cache_path']} | {field} {list(tensor.shape)} != {shape}"
+            )
+        _validate_unit_range(tensor, field, row["cache_path"])
+        out[field] = tensor
+    if missing:
+        raise RuntimeError(
+            "DABE-PU payload missing required fields | "
+            f"dataset={expected_dataset} | stem={expected_stem} | "
+            f"cache_path={row['cache_path']} | missing_key={missing[0]} | missing_keys={missing}"
+        )
+    return {
+        "pu_target_soft": out["target_soft_68"],
+        "pu_weight_map": out["weight_map_68"],
+        "pu_fg_core": out["fg_core_pu_68"],
+        "pu_fg_fallback": out["fg_core_fallback_68"],
+        "pu_bg_core": out["bg_core_pu_68"],
+        "pu_extent": out["extent_candidate_68"],
+        "pu_unknown": out["unknown_68"],
+        "pu_fg_core_37": out.get("fg_core_pu_37"),
+        "pu_fg_fallback_37": out.get("fg_core_fallback_37"),
+        "pu_bg_core_37": out.get("bg_core_pu_37"),
+        "pu_extent_37": out.get("extent_candidate_37"),
+        "pu_unknown_37": out.get("unknown_37"),
+        "pu_target_area": float(payload.get("target_soft_area", out["target_soft_68"].mean().item())),
+        "pu_weight_mean": float(payload.get("weight_mean", out["weight_map_68"].mean().item())),
+        "pu_fg_core_area": float(payload.get("fg_core_pu_area", out["fg_core_pu_68"].mean().item())),
+        "pu_fg_fallback_area": float(payload.get("fg_core_fallback_area", out["fg_core_fallback_68"].mean().item())),
+        "pu_bg_core_area": float(payload.get("bg_core_pu_area", out["bg_core_pu_68"].mean().item())),
+        "pu_extent_area": float(payload.get("extent_area", out["extent_candidate_68"].mean().item())),
+        "pu_unknown_area": float(payload.get("unknown_area", out["unknown_68"].mean().item())),
     }
 
 
@@ -504,21 +801,79 @@ class CachedTrainDataset(Dataset):
         self.use_qra = bool(getattr(cfg, "USE_QRA", False))
         self.use_ccr = bool(getattr(cfg, "USE_CCR", False))
         self.use_drepp = bool(getattr(cfg, "USE_DREPP", False))
+        self.use_dabe_pseudo = bool(getattr(cfg, "USE_DABE_PSEUDO", False))
+        self.use_dabe_pu = bool(getattr(cfg, "USE_DABE_PU", False))
         self.use_despl_pseudo = bool(getattr(cfg, "USE_DESPL_PSEUDO", False))
         self.p_init_mode = str(getattr(cfg, "P_INIT_MODE", ""))
+        self.use_dabe_oem = self.use_dabe_pu and (
+            bool(getattr(cfg, "USE_DABE_OEM", False)) or self.p_init_mode == "dabe_pu_v11_oem"
+        )
+        self.use_dabe_pu_despl_sched = self.use_dabe_pu and self.p_init_mode in {
+            "dabe_pu_v11_desplsched",
+            "dabe_pu_v11_desplsched_exactreset",
+            "dabe_pu_v11_desplsched_A1_keepteacher_lowlr",
+            "dabe_pu_v11_desplsched_A2_resetteacher_highlr",
+            "dabe_pu_v11_desplsched_softteacher",
+            "dabe_pu_v11_desplsched_dabehard",
+        }
+        self.use_dabe_only = self.use_dabe_pseudo and self.p_init_mode in {"dabe_only", "dabe_gc_only"}
+        self.use_dabe_pu_v11 = self.use_dabe_pu and self.p_init_mode in {
+            "dabe_pu_v11",
+            "dabe_pu_v11_oem",
+            "dabe_pu_v11_desplsched",
+            "dabe_pu_v11_desplsched_exactreset",
+            "dabe_pu_v11_desplsched_A1_keepteacher_lowlr",
+            "dabe_pu_v11_desplsched_A2_resetteacher_highlr",
+            "dabe_pu_v11_desplsched_softteacher",
+            "dabe_pu_v11_desplsched_dabehard",
+        }
         self.use_despl_only = self.use_despl_pseudo and self.p_init_mode == "despl_only"
         self.use_despl_paper = self.use_despl_pseudo and self.p_init_mode == "despl_paper_only"
         self.use_dre_safe_prior = self.use_despl_pseudo and bool(getattr(cfg, "USE_DRE_SAFE_PRIOR", False))
         self.use_despl_light_cache = self.use_despl_pseudo and bool(getattr(cfg, "USE_DESPL_LIGHT_CACHE", False))
         self.use_multi_level_feature = bool(getattr(cfg, "USE_MULTI_LEVEL_FEATURE", False))
         self.use_ndr_branch = bool(getattr(cfg, "USE_NDR_BRANCH", False))
+        self.use_multi_view_feature = bool(getattr(cfg, "USE_MULTI_VIEW_FEATURE", False))
+        self.multi_view_types = [str(view).lower() for view in getattr(cfg, "MULTI_VIEW_TYPES", [])]
+        self.use_hflip_view = self.use_multi_view_feature and "hflip" in self.multi_view_types
         self.multi_level_layers = [int(layer) for layer in getattr(cfg, "MULTI_LEVEL_LAYERS", [4, 8, 12])]
+        if self.use_hflip_view and self.use_multi_level_feature:
+            raise RuntimeError("HFlip multi-view feature currently supports single-level cached DINO features only.")
         if self.use_qra and self.use_ccr:
             raise RuntimeError("USE_QRA=True and USE_CCR=True cannot be combined.")
-        if self.use_drepp and (self.use_qra or self.use_ccr or self.use_despl_pseudo):
-            raise RuntimeError("USE_DREPP=True cannot be combined with USE_QRA, USE_CCR, or USE_DESPL_PSEUDO.")
+        if self.use_drepp and (self.use_qra or self.use_ccr or self.use_despl_pseudo or self.use_dabe_pseudo or self.use_dabe_pu):
+            raise RuntimeError("USE_DREPP=True cannot be combined with USE_QRA, USE_CCR, USE_DESPL_PSEUDO, USE_DABE_PSEUDO, or USE_DABE_PU.")
         if self.use_despl_pseudo and (self.use_qra or self.use_ccr):
             raise RuntimeError("USE_DESPL_PSEUDO=True cannot be combined with USE_QRA=True or USE_CCR=True.")
+        if self.use_dabe_pseudo:
+            if not self.use_dabe_only:
+                raise RuntimeError(
+                    "USE_DABE_PSEUDO=True currently requires P_INIT_MODE in "
+                    "{'dabe_only', 'dabe_gc_only'}."
+                )
+            if not (self.use_despl_pseudo and self.use_despl_light_cache):
+                raise RuntimeError("DABE-only training requires DESPL light cache for pseudo_fixed/pseudo_despl diagnostics.")
+        if self.use_dabe_pu:
+            if self.use_dabe_pseudo:
+                raise RuntimeError("USE_DABE_PU=True cannot be combined with USE_DABE_PSEUDO=True.")
+            if not self.use_dabe_pu_v11:
+                raise RuntimeError(
+                    "USE_DABE_PU=True currently requires P_INIT_MODE in "
+                    "{'dabe_pu_v11', 'dabe_pu_v11_oem', "
+                    "'dabe_pu_v11_desplsched', 'dabe_pu_v11_desplsched_exactreset', "
+                    "'dabe_pu_v11_desplsched_A1_keepteacher_lowlr', "
+                    "'dabe_pu_v11_desplsched_A2_resetteacher_highlr', "
+                    "'dabe_pu_v11_desplsched_softteacher', "
+                    "'dabe_pu_v11_desplsched_dabehard'}."
+                )
+            if str(getattr(cfg, "DABE_PU_VERSION", "")).lower() != "pu_v11":
+                raise RuntimeError("USE_DABE_PU=True currently requires DABE_PU_VERSION='pu_v11'.")
+            if (
+                not self.use_dabe_oem
+                and not self.use_dabe_pu_despl_sched
+                and not (self.use_despl_pseudo and self.use_despl_light_cache)
+            ):
+                raise RuntimeError("DABE-PU training requires DESPL light cache for pseudo_fixed/pseudo_despl diagnostics.")
         # 训练集只建立 image/cache 索引，不读取 GT，避免把训练 GT 引入监督。
         self.items = build_image_items(cfg.DATA_ROOT, cfg.TRAIN_DATASETS, require_gt=False)
         if max_samples >= 0:
@@ -545,6 +900,21 @@ class CachedTrainDataset(Dataset):
                     f"feature train cache missing first 10: {missing_features[:10]}"
                 )
 
+        self.hflip_feature_map = None
+        self.hflip_feature_root = None
+        self.hflip_first_cache_path = None
+        if self.use_hflip_view:
+            hflip_manifest = hflip_feature_cache_manifest_path(cfg)
+            hflip_rows = read_jsonl(hflip_manifest)
+            self.hflip_feature_map = manifest_to_map(hflip_rows, hflip_manifest)
+            if max_samples < 0:
+                check_exact_keys("hflip feature train cache", self.hflip_feature_map.keys(), self.keys)
+            else:
+                missing_hflip = sorted(set(self.keys) - set(self.hflip_feature_map))
+                if missing_hflip:
+                    raise RuntimeError(f"hflip feature train cache missing first 10: {missing_hflip[:10]}")
+            self.hflip_feature_root = str(hflip_manifest.parent.resolve())
+
         override = getattr(cfg, "PSEUDO_CACHE_OVERRIDE", None)
         self.pseudo_cache_override = (
             str(Path(override).expanduser().resolve()) if override else None
@@ -557,6 +927,10 @@ class CachedTrainDataset(Dataset):
             raise RuntimeError("USE_DREPP=True cannot be combined with PSEUDO_CACHE_OVERRIDE.")
         if self.use_despl_pseudo and self.pseudo_cache_override is not None:
             raise RuntimeError("USE_DESPL_PSEUDO=True cannot be combined with PSEUDO_CACHE_OVERRIDE.")
+        if self.use_dabe_pseudo and self.pseudo_cache_override is not None:
+            raise RuntimeError("USE_DABE_PSEUDO=True cannot be combined with PSEUDO_CACHE_OVERRIDE.")
+        if self.use_dabe_pu and self.pseudo_cache_override is not None:
+            raise RuntimeError("USE_DABE_PU=True cannot be combined with PSEUDO_CACHE_OVERRIDE.")
         self.original_pseudo_cache_root = str(
             (
                 Path(cfg.CACHE_ROOT)
@@ -568,6 +942,16 @@ class CachedTrainDataset(Dataset):
         self.despl_cache_root = None
         self.despl_first_cache_path = None
         self.despl_paper_map = None
+        self.dabe_map = None
+        self.dabe_cache_root = None
+        self.dabe_first_cache_path = None
+        self.dabe_first_source_key = None
+        self.dabe_first_resized_from_37 = False
+        self.dabe_first_resized_from = None
+        self.dabe_first_resized_to = None
+        self.dabe_pu_map = None
+        self.dabe_pu_cache_root = None
+        self.dabe_pu_first_cache_path = None
         self.drepp_map = None
         self.drepp_cache_root = None
         self.drepp_first_cache_path = None
@@ -624,6 +1008,10 @@ class CachedTrainDataset(Dataset):
                 if pseudo_manifest.exists():
                     pseudo_rows = read_jsonl(pseudo_manifest)
                     self.pseudo_map = manifest_to_map(pseudo_rows, pseudo_manifest)
+        elif self.use_dabe_pu:
+            self.pseudo_map = {}
+            self.actual_pseudo_cache_root = self.original_pseudo_cache_root
+            self.actual_pseudo_cache_pattern = f"{self.original_pseudo_cache_root}/<dataset>/<stem>.pt"
         elif self.pseudo_cache_override is None:
             pseudo_manifest = _pseudo_manifest_path(cfg)
             pseudo_rows = read_jsonl(pseudo_manifest)
@@ -673,6 +1061,33 @@ class CachedTrainDataset(Dataset):
                 f"{self.actual_pseudo_cache_root}"
                 "/<dataset>/candidate_cache/<stem>.pt"
             )
+
+        if self.use_dabe_pseudo:
+            dabe_manifest = dabe_pseudo_manifest_path(cfg)
+            dabe_rows = read_jsonl(dabe_manifest)
+            self.dabe_map = manifest_to_map(dabe_rows, dabe_manifest)
+            if max_samples < 0:
+                check_exact_keys("DABE pseudo cache", self.dabe_map.keys(), self.keys)
+            else:
+                missing_dabe = sorted(set(self.keys) - set(self.dabe_map))
+                if missing_dabe:
+                    raise RuntimeError(f"DABE pseudo cache missing first 10: {missing_dabe[:10]}")
+            self.dabe_cache_root = str(dabe_manifest.parent.resolve())
+            self.actual_pseudo_cache_root = self.dabe_cache_root
+            self.actual_pseudo_cache_pattern = f"{self.dabe_cache_root}/<dataset>/<stem>.pt"
+        if self.use_dabe_pu:
+            dabe_pu_manifest = dabe_pu_manifest_path(cfg)
+            dabe_pu_rows = read_jsonl(dabe_pu_manifest)
+            self.dabe_pu_map = manifest_to_map(dabe_pu_rows, dabe_pu_manifest)
+            if max_samples < 0:
+                check_exact_keys("DABE-PU cache", self.dabe_pu_map.keys(), self.keys)
+            else:
+                missing_dabe_pu = sorted(set(self.keys) - set(self.dabe_pu_map))
+                if missing_dabe_pu:
+                    raise RuntimeError(f"DABE-PU cache missing first 10: {missing_dabe_pu[:10]}")
+            self.dabe_pu_cache_root = str(dabe_pu_manifest.parent.resolve())
+            self.actual_pseudo_cache_root = self.dabe_pu_cache_root
+            self.actual_pseudo_cache_pattern = f"{self.dabe_pu_cache_root}/<dataset>/<stem>.pt"
 
         first_dataset, first_stem = self.keys[0]
         if self.use_multi_level_feature:
@@ -746,7 +1161,7 @@ class CachedTrainDataset(Dataset):
                     f"{self.despl_blend_despl_weight:.3f}*p_despl+"
                     f"{self.despl_blend_fixed_weight:.3f}*p_fixed"
                 )
-        else:
+        elif not self.use_dabe_pu:
             pseudo, pseudo_payload = _load_pseudo(
                 self.pseudo_map[(first_dataset, first_stem)],
                 first_dataset,
@@ -758,6 +1173,72 @@ class CachedTrainDataset(Dataset):
             ]["cache_path"]
             self.pseudo_source = pseudo_payload.get("source", "original_fixed")
             self.pseudo_final_candidate = pseudo_payload.get("final_candidate", "")
+        if self.use_dabe_pseudo:
+            dabe_payload = _load_dabe_pseudo(
+                self.dabe_map[(first_dataset, first_stem)],
+                first_dataset,
+                first_stem,
+                cfg,
+            )
+            self.pseudo_shape = list(dabe_payload["pseudo_dabe"].shape)
+            self.pseudo_source = _dabe_source_name(cfg)
+            self.pseudo_final_candidate = "p_dabe_68"
+            self.dabe_first_cache_path = self.dabe_map[(first_dataset, first_stem)]["cache_path"]
+            self.dabe_first_source_key = dabe_payload["dabe_source_key"]
+            self.dabe_first_resized_from_37 = bool(dabe_payload["dabe_resized_from_37"])
+            self.dabe_first_resized_from = list(dabe_payload["dabe_resized_from"])
+            self.dabe_first_resized_to = list(dabe_payload["dabe_resized_to"])
+            self.first_pseudo_cache_path = self.dabe_first_cache_path
+        if self.use_dabe_pu:
+            dabe_pu_payload = _load_dabe_pu_v11(
+                self.dabe_pu_map[(first_dataset, first_stem)],
+                first_dataset,
+                first_stem,
+                cfg,
+            )
+            self.pseudo_shape = list(dabe_pu_payload["pu_target_soft"].shape)
+            self.pseudo_source = "dabe_pu_v11_cache"
+            teacher_target_desc = (
+                "soft_prob"
+                if (
+                    bool(getattr(cfg, "USE_TEACHER_SOFT_FULL_LOSS", False))
+                    or str(getattr(cfg, "TEACHER_TARGET_MODE", "binary")).lower() == "soft_prob"
+                )
+                else "binary"
+            )
+            static_target_desc = (
+                "target_hard_from_target_soft_68"
+                if (
+                    bool(getattr(cfg, "USE_DABE_PU_HARD_STATIC_TARGET", False))
+                    or str(getattr(cfg, "DABE_PU_STATIC_TARGET_MODE", "soft")).lower()
+                    == "hard_from_target_soft"
+                )
+                else "target_soft_68"
+            )
+            self.pseudo_final_candidate = (
+                "DABE-PU seed masks + OEM dynamic extent"
+                if self.use_dabe_oem
+                else (
+                    f"{static_target_desc} + DESPL-style full teacher {teacher_target_desc}"
+                    if self.use_dabe_pu_despl_sched
+                    else "target_soft_68"
+                )
+            )
+            self.dabe_pu_first_cache_path = self.dabe_pu_map[(first_dataset, first_stem)]["cache_path"]
+            self.first_pseudo_cache_path = self.dabe_pu_first_cache_path
+        if self.use_hflip_view:
+            hflip_feature, _ = _load_feature(
+                self.hflip_feature_map[(first_dataset, first_stem)],
+                first_dataset,
+                first_stem,
+            )
+            self.hflip_feature_shape = list(hflip_feature.shape)
+            if self.hflip_feature_shape != self.feature_shape:
+                raise RuntimeError(
+                    f"HFlip feature shape mismatch: {self.hflip_feature_shape} != {self.feature_shape} | "
+                    f"{self.hflip_feature_map[(first_dataset, first_stem)]['cache_path']}"
+                )
+            self.hflip_first_cache_path = self.hflip_feature_map[(first_dataset, first_stem)]["cache_path"]
         if self.pseudo_cache_override is not None:
             input_size = int(cfg.DINO["pseudo_input_size"])
             patch_size = int(cfg.DINO["patch_size"])
@@ -844,6 +1325,18 @@ class CachedTrainDataset(Dataset):
             feature_payload = ml_feature_payload["payload"]
         else:
             feature, feature_payload = _load_feature(self.feature_map[key], dataset, stem)
+        hflip_feature = None
+        if self.use_hflip_view:
+            hflip_feature, hflip_payload = _load_feature(self.hflip_feature_map[key], dataset, stem)
+            if list(hflip_feature.shape) != list(feature.shape):
+                raise RuntimeError(
+                    f"HFlip feature shape mismatch for {dataset}/{stem}: "
+                    f"{list(hflip_feature.shape)} != {list(feature.shape)}"
+                )
+            if hflip_payload.get("view") not in {None, "hflip"}:
+                raise RuntimeError(
+                    f"HFlip feature payload view mismatch for {dataset}/{stem}: {hflip_payload.get('view')}"
+                )
         if self.use_drepp:
             drepp_payload = _load_drepp(self.drepp_map[key], dataset, stem, self.cfg)
             pseudo = drepp_payload["p_despl"].float()
@@ -945,7 +1438,7 @@ class CachedTrainDataset(Dataset):
                 p_despl_paper_view_consistency = 0.0
                 p_despl_paper_binary = torch.zeros_like(pseudo)
                 p_despl_paper_sign_mode = ""
-        else:
+        elif not self.use_dabe_pu:
             pseudo, pseudo_payload = _load_pseudo(self.pseudo_map[key], dataset, stem)
             if (
                 self.override_expected_shape is not None
@@ -960,6 +1453,34 @@ class CachedTrainDataset(Dataset):
                 raise RuntimeError(f"Feature/pseudo dataset mismatch for {dataset}/{stem}")
             if feature_payload.get("stem") != pseudo_payload.get("stem"):
                 raise RuntimeError(f"Feature/pseudo stem mismatch for {dataset}/{stem}")
+        else:
+            pseudo = torch.zeros((1, int(self.cfg.LOSS_SIZE), int(self.cfg.LOSS_SIZE)), dtype=torch.float32)
+
+        if self.use_dabe_pseudo:
+            dabe_payload = _load_dabe_pseudo(self.dabe_map[key], dataset, stem, self.cfg)
+            pseudo_dabe = dabe_payload["pseudo_dabe"].float()
+            pseudo = pseudo_dabe
+            p_dabe_area = float(dabe_payload["p_dabe_area"])
+            p_init_area = p_dabe_area
+            use_fixed_in_pseudo = False
+            pseudo_base = pseudo_dabe
+            pseudo_safe = pseudo_dabe
+            dabe_fallback_flag = bool(dabe_payload["dabe_fallback_flag"])
+            dabe_large_area_flag = bool(dabe_payload["dabe_large_area_flag"])
+            dabe_num_components = int(dabe_payload["dabe_num_components"])
+            dabe_source_key = str(dabe_payload["dabe_source_key"])
+            dabe_resized_from_37 = bool(dabe_payload["dabe_resized_from_37"])
+            dabe_fg_core_68 = dabe_payload.get("dabe_fg_core_68")
+            dabe_bg_core_68 = dabe_payload.get("dabe_bg_core_68")
+            dabe_evidence_68 = dabe_payload.get("dabe_evidence_68")
+            dabe_uncertain_68 = dabe_payload.get("dabe_uncertain_68")
+        if self.use_dabe_pu:
+            dabe_pu_payload = _load_dabe_pu_v11(self.dabe_pu_map[key], dataset, stem, self.cfg)
+            pseudo = dabe_pu_payload["pu_target_soft"].float()
+            pseudo_base = pseudo
+            pseudo_safe = pseudo
+            p_init_area = float(dabe_pu_payload["pu_target_area"])
+            use_fixed_in_pseudo = False
 
         sample = {
             "feature": feature,
@@ -969,7 +1490,12 @@ class CachedTrainDataset(Dataset):
             "image_path": item["image_path"],
         }
         if self.use_ndr_branch:
-            sample["image_68"] = _load_image_68(item["image_path"], int(self.cfg.LOSS_SIZE))
+            image_68 = _load_image_68(item["image_path"], int(self.cfg.LOSS_SIZE))
+            sample["image_68"] = image_68
+            if self.use_hflip_view:
+                sample["image_hflip_68"] = torch.flip(image_68, dims=[-1])
+        if self.use_hflip_view:
+            sample["feature_hflip"] = hflip_feature.float()
         if self.use_multi_level_feature:
             sample.update(
                 {
@@ -1015,6 +1541,75 @@ class CachedTrainDataset(Dataset):
                         "dre_safe_changed_ratio": float(dre_safe["safe_changed_ratio"]),
                     }
                 )
+        if self.use_dabe_pseudo:
+            sample.update(
+                {
+                    "pseudo_dabe": pseudo_dabe.float(),
+                    "p_dabe_area": p_dabe_area,
+                    "dabe_fallback_flag": bool(dabe_fallback_flag),
+                    "dabe_large_area_flag": bool(dabe_large_area_flag),
+                    "dabe_num_components": int(dabe_num_components),
+                    "dabe_source_key": dabe_source_key,
+                    "dabe_resized_from_37": bool(dabe_resized_from_37),
+                    "use_fixed_in_pseudo": False,
+                    "fixed_used_for_training": False,
+                }
+            )
+            if bool(getattr(self.cfg, "USE_DABE_AWARE_LOSS", False)):
+                sample.update(
+                    {
+                        "dabe_fg_core_68": dabe_fg_core_68.float(),
+                        "dabe_bg_core_68": dabe_bg_core_68.float(),
+                        "dabe_evidence_68": dabe_evidence_68.float(),
+                        "dabe_uncertain_68": dabe_uncertain_68.float(),
+                    }
+                )
+        if self.use_dabe_pu:
+            if not self.use_despl_pseudo:
+                zero_pseudo = torch.zeros_like(pseudo)
+                sample.update(
+                    {
+                        "pseudo_fixed": zero_pseudo.float(),
+                        "pseudo_despl": zero_pseudo.float(),
+                        "p_fixed_area": 0.0,
+                        "p_despl_area": 0.0,
+                    }
+                )
+            sample.update(
+                {
+                    "pu_target_soft": dabe_pu_payload["pu_target_soft"].float(),
+                    "pu_weight_map": dabe_pu_payload["pu_weight_map"].float(),
+                    "pu_fg_core": dabe_pu_payload["pu_fg_core"].float(),
+                    "pu_fg_fallback": dabe_pu_payload["pu_fg_fallback"].float(),
+                    "pu_bg_core": dabe_pu_payload["pu_bg_core"].float(),
+                    "pu_extent": dabe_pu_payload["pu_extent"].float(),
+                    "pu_unknown": dabe_pu_payload["pu_unknown"].float(),
+                    "pu_fg_core_37": dabe_pu_payload["pu_fg_core_37"].float()
+                    if dabe_pu_payload.get("pu_fg_core_37") is not None
+                    else torch.empty(0),
+                    "pu_fg_fallback_37": dabe_pu_payload["pu_fg_fallback_37"].float()
+                    if dabe_pu_payload.get("pu_fg_fallback_37") is not None
+                    else torch.empty(0),
+                    "pu_bg_core_37": dabe_pu_payload["pu_bg_core_37"].float()
+                    if dabe_pu_payload.get("pu_bg_core_37") is not None
+                    else torch.empty(0),
+                    "pu_extent_37": dabe_pu_payload["pu_extent_37"].float()
+                    if dabe_pu_payload.get("pu_extent_37") is not None
+                    else torch.empty(0),
+                    "pu_unknown_37": dabe_pu_payload["pu_unknown_37"].float()
+                    if dabe_pu_payload.get("pu_unknown_37") is not None
+                    else torch.empty(0),
+                    "pu_target_area": float(dabe_pu_payload["pu_target_area"]),
+                    "pu_weight_mean": float(dabe_pu_payload["pu_weight_mean"]),
+                    "pu_fg_core_area": float(dabe_pu_payload["pu_fg_core_area"]),
+                    "pu_fg_fallback_area": float(dabe_pu_payload["pu_fg_fallback_area"]),
+                    "pu_bg_core_area": float(dabe_pu_payload["pu_bg_core_area"]),
+                    "pu_extent_area": float(dabe_pu_payload["pu_extent_area"]),
+                    "pu_unknown_area": float(dabe_pu_payload["pu_unknown_area"]),
+                    "use_fixed_in_pseudo": False,
+                    "fixed_used_for_training": False,
+                }
+            )
         if self.use_drepp:
             sample.update(
                 {

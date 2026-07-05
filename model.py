@@ -187,6 +187,17 @@ class NativeDetailResidualBranch(nn.Module):
             self._activation(),
         )
 
+    def compute_sobel_map(self, x):
+        if x.ndim != 4 or x.shape[1] != 1:
+            raise ValueError(f"Sobel map input must be [B,1,H,W], got {list(x.shape)}")
+        sobel_x = self.sobel_x.to(device=x.device, dtype=x.dtype)
+        sobel_y = self.sobel_y.to(device=x.device, dtype=x.dtype)
+        dx = F.conv2d(x, sobel_x, padding=1)
+        dy = F.conv2d(x, sobel_y, padding=1)
+        sobel_mag = torch.sqrt(dx * dx + dy * dy + 1e-6)
+        sobel_mag = sobel_mag / (sobel_mag.amax(dim=(2, 3), keepdim=True) + 1e-6)
+        return torch.clamp(sobel_mag, 0.0, 1.0)
+
     def compute_sobel(self, image_68):
         if image_68.ndim != 4 or image_68.shape[1] != 3:
             raise ValueError(f"NDR image_68 must be [B,3,H,W], got {list(image_68.shape)}")
@@ -195,13 +206,7 @@ class NativeDetailResidualBranch(nn.Module):
             + 0.587 * image_68[:, 1:2]
             + 0.114 * image_68[:, 2:3]
         )
-        sobel_x = self.sobel_x.to(device=gray.device, dtype=gray.dtype)
-        sobel_y = self.sobel_y.to(device=gray.device, dtype=gray.dtype)
-        dx = F.conv2d(gray, sobel_x, padding=1)
-        dy = F.conv2d(gray, sobel_y, padding=1)
-        sobel_mag = torch.sqrt(dx * dx + dy * dy + 1e-6)
-        sobel_mag = sobel_mag / (sobel_mag.amax(dim=(2, 3), keepdim=True) + 1e-6)
-        return torch.clamp(sobel_mag, 0.0, 1.0)
+        return self.compute_sobel_map(gray)
 
     def forward(self, image_68, coarse_prob_68):
         sobel_68 = self.compute_sobel(image_68)
@@ -216,6 +221,52 @@ class NativeDetailResidualBranch(nn.Module):
         raw_residual = self.out_conv(self.block3(self.block2(self.block1(ndr_input))))
         residual = raw_residual.tanh() * raw_residual.new_tensor(self.residual_clip)
         return residual, sobel_68
+
+
+class AdaptiveDetailRouter(nn.Module):
+    def __init__(
+        self,
+        in_channels=4,
+        hidden=16,
+        num_layers=2,
+        act="gelu",
+        init_bias=2.0,
+        zero_init_out=True,
+    ):
+        super().__init__()
+        if int(in_channels) <= 0:
+            raise ValueError(f"TADR_ROUTER_IN_CHANNELS must be positive, got {in_channels}")
+        if int(hidden) <= 0:
+            raise ValueError(f"TADR_ROUTER_HIDDEN must be positive, got {hidden}")
+        if int(num_layers) != 2:
+            raise ValueError(f"TADR_ROUTER_NUM_LAYERS=2 is required, got {num_layers}")
+        self.in_channels = int(in_channels)
+        self.hidden = int(hidden)
+        self.act_name = str(act).lower()
+        self.net = nn.Sequential(
+            nn.Conv2d(self.in_channels, self.hidden, kernel_size=3, padding=1, bias=True),
+            self._activation(),
+            nn.Conv2d(self.hidden, self.hidden, kernel_size=3, padding=1, bias=True),
+            self._activation(),
+        )
+        self.out_conv = nn.Conv2d(self.hidden, 1, kernel_size=1, bias=True)
+        if bool(zero_init_out):
+            nn.init.zeros_(self.out_conv.weight)
+            nn.init.constant_(self.out_conv.bias, float(init_bias))
+
+    def _activation(self):
+        if self.act_name == "gelu":
+            return nn.GELU()
+        if self.act_name == "relu":
+            return nn.ReLU(inplace=True)
+        raise ValueError(f"Unsupported TADR_ROUTER_ACT: {self.act_name}")
+
+    def forward(self, x):
+        if x.ndim != 4 or x.shape[1] != self.in_channels:
+            raise ValueError(
+                f"TADR router input must be [B,{self.in_channels},H,W], got {list(x.shape)}"
+            )
+        return torch.sigmoid(self.out_conv(self.net(x)))
 
 
 class DAGPSafeHead(nn.Module):
@@ -262,6 +313,26 @@ class DAGPSafeHead(nn.Module):
         ndr_use_uncertainty_gate=True,
         ndr_use_edge_gate=True,
         ndr_gate_mode="uncertainty_edge_boost",
+        use_tadr_router=False,
+        tadr_router_in_channels=4,
+        tadr_router_hidden=16,
+        tadr_router_num_layers=2,
+        tadr_router_act="gelu",
+        tadr_use_coarse_prob=True,
+        tadr_use_uncertainty=True,
+        tadr_use_sobel=True,
+        tadr_use_coarse_boundary=True,
+        tadr_router_init_bias=2.0,
+        tadr_router_zero_init_out=True,
+        tadr_router_detach_inputs=True,
+        tadr_router_min=0.0,
+        tadr_router_max=1.0,
+        use_proto_contrast=False,
+        proto_feature_source="dagp_semantic",
+        proto_use_proj_head=True,
+        proto_proj_hidden=64,
+        proto_proj_dim=32,
+        proto_proj_act="gelu",
     ):
         super().__init__()
         if int(hidden) <= 0:
@@ -307,19 +378,63 @@ class DAGPSafeHead(nn.Module):
         self.ndr_use_uncertainty_gate = bool(ndr_use_uncertainty_gate)
         self.ndr_use_edge_gate = bool(ndr_use_edge_gate)
         self.ndr_gate_mode = str(ndr_gate_mode)
+        self.use_tadr_router = bool(use_tadr_router)
+        self.tadr_router_in_channels = int(tadr_router_in_channels)
+        self.tadr_use_coarse_prob = bool(tadr_use_coarse_prob)
+        self.tadr_use_uncertainty = bool(tadr_use_uncertainty)
+        self.tadr_use_sobel = bool(tadr_use_sobel)
+        self.tadr_use_coarse_boundary = bool(tadr_use_coarse_boundary)
+        self.tadr_router_detach_inputs = bool(tadr_router_detach_inputs)
+        self.tadr_router_min = float(tadr_router_min)
+        self.tadr_router_max = float(tadr_router_max)
+        self.use_proto_contrast = bool(use_proto_contrast)
+        self.proto_feature_source = str(proto_feature_source)
+        self.proto_use_proj_head = bool(proto_use_proj_head)
+        self.proto_proj_hidden = int(proto_proj_hidden)
+        self.proto_proj_dim = int(proto_proj_dim)
+        self.proto_proj_act = str(proto_proj_act).lower()
 
         self.base_head = nn.Conv2d(in_channels, 1, kernel_size=1)
         self.proj = nn.Conv2d(in_channels, self.hidden, kernel_size=1)
         self.value = nn.Linear(self.hidden, self.hidden)
         self.graph_pred = nn.Conv2d(self.hidden, 1, kernel_size=1)
         self.register_buffer("current_epoch_tensor", torch.zeros(1, dtype=torch.float32))
+        if self.use_proto_contrast:
+            if self.proto_feature_source != "dagp_semantic":
+                raise ValueError(
+                    f"PROTO_FEATURE_SOURCE currently supports only 'dagp_semantic', got {self.proto_feature_source}"
+                )
+            if not self.proto_use_proj_head:
+                raise ValueError("PROTO_USE_PROJ_HEAD=False is not implemented for MVFlip-Proto.")
+            if self.proto_proj_hidden <= 0:
+                raise ValueError(f"PROTO_PROJ_HIDDEN must be positive, got {self.proto_proj_hidden}")
+            if self.proto_proj_dim <= 0:
+                raise ValueError(f"PROTO_PROJ_DIM must be positive, got {self.proto_proj_dim}")
+            if self.proto_proj_act == "gelu":
+                proto_act = nn.GELU()
+            elif self.proto_proj_act == "relu":
+                proto_act = nn.ReLU(inplace=True)
+            else:
+                raise ValueError(f"Unsupported PROTO_PROJ_ACT: {self.proto_proj_act}")
+            self.proto_proj_head = nn.Sequential(
+                nn.Conv2d(self.hidden, self.proto_proj_hidden, kernel_size=1),
+                proto_act,
+                nn.Conv2d(self.proto_proj_hidden, self.proto_proj_dim, kernel_size=1),
+            )
+        else:
+            self.proto_proj_head = None
         if self.use_ndr_branch:
             if self.ndr_loss_size <= 0:
                 raise ValueError(f"LOSS_SIZE for NDR must be positive, got {self.ndr_loss_size}")
             if self.ndr_beta_max < 0.0:
                 raise ValueError(f"NDR_BETA_MAX must be non-negative, got {self.ndr_beta_max}")
-            if self.ndr_gate_mode != "uncertainty_edge_boost":
+            if self.ndr_gate_mode not in {"uncertainty_edge_boost", "uncertainty_edge_stronger"}:
                 raise ValueError(f"Unsupported NDR_GATE_MODE: {self.ndr_gate_mode}")
+            if self.tadr_router_min > self.tadr_router_max:
+                raise ValueError(
+                    f"TADR_ROUTER_MIN must be <= TADR_ROUTER_MAX, got "
+                    f"{self.tadr_router_min} > {self.tadr_router_max}"
+                )
             self.ndr_branch = NativeDetailResidualBranch(
                 in_channels=int(ndr_in_channels),
                 hidden=int(ndr_hidden),
@@ -333,8 +448,29 @@ class DAGPSafeHead(nn.Module):
                 input_sobel=bool(ndr_input_sobel),
                 input_coarse_prob=bool(ndr_input_coarse_prob),
             )
+            if self.use_tadr_router:
+                expected_tadr_channels = int(self.tadr_use_coarse_prob) + int(self.tadr_use_uncertainty)
+                expected_tadr_channels += int(self.tadr_use_sobel) + int(self.tadr_use_coarse_boundary)
+                if self.tadr_router_in_channels != expected_tadr_channels:
+                    raise ValueError(
+                        f"TADR_ROUTER_IN_CHANNELS={self.tadr_router_in_channels} does not match enabled "
+                        f"TADR inputs ({expected_tadr_channels} channels)"
+                    )
+                self.tadr_router = AdaptiveDetailRouter(
+                    in_channels=self.tadr_router_in_channels,
+                    hidden=int(tadr_router_hidden),
+                    num_layers=int(tadr_router_num_layers),
+                    act=str(tadr_router_act),
+                    init_bias=float(tadr_router_init_bias),
+                    zero_init_out=bool(tadr_router_zero_init_out),
+                )
+            else:
+                self.tadr_router = None
         else:
+            if self.use_tadr_router:
+                raise ValueError("USE_TADR_ROUTER=True requires USE_NDR_BRANCH=True")
             self.ndr_branch = None
+            self.tadr_router = None
 
         if bool(zero_init_graph_pred):
             nn.init.zeros_(self.graph_pred.weight)
@@ -430,6 +566,43 @@ class DAGPSafeHead(nn.Module):
         gate_for_stats = gate.detach()
         return gate_for_stats.mean(), gate_for_stats.min(), gate_for_stats.max()
 
+    def _proto_features(self, semantic_feat):
+        if not self.use_proto_contrast:
+            return None, None
+        proto_feat_raw = F.interpolate(
+            semantic_feat,
+            size=(self.ndr_loss_size, self.ndr_loss_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        proto_feat = self.proto_proj_head(proto_feat_raw)
+        proto_feat = F.normalize(proto_feat, dim=1)
+        return proto_feat_raw, proto_feat
+
+    def _attach_proto_aux(self, output, semantic_feat):
+        if not self.use_proto_contrast or semantic_feat is None:
+            return output
+        proto_feat_raw, proto_feat = self._proto_features(semantic_feat)
+        output["proto_feat_raw"] = proto_feat_raw
+        output["proto_feat"] = proto_feat
+        output["prob"] = torch.sigmoid(output["logits"])
+        if "coarse_logits_68" in output:
+            output["coarse_logits"] = output["coarse_logits_68"]
+            output["coarse_prob"] = torch.sigmoid(output["coarse_logits_68"])
+        elif "coarse_logits_37" in output:
+            coarse_logits = F.interpolate(
+                output["coarse_logits_37"],
+                size=(self.ndr_loss_size, self.ndr_loss_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+            output["coarse_logits"] = coarse_logits
+            output["coarse_prob"] = torch.sigmoid(coarse_logits)
+        else:
+            output["coarse_logits"] = output["logits"]
+            output["coarse_prob"] = output["prob"]
+        return output
+
     def _aux_output(
         self,
         logits,
@@ -439,10 +612,11 @@ class DAGPSafeHead(nn.Module):
         alpha_eff,
         gamma_eff,
         uncertainty_gate=None,
+        semantic_feat=None,
     ):
         scalar = base_logits.new_tensor(float(scale))
         unc_mean, unc_min, unc_max = self._uncertainty_stats(base_logits, uncertainty_gate)
-        return {
+        output = {
             "logits": logits,
             "base_logits": base_logits,
             "graph_logits": graph_logits,
@@ -453,11 +627,34 @@ class DAGPSafeHead(nn.Module):
             "uncertainty_gate_min": unc_min,
             "uncertainty_gate_max": unc_max,
         }
+        return self._attach_proto_aux(output, semantic_feat)
 
     @staticmethod
     def _tensor_stats(tensor):
         tensor_detached = tensor.detach()
         return tensor_detached.mean(), tensor_detached.min(), tensor_detached.max()
+
+    def _build_tadr_router_input(self, coarse_prob_68, uncertainty_68, sobel_68, coarse_boundary_68):
+        inputs = []
+        if self.tadr_use_coarse_prob:
+            inputs.append(coarse_prob_68)
+        if self.tadr_use_uncertainty:
+            inputs.append(uncertainty_68)
+        if self.tadr_use_sobel:
+            inputs.append(sobel_68)
+        if self.tadr_use_coarse_boundary:
+            inputs.append(coarse_boundary_68)
+        if not inputs:
+            raise ValueError("USE_TADR_ROUTER=True requires at least one enabled TADR input.")
+        if self.tadr_router_detach_inputs:
+            inputs = [tensor.detach() for tensor in inputs]
+        router_input = torch.cat(inputs, dim=1)
+        if router_input.shape[1] != self.tadr_router_in_channels:
+            raise ValueError(
+                f"TADR router input channels mismatch: got {router_input.shape[1]}, "
+                f"expected {self.tadr_router_in_channels}"
+            )
+        return router_input
 
     def _apply_ndr(
         self,
@@ -470,6 +667,7 @@ class DAGPSafeHead(nn.Module):
         gamma_eff,
         uncertainty_gate,
         return_aux,
+        semantic_feat=None,
     ):
         if image_68 is None:
             raise ValueError("NDR branch requires image_68")
@@ -489,13 +687,33 @@ class DAGPSafeHead(nn.Module):
         coarse_prob_68 = torch.sigmoid(coarse_logits_68.detach())
         residual_logits_68, sobel_68 = self.ndr_branch(image_68.to(dtype=coarse_logits_68.dtype), coarse_prob_68)
 
-        if self.ndr_use_uncertainty_gate:
-            uncertainty = 1.0 - 2.0 * torch.abs(coarse_prob_68 - 0.5)
-            uncertainty = torch.clamp(uncertainty, 0.0, 1.0)
+        uncertainty_68 = 1.0 - 2.0 * torch.abs(coarse_prob_68 - 0.5)
+        uncertainty_68 = torch.clamp(uncertainty_68, 0.0, 1.0)
+        base_uncertainty = uncertainty_68 if self.ndr_use_uncertainty_gate else torch.ones_like(coarse_prob_68)
+        if not self.ndr_use_edge_gate:
+            edge_gate = torch.ones_like(sobel_68)
+        elif self.ndr_gate_mode == "uncertainty_edge_boost":
+            edge_gate = 0.5 + 0.5 * sobel_68
+        elif self.ndr_gate_mode == "uncertainty_edge_stronger":
+            edge_gate = 0.25 + 0.75 * sobel_68
         else:
-            uncertainty = torch.ones_like(coarse_prob_68)
-        edge_gate = 0.5 + 0.5 * sobel_68 if self.ndr_use_edge_gate else torch.ones_like(sobel_68)
-        detail_gate = torch.clamp(uncertainty * edge_gate, 0.0, 1.0)
+            raise ValueError(f"Unsupported NDR_GATE_MODE: {self.ndr_gate_mode}")
+        base_gate = torch.clamp(base_uncertainty * edge_gate, 0.0, 1.0)
+        detail_gate = base_gate
+        coarse_boundary_68 = None
+        router_input = None
+        router_map_68 = None
+        if self.use_tadr_router:
+            coarse_boundary_68 = self.ndr_branch.compute_sobel_map(coarse_prob_68)
+            router_input = self._build_tadr_router_input(
+                coarse_prob_68,
+                uncertainty_68,
+                sobel_68,
+                coarse_boundary_68,
+            )
+            router_map_68 = self.tadr_router(router_input)
+            router_map_68 = torch.clamp(router_map_68, self.tadr_router_min, self.tadr_router_max)
+            detail_gate = torch.clamp(base_gate * router_map_68, 0.0, 1.0)
         beta_eff = self._ndr_beta_eff()
         logits = coarse_logits_68 + coarse_logits_68.new_tensor(float(beta_eff)) * detail_gate * residual_logits_68
 
@@ -517,7 +735,10 @@ class DAGPSafeHead(nn.Module):
             {
                 "coarse_logits_37": coarse_logits_37,
                 "coarse_logits_68": coarse_logits_68,
+                "coarse_prob_68": coarse_prob_68,
+                "uncertainty_68": uncertainty_68,
                 "residual_logits_68": residual_logits_68,
+                "base_gate": base_gate,
                 "detail_gate": detail_gate,
                 "sobel_68": sobel_68,
                 "ndr_beta_eff": coarse_logits_68.new_tensor(float(beta_eff)),
@@ -528,7 +749,26 @@ class DAGPSafeHead(nn.Module):
                 "ndr_residual_abs_max": residual_abs.max(),
             }
         )
-        return output
+        if self.use_tadr_router:
+            router_mean, router_min, router_max = self._tensor_stats(router_map_68)
+            base_gate_mean, base_gate_min, base_gate_max = self._tensor_stats(base_gate)
+            output.update(
+                {
+                    "coarse_boundary_68": coarse_boundary_68,
+                    "router_input": router_input,
+                    "router_map_68": router_map_68,
+                    "tadr_router_mean": router_mean,
+                    "tadr_router_min": router_min,
+                    "tadr_router_max": router_max,
+                    "tadr_base_gate_mean": base_gate_mean,
+                    "tadr_base_gate_min": base_gate_min,
+                    "tadr_base_gate_max": base_gate_max,
+                    "tadr_final_gate_mean": gate_mean,
+                    "tadr_final_gate_min": gate_min,
+                    "tadr_final_gate_max": gate_max,
+                }
+            )
+        return self._attach_proto_aux(output, semantic_feat)
 
     def forward(self, feat, image_68=None, return_aux=False):
         bsz, _, height, width = feat.shape
@@ -539,6 +779,7 @@ class DAGPSafeHead(nn.Module):
 
         if alpha_eff == 0.0 or gamma_eff == 0.0:
             graph_logits = torch.zeros_like(base_logits)
+            semantic_feat = self.proj(feat) if return_aux and self.use_proto_contrast else None
             if self.use_ndr_branch:
                 return self._apply_ndr(
                     base_logits,
@@ -550,6 +791,7 @@ class DAGPSafeHead(nn.Module):
                     gamma_eff,
                     self._uncertainty_output_gate(base_logits),
                     return_aux,
+                    semantic_feat=semantic_feat,
                 )
             if return_aux:
                 uncertainty_gate = self._uncertainty_output_gate(base_logits)
@@ -561,6 +803,7 @@ class DAGPSafeHead(nn.Module):
                     alpha_eff,
                     gamma_eff,
                     uncertainty_gate,
+                    semantic_feat=semantic_feat,
                 )
             return base_logits
 
@@ -594,6 +837,7 @@ class DAGPSafeHead(nn.Module):
                 gamma_eff,
                 uncertainty_gate,
                 return_aux,
+                semantic_feat=z_prop_map if return_aux and self.use_proto_contrast else None,
             )
         if return_aux:
             return self._aux_output(
@@ -604,6 +848,7 @@ class DAGPSafeHead(nn.Module):
                 alpha_eff,
                 gamma_eff,
                 uncertainty_gate,
+                semantic_feat=z_prop_map if self.use_proto_contrast else None,
             )
         return logits
 
@@ -1152,6 +1397,26 @@ def build_seg_head(in_channels, cfg):
             ndr_use_uncertainty_gate=bool(getattr(cfg, "NDR_USE_UNCERTAINTY_GATE", True)),
             ndr_use_edge_gate=bool(getattr(cfg, "NDR_USE_EDGE_GATE", True)),
             ndr_gate_mode=str(getattr(cfg, "NDR_GATE_MODE", "uncertainty_edge_boost")),
+            use_tadr_router=bool(getattr(cfg, "USE_TADR_ROUTER", False)),
+            tadr_router_in_channels=int(getattr(cfg, "TADR_ROUTER_IN_CHANNELS", 4)),
+            tadr_router_hidden=int(getattr(cfg, "TADR_ROUTER_HIDDEN", 16)),
+            tadr_router_num_layers=int(getattr(cfg, "TADR_ROUTER_NUM_LAYERS", 2)),
+            tadr_router_act=str(getattr(cfg, "TADR_ROUTER_ACT", "gelu")),
+            tadr_use_coarse_prob=bool(getattr(cfg, "TADR_USE_COARSE_PROB", True)),
+            tadr_use_uncertainty=bool(getattr(cfg, "TADR_USE_UNCERTAINTY", True)),
+            tadr_use_sobel=bool(getattr(cfg, "TADR_USE_SOBEL", True)),
+            tadr_use_coarse_boundary=bool(getattr(cfg, "TADR_USE_COARSE_BOUNDARY", True)),
+            tadr_router_init_bias=float(getattr(cfg, "TADR_ROUTER_INIT_BIAS", 2.0)),
+            tadr_router_zero_init_out=bool(getattr(cfg, "TADR_ROUTER_ZERO_INIT_OUT", True)),
+            tadr_router_detach_inputs=bool(getattr(cfg, "TADR_ROUTER_DETACH_INPUTS", True)),
+            tadr_router_min=float(getattr(cfg, "TADR_ROUTER_MIN", 0.0)),
+            tadr_router_max=float(getattr(cfg, "TADR_ROUTER_MAX", 1.0)),
+            use_proto_contrast=bool(getattr(cfg, "USE_PROTO_CONTRAST", False)),
+            proto_feature_source=str(getattr(cfg, "PROTO_FEATURE_SOURCE", "dagp_semantic")),
+            proto_use_proj_head=bool(getattr(cfg, "PROTO_USE_PROJ_HEAD", True)),
+            proto_proj_hidden=int(getattr(cfg, "PROTO_PROJ_HIDDEN", 64)),
+            proto_proj_dim=int(getattr(cfg, "PROTO_PROJ_DIM", 32)),
+            proto_proj_act=str(getattr(cfg, "PROTO_PROJ_ACT", "gelu")),
         )
     if head_type == "context_residual":
         hidden = int(getattr(cfg, "CONTEXT_HEAD_HIDDEN", 64))

@@ -1,0 +1,25 @@
+from configs.dinov1_s8_despl_dagp_uncgate_ndr_lrfloor_2e5 import *  # noqa: F401,F403
+
+
+EXP_NAME = "dinov1_s8_despl_dagp_uncgate_ndr_mvflip_viewonly"
+
+USE_MULTI_VIEW_FEATURE = True
+MULTI_VIEW_TYPES = ["hflip"]
+HFLIP_FEATURE_CACHE_ROOT = "../datasets/cache/features_cache_hflip"
+HFLIP_FEATURE_PREFLIGHT_SAMPLES = 16
+
+USE_VIEW_CONSISTENCY = True
+LAMBDA_VIEW_MAX = 0.03
+VIEW_CONSISTENCY_TYPE = "l1"
+VIEW_CONF_SOURCE = "despl_core"
+VIEW_FG_THRESH = 0.8
+VIEW_BG_THRESH = 0.2
+VIEW_BOUNDARY_WEIGHT = 0.0
+VIEW_WARMUP_EPOCH = 6
+VIEW_RAMP_START_EPOCH = 7
+VIEW_RAMP_END_EPOCH = 15
+VIEW_AFTER_RESET_SCALE = 0.0
+MV_LOSS_DEBUG = True
+
+USE_PROTO_CONTRAST = False
+LAMBDA_PROTO_MAX = 0.0

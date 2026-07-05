@@ -253,6 +253,15 @@ def ml_feature_cache_manifest_path(cfg, split):
     return ml_feature_cache_dir(cfg) / f"manifest_{split}.jsonl"
 
 
+def hflip_feature_cache_dir(cfg):
+    root = getattr(cfg, "HFLIP_FEATURE_CACHE_ROOT", "../datasets/cache/features_cache_hflip")
+    return Path(root) / cfg.BACKBONE_KEY
+
+
+def hflip_feature_cache_manifest_path(cfg):
+    return hflip_feature_cache_dir(cfg) / "manifest_train.jsonl"
+
+
 def qra_cache_dir(cfg):
     return Path(cfg.QRA_CACHE_ROOT) / cfg.BACKBONE_KEY
 
@@ -306,6 +315,16 @@ def despl_light_cache_manifest_path(cfg):
     return despl_light_cache_dir(cfg) / "manifest_train.jsonl"
 
 
+def dabe_pseudo_manifest_path(cfg):
+    root = getattr(cfg, "DABE_PSEUDO_ROOT", "../datasets/cache/dabe_v2_pseudo_cache/dinov1-s8")
+    return Path(root) / "manifest_train.jsonl"
+
+
+def dabe_pu_manifest_path(cfg):
+    root = getattr(cfg, "DABE_PU_ROOT", "../datasets/cache/dabe_pu_v11_pseudo_cache/dinov1-s8")
+    return Path(root) / "manifest_train.jsonl"
+
+
 def despl_paper_cache_dir(cfg, sign_mode=None):
     root = Path(cfg.DESPL_PAPER_CACHE_ROOT)
     backbone = getattr(cfg, "DESPL_PAPER_BACKBONE_KEY", cfg.BACKBONE_KEY)
@@ -348,6 +367,15 @@ def _ml_feature_error(split, reason):
         "Please run:\n"
         "python common/cache_features_ml.py --config <your_multi_level_config.py> "
         f"--split {split}"
+    )
+
+
+def _hflip_feature_error(reason):
+    return (
+        f"HFlip feature cache train missing or incomplete: {reason}\n"
+        "Please run:\n"
+        "python common/cache_features_hflip.py --config <your_mvflip_config.py> "
+        "--split train"
     )
 
 
@@ -542,6 +570,74 @@ def check_ml_feature_cache(cfg, split, max_samples=None):
             raise RuntimeError(_ml_feature_error(split, f"payload tensor dtype must be float32 for {key}: {tensor.dtype}"))
 
     return True, f"complete: {manifest_path} | payload_check={preflight_mode}:{len(payload_keys)}/{len(expected_keys)}"
+
+
+def check_hflip_feature_cache(cfg, max_samples=None):
+    manifest_path = hflip_feature_cache_manifest_path(cfg)
+    if not manifest_path.exists():
+        raise RuntimeError(_hflip_feature_error(f"missing manifest: {manifest_path}"))
+
+    expected_items = build_image_items(cfg.DATA_ROOT, cfg.TRAIN_DATASETS, require_gt=False)
+    if max_samples is not None and int(max_samples) >= 0:
+        expected_items = expected_items[: int(max_samples)]
+    expected_keys = [(item["dataset"], item["stem"]) for item in expected_items]
+    expected_key_set = set(expected_keys)
+
+    rows = read_jsonl(manifest_path)
+    row_map = {}
+    for row in rows:
+        if "dataset" not in row or "stem" not in row:
+            raise RuntimeError(_hflip_feature_error(f"bad manifest row without dataset/stem in {manifest_path}"))
+        key = (row["dataset"], row["stem"])
+        if key in row_map:
+            raise RuntimeError(_hflip_feature_error(f"duplicate manifest key in {manifest_path}: {key}"))
+        row_map[key] = row
+
+    actual_key_set = set(row_map)
+    if max_samples is None or int(max_samples) < 0:
+        extra = sorted(actual_key_set - expected_key_set)
+        if extra:
+            raise RuntimeError(_hflip_feature_error(f"manifest has unexpected keys first 10: {extra[:10]}"))
+    missing = sorted(expected_key_set - actual_key_set)
+    if missing:
+        raise RuntimeError(_hflip_feature_error(f"missing manifest rows first 10: {missing[:10]}"))
+
+    payload_keys = _sample_ordered_keys(expected_keys, int(getattr(cfg, "HFLIP_FEATURE_PREFLIGHT_SAMPLES", 16)))
+    if max_samples is not None and int(max_samples) >= 0:
+        payload_keys = expected_keys
+    for key in expected_keys:
+        row = row_map[key]
+        cache_path = row.get("cache_path")
+        if not cache_path:
+            raise RuntimeError(_hflip_feature_error(f"missing cache_path for {key}"))
+        if not Path(cache_path).exists():
+            raise RuntimeError(_hflip_feature_error(f"missing cache file: {cache_path}"))
+        shape = row.get("shape")
+        if not _feature_shape3_ok(shape):
+            raise RuntimeError(_hflip_feature_error(f"invalid manifest shape for {key}: {shape}"))
+    for key in payload_keys:
+        row = row_map[key]
+        cache_path = row["cache_path"]
+        payload = torch_load(cache_path, map_location="cpu")
+        if not isinstance(payload, dict):
+            raise RuntimeError(_hflip_feature_error(f"payload must be dict for {key}: {cache_path}"))
+        if payload.get("dataset") != key[0] or payload.get("stem") != key[1]:
+            raise RuntimeError(_hflip_feature_error(f"payload key mismatch for {key}: {cache_path}"))
+        if payload.get("view") not in {None, "hflip"}:
+            raise RuntimeError(_hflip_feature_error(f"payload view mismatch for {key}: {payload.get('view')}"))
+        tensor = payload.get("tensor")
+        if not torch.is_tensor(tensor):
+            raise RuntimeError(_hflip_feature_error(f"payload missing tensor for {key}: {cache_path}"))
+        if tensor.ndim != 3:
+            raise RuntimeError(_hflip_feature_error(f"payload tensor must be [C,H,W], got {list(tensor.shape)}"))
+        if list(tensor.shape) != list(row.get("shape")):
+            raise RuntimeError(
+                _hflip_feature_error(
+                    f"shape mismatch for {key}: manifest {row.get('shape')} != payload {list(tensor.shape)}"
+                )
+            )
+
+    return True, f"complete: {manifest_path} | payload_check={len(payload_keys)}/{len(expected_keys)}"
 
 
 def _qra_required_shapes(cfg):
@@ -1010,6 +1106,299 @@ def check_despl_light_cache(cfg, max_samples=None):
                 )
 
     return True, f"complete: {manifest_path}"
+
+
+def _dabe_pseudo_error(reason):
+    return (
+        f"DABE pseudo cache missing or incomplete: {reason}\n"
+        "Please generate it first, for example:\n"
+        "python common/cache_dabe_pseudo.py --config <config.py> "
+        "--out_root <DABE_PSEUDO_ROOT> --split train "
+        "--augs identity,hflip,vflip,rot180 --dabe_version <DABE_VERSION> --overwrite"
+    )
+
+
+def _dabe_first_tensor(payload, keys):
+    for key in keys:
+        value = payload.get(key)
+        if torch.is_tensor(value):
+            return key, value.float()
+    return None, None
+
+
+def _dabe_pseudo_tensor_keys(cfg):
+    version = str(getattr(cfg, "DABE_VERSION", "v2")).lower()
+    keys = ["p_dabe_68"]
+    if version == "gc":
+        keys.append("p_dabe_gc_68")
+    keys.append("p_dabe_37")
+    if version == "gc":
+        keys.append("p_dabe_gc_37")
+    return keys
+
+
+def _check_dabe_pseudo_tensor(payload, cfg, key, cache_path):
+    expected_shape = [1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE)]
+    raw_shape = [1, 37, 37]
+    found_bad_shapes = []
+    for tensor_key in _dabe_pseudo_tensor_keys(cfg):
+        tensor = payload.get(tensor_key)
+        if not torch.is_tensor(tensor):
+            continue
+        tensor = tensor.float()
+        shape = list(tensor.shape)
+        if shape not in (expected_shape, raw_shape):
+            found_bad_shapes.append((tensor_key, shape))
+            continue
+        min_value = float(tensor.min().item())
+        max_value = float(tensor.max().item())
+        if min_value < -1e-6 or max_value > 1.0 + 1e-6:
+            raise RuntimeError(
+                _dabe_pseudo_error(
+                    f"{tensor_key} values out of [0,1] for {key}: "
+                    f"min={min_value:.6f}, max={max_value:.6f} | {cache_path}"
+                )
+            )
+        return tensor_key, shape
+    if found_bad_shapes:
+        raise RuntimeError(
+            _dabe_pseudo_error(
+                f"invalid DABE pseudo tensor shape for {key}: "
+                f"expected {expected_shape} or {raw_shape}, found={found_bad_shapes} | {cache_path}"
+            )
+        )
+    raise RuntimeError(
+        _dabe_pseudo_error(
+            f"missing usable DABE pseudo tensor for {key}: tried={_dabe_pseudo_tensor_keys(cfg)} | {cache_path}"
+        )
+    )
+
+
+def check_dabe_pseudo_cache(cfg, max_samples=None):
+    manifest_path = dabe_pseudo_manifest_path(cfg)
+    if not manifest_path.exists():
+        raise RuntimeError(_dabe_pseudo_error(f"missing manifest: {manifest_path}"))
+
+    expected_items = build_image_items(cfg.DATA_ROOT, cfg.TRAIN_DATASETS, require_gt=False)
+    if max_samples is not None and int(max_samples) >= 0:
+        expected_items = expected_items[: int(max_samples)]
+    expected_keys = [(item["dataset"], item["stem"]) for item in expected_items]
+    expected_key_set = set(expected_keys)
+
+    rows = read_jsonl(manifest_path)
+    row_map = {}
+    for row in rows:
+        if "dataset" not in row or "stem" not in row:
+            raise RuntimeError(_dabe_pseudo_error(f"bad manifest row without dataset/stem in {manifest_path}"))
+        key = (row["dataset"], row["stem"])
+        if key in row_map:
+            raise RuntimeError(_dabe_pseudo_error(f"duplicate manifest key in {manifest_path}: {key}"))
+        row_map[key] = row
+
+    actual_key_set = set(row_map)
+    if max_samples is None or int(max_samples) < 0:
+        extra = sorted(actual_key_set - expected_key_set)
+        if extra:
+            raise RuntimeError(_dabe_pseudo_error(f"manifest has unexpected keys first 10: {extra[:10]}"))
+    missing = sorted(expected_key_set - actual_key_set)
+    if missing:
+        raise RuntimeError(_dabe_pseudo_error(f"missing manifest rows first 10: {missing[:10]}"))
+
+    expected_shape = [1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE)]
+    expected_version = str(getattr(cfg, "DABE_VERSION", "v2")).lower()
+    for key in expected_keys:
+        row = row_map[key]
+        if row.get("backbone_key", cfg.BACKBONE_KEY) != cfg.BACKBONE_KEY:
+            raise RuntimeError(
+                _dabe_pseudo_error(
+                    f"backbone mismatch for {key}: {row.get('backbone_key')} != {cfg.BACKBONE_KEY}"
+                )
+            )
+        if str(row.get("dabe_version", expected_version)).lower() != expected_version:
+            raise RuntimeError(
+                _dabe_pseudo_error(
+                    f"version mismatch for {key}: {row.get('dabe_version')} != {expected_version}"
+                )
+            )
+        if row.get("shape_68") is not None and row.get("shape_68") != expected_shape:
+            raise RuntimeError(_dabe_pseudo_error(f"invalid shape_68 for {key}: {row.get('shape_68')} != {expected_shape}"))
+        cache_path = row.get("cache_path")
+        if not cache_path:
+            raise RuntimeError(_dabe_pseudo_error(f"missing cache_path for {key}"))
+        if not Path(cache_path).exists():
+            raise RuntimeError(_dabe_pseudo_error(f"missing cache file: {cache_path}"))
+        payload = torch_load(cache_path, map_location="cpu")
+        if not isinstance(payload, dict):
+            raise RuntimeError(_dabe_pseudo_error(f"payload must be dict for {key}: {cache_path}"))
+        if payload.get("dataset") != key[0] or payload.get("stem") != key[1]:
+            raise RuntimeError(_dabe_pseudo_error(f"payload key mismatch for {key}: {cache_path}"))
+        if payload.get("backbone_key") != cfg.BACKBONE_KEY:
+            raise RuntimeError(_dabe_pseudo_error(f"payload backbone mismatch for {key}: {cache_path}"))
+        if str(payload.get("dabe_version", "")).lower() != expected_version:
+            raise RuntimeError(_dabe_pseudo_error(f"payload version mismatch for {key}: {cache_path}"))
+        _check_dabe_pseudo_tensor(payload, cfg, key, cache_path)
+        if bool(getattr(cfg, "USE_DABE_AWARE_LOSS", False)):
+            aware_fields = {
+                "fg_core": ["fg_core_37", "fg_core"],
+                "bg_core": ["bg_core_37", "bg_core"],
+                "evidence": ["evidence_37", "evidence"],
+            }
+            missing = []
+            for field_name, field_keys in aware_fields.items():
+                _, aware_tensor = _dabe_first_tensor(payload, field_keys)
+                if aware_tensor is None:
+                    missing.append(field_name)
+                    continue
+                if list(aware_tensor.shape) != [1, 37, 37]:
+                    raise RuntimeError(
+                        _dabe_pseudo_error(
+                            f"invalid aware field shape for {key}: {field_name} "
+                            f"{list(aware_tensor.shape)} != [1, 37, 37] | {cache_path}"
+                        )
+                    )
+                min_aware = float(aware_tensor.min().item())
+                max_aware = float(aware_tensor.max().item())
+                if min_aware < -1e-6 or max_aware > 1.0 + 1e-6:
+                    raise RuntimeError(
+                        _dabe_pseudo_error(
+                            f"aware field values out of [0,1] for {key}: {field_name} "
+                            f"min={min_aware:.6f}, max={max_aware:.6f} | {cache_path}"
+                        )
+                    )
+            if missing:
+                raise RuntimeError(
+                    _dabe_pseudo_error(
+                        f"missing aware fields for {key}: cache_path={cache_path} missing_keys={missing}"
+                    )
+                )
+
+    return True, f"complete: {manifest_path} | rows_checked={len(expected_keys)} | version={expected_version}"
+
+
+def _dabe_pu_error(reason):
+    return (
+        f"DABE-PU cache missing or incomplete: {reason}\n"
+        "Please generate the offline DABE-PU cache first; training will not auto-generate it."
+    )
+
+
+def _check_dabe_pu_tensor(payload, key, cache_path, tensor_key, expected_shape):
+    tensor = payload.get(tensor_key)
+    if not torch.is_tensor(tensor):
+        raise RuntimeError(
+            _dabe_pu_error(
+                f"missing_key={tensor_key} for {key}: cache_path={cache_path}"
+            )
+        )
+    tensor = tensor.float()
+    if list(tensor.shape) != expected_shape:
+        raise RuntimeError(
+            _dabe_pu_error(
+                f"invalid shape for {key}: {tensor_key} {list(tensor.shape)} != "
+                f"{expected_shape} | cache_path={cache_path}"
+            )
+        )
+    min_value = float(tensor.min().item())
+    max_value = float(tensor.max().item())
+    if min_value < -1e-6 or max_value > 1.0 + 1e-6:
+        raise RuntimeError(
+            _dabe_pu_error(
+                f"{tensor_key} values out of [0,1] for {key}: "
+                f"min={min_value:.6f}, max={max_value:.6f} | cache_path={cache_path}"
+            )
+        )
+
+
+def check_dabe_pu_cache(cfg, max_samples=None):
+    manifest_path = dabe_pu_manifest_path(cfg)
+    if not manifest_path.exists():
+        raise RuntimeError(_dabe_pu_error(f"missing manifest: {manifest_path}"))
+
+    expected_items = build_image_items(cfg.DATA_ROOT, cfg.TRAIN_DATASETS, require_gt=False)
+    if max_samples is not None and int(max_samples) >= 0:
+        expected_items = expected_items[: int(max_samples)]
+    expected_keys = [(item["dataset"], item["stem"]) for item in expected_items]
+    expected_key_set = set(expected_keys)
+
+    rows = read_jsonl(manifest_path)
+    row_map = {}
+    for row in rows:
+        if "dataset" not in row or "stem" not in row:
+            raise RuntimeError(_dabe_pu_error(f"bad manifest row without dataset/stem in {manifest_path}"))
+        key = (row["dataset"], row["stem"])
+        if key in row_map:
+            raise RuntimeError(_dabe_pu_error(f"duplicate manifest key in {manifest_path}: {key}"))
+        row_map[key] = row
+
+    actual_key_set = set(row_map)
+    if max_samples is None or int(max_samples) < 0:
+        extra = sorted(actual_key_set - expected_key_set)
+        if extra:
+            raise RuntimeError(_dabe_pu_error(f"manifest has unexpected keys first 10: {extra[:10]}"))
+    missing = sorted(expected_key_set - actual_key_set)
+    if missing:
+        raise RuntimeError(_dabe_pu_error(f"missing manifest rows first 10: {missing[:10]}"))
+
+    expected_shape = [1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE)]
+    expected_shape_37 = [1, 37, 37]
+    expected_version = str(getattr(cfg, "DABE_PU_VERSION", "pu_v11")).lower()
+    use_oem = bool(getattr(cfg, "USE_DABE_OEM", False)) or str(
+        getattr(cfg, "P_INIT_MODE", "")
+    ) == "dabe_pu_v11_oem"
+    required_fields = [
+        "target_soft_68",
+        "weight_map_68",
+        "fg_core_pu_68",
+        "fg_core_fallback_68",
+        "bg_core_pu_68",
+        "extent_candidate_68",
+        "unknown_68",
+    ]
+    if use_oem:
+        required_fields.extend(
+            [
+                "fg_core_pu_37",
+                "fg_core_fallback_37",
+                "bg_core_pu_37",
+                "extent_candidate_37",
+                "unknown_37",
+            ]
+        )
+    for key in expected_keys:
+        row = row_map[key]
+        if row.get("backbone_key", cfg.BACKBONE_KEY) != cfg.BACKBONE_KEY:
+            raise RuntimeError(
+                _dabe_pu_error(
+                    f"backbone mismatch for {key}: {row.get('backbone_key')} != {cfg.BACKBONE_KEY}"
+                )
+            )
+        if str(row.get("dabe_version", expected_version)).lower() != expected_version:
+            raise RuntimeError(
+                _dabe_pu_error(
+                    f"version mismatch for {key}: {row.get('dabe_version')} != {expected_version}"
+                )
+            )
+        if row.get("shape_68") is not None and row.get("shape_68") != expected_shape:
+            raise RuntimeError(_dabe_pu_error(f"invalid shape_68 for {key}: {row.get('shape_68')} != {expected_shape}"))
+        cache_path = row.get("cache_path")
+        if not cache_path:
+            raise RuntimeError(_dabe_pu_error(f"missing cache_path for {key}"))
+        if not Path(cache_path).exists():
+            raise RuntimeError(_dabe_pu_error(f"missing cache file: {cache_path}"))
+        payload = torch_load(cache_path, map_location="cpu")
+        if not isinstance(payload, dict):
+            raise RuntimeError(_dabe_pu_error(f"payload must be dict for {key}: {cache_path}"))
+        if payload.get("dataset") != key[0] or payload.get("stem") != key[1]:
+            raise RuntimeError(_dabe_pu_error(f"payload key mismatch for {key}: {cache_path}"))
+        if payload.get("backbone_key") != cfg.BACKBONE_KEY:
+            raise RuntimeError(_dabe_pu_error(f"payload backbone mismatch for {key}: {cache_path}"))
+        if str(payload.get("dabe_version", "")).lower() != expected_version:
+            raise RuntimeError(_dabe_pu_error(f"payload version mismatch for {key}: {cache_path}"))
+        for tensor_key in required_fields:
+            shape = expected_shape_37 if tensor_key.endswith("_37") else expected_shape
+            _check_dabe_pu_tensor(payload, key, cache_path, tensor_key, shape)
+
+    return True, f"complete: {manifest_path} | rows_checked={len(expected_keys)} | version={expected_version}"
 
 
 def _despl_paper_error(reason):
