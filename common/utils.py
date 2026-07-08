@@ -325,6 +325,16 @@ def dabe_pu_manifest_path(cfg):
     return Path(root) / "manifest_train.jsonl"
 
 
+def tce_cover_manifest_path(cfg):
+    root = getattr(cfg, "TCE_COVER_CACHE_ROOT", "../datasets/cache/tce_cover_cache/dinov1-s8/long35_epoch030")
+    return Path(root) / "manifest_train.jsonl"
+
+
+def lceg_cover_manifest_path(cfg):
+    root = getattr(cfg, "LCEG_COVER_CACHE_ROOT", "../datasets/cache/lceg_cover_cache/dinov1-s8/long35_epoch025")
+    return Path(root) / "manifest_train.jsonl"
+
+
 def despl_paper_cache_dir(cfg, sign_mode=None):
     root = Path(cfg.DESPL_PAPER_CACHE_ROOT)
     backbone = getattr(cfg, "DESPL_PAPER_BACKBONE_KEY", cfg.BACKBONE_KEY)
@@ -1399,6 +1409,246 @@ def check_dabe_pu_cache(cfg, max_samples=None):
             _check_dabe_pu_tensor(payload, key, cache_path, tensor_key, shape)
 
     return True, f"complete: {manifest_path} | rows_checked={len(expected_keys)} | version={expected_version}"
+
+
+def _tce_cover_error(reason):
+    return (
+        f"TCE coverage cache missing or incomplete: {reason}\n"
+        "Please build it first with tools/build_tce_cover_cache.py; training will not auto-generate it."
+    )
+
+
+def _check_tce_cover_tensor(payload, key, cache_path, tensor_key, expected_shape):
+    tensor = payload.get(tensor_key)
+    if not torch.is_tensor(tensor):
+        raise RuntimeError(
+            _tce_cover_error(
+                f"missing_key={tensor_key} for {key}: cache_path={cache_path}"
+            )
+        )
+    tensor = tensor.float()
+    if list(tensor.shape) != expected_shape:
+        raise RuntimeError(
+            _tce_cover_error(
+                f"invalid shape for {key}: {tensor_key} {list(tensor.shape)} != "
+                f"{expected_shape} | cache_path={cache_path}"
+            )
+        )
+    min_value = float(tensor.min().item())
+    max_value = float(tensor.max().item())
+    if min_value < -1e-6 or max_value > 1.0 + 1e-6:
+        raise RuntimeError(
+            _tce_cover_error(
+                f"{tensor_key} values out of [0,1] for {key}: "
+                f"min={min_value:.6f}, max={max_value:.6f} | cache_path={cache_path}"
+            )
+        )
+
+
+def check_tce_cover_cache(cfg, max_samples=None):
+    manifest_path = tce_cover_manifest_path(cfg)
+    if not manifest_path.exists():
+        raise RuntimeError(_tce_cover_error(f"missing manifest: {manifest_path}"))
+
+    expected_items = build_image_items(cfg.DATA_ROOT, cfg.TRAIN_DATASETS, require_gt=False)
+    if max_samples is not None and int(max_samples) >= 0:
+        expected_items = expected_items[: int(max_samples)]
+    expected_keys = [(item["dataset"], item["stem"]) for item in expected_items]
+    expected_key_set = set(expected_keys)
+
+    rows = read_jsonl(manifest_path)
+    row_map = {}
+    for row in rows:
+        if "dataset" not in row or "stem" not in row:
+            raise RuntimeError(_tce_cover_error(f"bad manifest row without dataset/stem in {manifest_path}"))
+        key = (row["dataset"], row["stem"])
+        if key in row_map:
+            raise RuntimeError(_tce_cover_error(f"duplicate manifest key in {manifest_path}: {key}"))
+        row_map[key] = row
+
+    actual_key_set = set(row_map)
+    if max_samples is None or int(max_samples) < 0:
+        extra = sorted(actual_key_set - expected_key_set)
+        if extra:
+            raise RuntimeError(_tce_cover_error(f"manifest has unexpected keys first 10: {extra[:10]}"))
+    missing = sorted(expected_key_set - actual_key_set)
+    if missing:
+        raise RuntimeError(_tce_cover_error(f"missing manifest rows first 10: {missing[:10]}"))
+
+    expected_shape = [1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE)]
+    expected_epoch = int(getattr(cfg, "TCE_COVER_EPOCH", -1))
+    expected_model = str(getattr(cfg, "TCE_COVER_MODEL", "")).lower()
+    for key in expected_keys:
+        row = row_map[key]
+        if row.get("backbone_key", cfg.BACKBONE_KEY) != cfg.BACKBONE_KEY:
+            raise RuntimeError(
+                _tce_cover_error(
+                    f"backbone mismatch for {key}: {row.get('backbone_key')} != {cfg.BACKBONE_KEY}"
+                )
+            )
+        if row.get("shape_68") is not None and row.get("shape_68") != expected_shape:
+            raise RuntimeError(_tce_cover_error(f"invalid shape_68 for {key}: {row.get('shape_68')} != {expected_shape}"))
+        if expected_epoch >= 0 and int(row.get("source_epoch", expected_epoch)) != expected_epoch:
+            raise RuntimeError(
+                _tce_cover_error(
+                    f"source_epoch mismatch for {key}: {row.get('source_epoch')} != {expected_epoch}"
+                )
+            )
+        if expected_model and str(row.get("model_for_cache", expected_model)).lower() != expected_model:
+            raise RuntimeError(
+                _tce_cover_error(
+                    f"model_for_cache mismatch for {key}: {row.get('model_for_cache')} != {expected_model}"
+                )
+            )
+        cache_path = row.get("cache_path")
+        if not cache_path:
+            raise RuntimeError(_tce_cover_error(f"missing cache_path for {key}"))
+        if not Path(cache_path).exists():
+            raise RuntimeError(_tce_cover_error(f"missing cache file: {cache_path}"))
+        payload = torch_load(cache_path, map_location="cpu")
+        if not isinstance(payload, dict):
+            raise RuntimeError(_tce_cover_error(f"payload must be dict for {key}: {cache_path}"))
+        if payload.get("dataset") != key[0] or payload.get("stem") != key[1]:
+            raise RuntimeError(_tce_cover_error(f"payload key mismatch for {key}: {cache_path}"))
+        if payload.get("backbone_key") != cfg.BACKBONE_KEY:
+            raise RuntimeError(_tce_cover_error(f"payload backbone mismatch for {key}: {cache_path}"))
+        if expected_epoch >= 0 and int(payload.get("source_epoch", expected_epoch)) != expected_epoch:
+            raise RuntimeError(
+                _tce_cover_error(
+                    f"payload source_epoch mismatch for {key}: {payload.get('source_epoch')} != {expected_epoch}"
+                )
+            )
+        if expected_model and str(payload.get("model_for_cache", expected_model)).lower() != expected_model:
+            raise RuntimeError(
+                _tce_cover_error(
+                    f"payload model_for_cache mismatch for {key}: {payload.get('model_for_cache')} != {expected_model}"
+                )
+            )
+        for tensor_key in ("cover_prob_68", "cover_binary_68", "cover_conf_68"):
+            _check_tce_cover_tensor(payload, key, cache_path, tensor_key, expected_shape)
+
+    return True, f"complete: {manifest_path} | rows_checked={len(expected_keys)} | source_epoch={expected_epoch}"
+
+
+def _lceg_cover_error(reason):
+    return (
+        f"LCEG coverage cache missing or incomplete: {reason}\n"
+        "Please build it first with tools/build_lceg_cover_cache.py; training will not auto-generate it."
+    )
+
+
+def _check_lceg_cover_tensor(payload, key, cache_path, tensor_key, expected_shape):
+    tensor = payload.get(tensor_key)
+    if not torch.is_tensor(tensor):
+        raise RuntimeError(
+            _lceg_cover_error(
+                f"missing_key={tensor_key} for {key}: cache_path={cache_path}"
+            )
+        )
+    tensor = tensor.float()
+    if list(tensor.shape) != expected_shape:
+        raise RuntimeError(
+            _lceg_cover_error(
+                f"invalid shape for {key}: {tensor_key} {list(tensor.shape)} != "
+                f"{expected_shape} | cache_path={cache_path}"
+            )
+        )
+    min_value = float(tensor.min().item())
+    max_value = float(tensor.max().item())
+    if min_value < -1e-6 or max_value > 1.0 + 1e-6:
+        raise RuntimeError(
+            _lceg_cover_error(
+                f"{tensor_key} values out of [0,1] for {key}: "
+                f"min={min_value:.6f}, max={max_value:.6f} | cache_path={cache_path}"
+            )
+        )
+
+
+def check_lceg_cover_cache(cfg, max_samples=None):
+    manifest_path = lceg_cover_manifest_path(cfg)
+    if not manifest_path.exists():
+        raise RuntimeError(_lceg_cover_error(f"missing manifest: {manifest_path}"))
+
+    expected_items = build_image_items(cfg.DATA_ROOT, cfg.TRAIN_DATASETS, require_gt=False)
+    if max_samples is not None and int(max_samples) >= 0:
+        expected_items = expected_items[: int(max_samples)]
+    expected_keys = [(item["dataset"], item["stem"]) for item in expected_items]
+    expected_key_set = set(expected_keys)
+
+    rows = read_jsonl(manifest_path)
+    row_map = {}
+    for row in rows:
+        if "dataset" not in row or "stem" not in row:
+            raise RuntimeError(_lceg_cover_error(f"bad manifest row without dataset/stem in {manifest_path}"))
+        key = (row["dataset"], row["stem"])
+        if key in row_map:
+            raise RuntimeError(_lceg_cover_error(f"duplicate manifest key in {manifest_path}: {key}"))
+        row_map[key] = row
+
+    actual_key_set = set(row_map)
+    if max_samples is None or int(max_samples) < 0:
+        extra = sorted(actual_key_set - expected_key_set)
+        if extra:
+            raise RuntimeError(_lceg_cover_error(f"manifest has unexpected keys first 10: {extra[:10]}"))
+    missing = sorted(expected_key_set - actual_key_set)
+    if missing:
+        raise RuntimeError(_lceg_cover_error(f"missing manifest rows first 10: {missing[:10]}"))
+
+    expected_shape = [1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE)]
+    expected_epoch = int(getattr(cfg, "LCEG_COVER_EPOCH", -1))
+    expected_model = str(getattr(cfg, "LCEG_COVER_MODEL", "")).lower()
+    for key in expected_keys:
+        row = row_map[key]
+        if row.get("backbone_key", cfg.BACKBONE_KEY) != cfg.BACKBONE_KEY:
+            raise RuntimeError(
+                _lceg_cover_error(
+                    f"backbone mismatch for {key}: {row.get('backbone_key')} != {cfg.BACKBONE_KEY}"
+                )
+            )
+        if row.get("shape_68") is not None and row.get("shape_68") != expected_shape:
+            raise RuntimeError(
+                _lceg_cover_error(f"invalid shape_68 for {key}: {row.get('shape_68')} != {expected_shape}")
+            )
+        if expected_epoch >= 0 and int(row.get("source_epoch", expected_epoch)) != expected_epoch:
+            raise RuntimeError(
+                _lceg_cover_error(
+                    f"source_epoch mismatch for {key}: {row.get('source_epoch')} != {expected_epoch}"
+                )
+            )
+        if expected_model and str(row.get("model_for_cache", expected_model)).lower() != expected_model:
+            raise RuntimeError(
+                _lceg_cover_error(
+                    f"model_for_cache mismatch for {key}: {row.get('model_for_cache')} != {expected_model}"
+                )
+            )
+        cache_path = row.get("cache_path")
+        if not cache_path:
+            raise RuntimeError(_lceg_cover_error(f"missing cache_path for {key}"))
+        if not Path(cache_path).exists():
+            raise RuntimeError(_lceg_cover_error(f"missing cache file: {cache_path}"))
+        payload = torch_load(cache_path, map_location="cpu")
+        if not isinstance(payload, dict):
+            raise RuntimeError(_lceg_cover_error(f"payload must be dict for {key}: {cache_path}"))
+        if payload.get("dataset") != key[0] or payload.get("stem") != key[1]:
+            raise RuntimeError(_lceg_cover_error(f"payload key mismatch for {key}: {cache_path}"))
+        if payload.get("backbone_key") != cfg.BACKBONE_KEY:
+            raise RuntimeError(_lceg_cover_error(f"payload backbone mismatch for {key}: {cache_path}"))
+        if expected_epoch >= 0 and int(payload.get("source_epoch", expected_epoch)) != expected_epoch:
+            raise RuntimeError(
+                _lceg_cover_error(
+                    f"payload source_epoch mismatch for {key}: {payload.get('source_epoch')} != {expected_epoch}"
+                )
+            )
+        if expected_model and str(payload.get("model_for_cache", expected_model)).lower() != expected_model:
+            raise RuntimeError(
+                _lceg_cover_error(
+                    f"payload model_for_cache mismatch for {key}: {payload.get('model_for_cache')} != {expected_model}"
+                )
+            )
+        for tensor_key in ("cover_prob_68", "cover_binary_68", "cover_conf_68"):
+            _check_lceg_cover_tensor(payload, key, cache_path, tensor_key, expected_shape)
+
+    return True, f"complete: {manifest_path} | rows_checked={len(expected_keys)} | source_epoch={expected_epoch}"
 
 
 def _despl_paper_error(reason):

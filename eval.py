@@ -145,7 +145,7 @@ def main():
 
     cfg = load_config(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    out_dir = Path(cfg.WORK_ROOT) / cfg.EXP_NAME / "eval35"
+    out_dir = Path(cfg.WORK_ROOT) / cfg.EXP_NAME / "eval"
     ensure_dir(out_dir)
     write_yaml(out_dir / "config.yaml", config_to_dict(cfg))
 
@@ -165,7 +165,7 @@ def main():
     else:
         student.load_state_dict(student_state)
 
-    with Logger(out_dir / "eval.log") as logger:
+    with Logger(out_dir / "eval45.log") as logger:
         logger.log(f"device = {device}")
         logger.log(f"ckpt = {args.ckpt}")
         logger.log("model_for_eval = student")

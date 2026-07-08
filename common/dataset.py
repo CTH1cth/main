@@ -18,10 +18,12 @@ from common.utils import (
     despl_pseudo_bank_manifest_path,
     drepp_manifest_path,
     hflip_feature_cache_manifest_path,
+    lceg_cover_manifest_path,
     manifest_to_map,
     ml_feature_cache_manifest_path,
     qra_manifest_path,
     read_jsonl,
+    tce_cover_manifest_path,
     torch_load,
 )
 
@@ -586,6 +588,124 @@ def _load_dabe_pu_v11(row, expected_dataset, expected_stem, cfg):
     }
 
 
+def _load_tce_cover(row, expected_dataset, expected_stem, cfg):
+    payload = torch_load(row["cache_path"], map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(f"TCE cover payload must be a dict: {row['cache_path']}")
+    if payload.get("dataset") != expected_dataset:
+        raise RuntimeError(
+            f"TCE cover dataset mismatch for {row['cache_path']}: "
+            f"{payload.get('dataset')} != {expected_dataset}"
+        )
+    if payload.get("stem") != expected_stem:
+        raise RuntimeError(
+            f"TCE cover stem mismatch for {row['cache_path']}: "
+            f"{payload.get('stem')} != {expected_stem}"
+        )
+    if payload.get("backbone_key") != cfg.BACKBONE_KEY:
+        raise RuntimeError(
+            f"TCE cover backbone mismatch for {row['cache_path']}: "
+            f"{payload.get('backbone_key')} != {cfg.BACKBONE_KEY}"
+        )
+    expected_epoch = int(getattr(cfg, "TCE_COVER_EPOCH", -1))
+    if expected_epoch >= 0 and int(payload.get("source_epoch", expected_epoch)) != expected_epoch:
+        raise RuntimeError(
+            f"TCE cover source_epoch mismatch for {row['cache_path']}: "
+            f"{payload.get('source_epoch')} != {expected_epoch}"
+        )
+    expected_model = str(getattr(cfg, "TCE_COVER_MODEL", "")).lower()
+    if expected_model and str(payload.get("model_for_cache", expected_model)).lower() != expected_model:
+        raise RuntimeError(
+            f"TCE cover model_for_cache mismatch for {row['cache_path']}: "
+            f"{payload.get('model_for_cache')} != {expected_model}"
+        )
+
+    expected_shape = [1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE)]
+    out = {}
+    for field in ("cover_prob_68", "cover_binary_68", "cover_conf_68"):
+        tensor = payload.get(field)
+        if not torch.is_tensor(tensor):
+            raise RuntimeError(
+                "TCE cover payload missing required field | "
+                f"dataset={expected_dataset} | stem={expected_stem} | "
+                f"cache_path={row['cache_path']} | missing_key={field}"
+            )
+        tensor = tensor.float()
+        if list(tensor.shape) != expected_shape:
+            raise RuntimeError(
+                "TCE cover tensor shape mismatch | "
+                f"dataset={expected_dataset} | stem={expected_stem} | "
+                f"cache_path={row['cache_path']} | {field} {list(tensor.shape)} != {expected_shape}"
+            )
+        _validate_unit_range(tensor, field, row["cache_path"])
+        out[field] = tensor
+    return {
+        "tce_cover_prob_68": out["cover_prob_68"],
+        "tce_cover_binary_68": out["cover_binary_68"],
+        "tce_cover_conf_68": out["cover_conf_68"],
+        "tce_cover_area": float(payload.get("cover_area", out["cover_binary_68"].mean().item())),
+    }
+
+
+def _load_lceg_cover(row, expected_dataset, expected_stem, cfg):
+    payload = torch_load(row["cache_path"], map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(f"LCEG cover payload must be a dict: {row['cache_path']}")
+    if payload.get("dataset") != expected_dataset:
+        raise RuntimeError(
+            f"LCEG cover dataset mismatch for {row['cache_path']}: "
+            f"{payload.get('dataset')} != {expected_dataset}"
+        )
+    if payload.get("stem") != expected_stem:
+        raise RuntimeError(
+            f"LCEG cover stem mismatch for {row['cache_path']}: "
+            f"{payload.get('stem')} != {expected_stem}"
+        )
+    if payload.get("backbone_key") != cfg.BACKBONE_KEY:
+        raise RuntimeError(
+            f"LCEG cover backbone mismatch for {row['cache_path']}: "
+            f"{payload.get('backbone_key')} != {cfg.BACKBONE_KEY}"
+        )
+    expected_epoch = int(getattr(cfg, "LCEG_COVER_EPOCH", -1))
+    if expected_epoch >= 0 and int(payload.get("source_epoch", expected_epoch)) != expected_epoch:
+        raise RuntimeError(
+            f"LCEG cover source_epoch mismatch for {row['cache_path']}: "
+            f"{payload.get('source_epoch')} != {expected_epoch}"
+        )
+    expected_model = str(getattr(cfg, "LCEG_COVER_MODEL", "")).lower()
+    if expected_model and str(payload.get("model_for_cache", expected_model)).lower() != expected_model:
+        raise RuntimeError(
+            f"LCEG cover model_for_cache mismatch for {row['cache_path']}: "
+            f"{payload.get('model_for_cache')} != {expected_model}"
+        )
+
+    expected_shape = [1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE)]
+    out = {}
+    for field in ("cover_prob_68", "cover_binary_68", "cover_conf_68"):
+        tensor = payload.get(field)
+        if not torch.is_tensor(tensor):
+            raise RuntimeError(
+                "LCEG cover payload missing required field | "
+                f"dataset={expected_dataset} | stem={expected_stem} | "
+                f"cache_path={row['cache_path']} | missing_key={field}"
+            )
+        tensor = tensor.float()
+        if list(tensor.shape) != expected_shape:
+            raise RuntimeError(
+                "LCEG cover tensor shape mismatch | "
+                f"dataset={expected_dataset} | stem={expected_stem} | "
+                f"cache_path={row['cache_path']} | {field} {list(tensor.shape)} != {expected_shape}"
+            )
+        _validate_unit_range(tensor, field, row["cache_path"])
+        out[field] = tensor
+    return {
+        "lceg_cover_prob_68": out["cover_prob_68"],
+        "lceg_cover_binary_68": out["cover_binary_68"],
+        "lceg_cover_conf_68": out["cover_conf_68"],
+        "lceg_cover_area": float(payload.get("cover_area", out["cover_binary_68"].mean().item())),
+    }
+
+
 def _load_despl_paper(row, expected_dataset, expected_stem, cfg):
     payload = torch_load(row["cache_path"], map_location="cpu")
     if not isinstance(payload, dict):
@@ -803,6 +923,8 @@ class CachedTrainDataset(Dataset):
         self.use_drepp = bool(getattr(cfg, "USE_DREPP", False))
         self.use_dabe_pseudo = bool(getattr(cfg, "USE_DABE_PSEUDO", False))
         self.use_dabe_pu = bool(getattr(cfg, "USE_DABE_PU", False))
+        self.use_tce = bool(getattr(cfg, "USE_TCE", False))
+        self.use_lceg = bool(getattr(cfg, "USE_LCEG", False))
         self.use_despl_pseudo = bool(getattr(cfg, "USE_DESPL_PSEUDO", False))
         self.p_init_mode = str(getattr(cfg, "P_INIT_MODE", ""))
         self.use_dabe_oem = self.use_dabe_pu and (
@@ -952,6 +1074,12 @@ class CachedTrainDataset(Dataset):
         self.dabe_pu_map = None
         self.dabe_pu_cache_root = None
         self.dabe_pu_first_cache_path = None
+        self.tce_cover_map = None
+        self.tce_cover_cache_root = None
+        self.tce_cover_first_cache_path = None
+        self.lceg_cover_map = None
+        self.lceg_cover_cache_root = None
+        self.lceg_cover_first_cache_path = None
         self.drepp_map = None
         self.drepp_cache_root = None
         self.drepp_first_cache_path = None
@@ -1088,6 +1216,28 @@ class CachedTrainDataset(Dataset):
             self.dabe_pu_cache_root = str(dabe_pu_manifest.parent.resolve())
             self.actual_pseudo_cache_root = self.dabe_pu_cache_root
             self.actual_pseudo_cache_pattern = f"{self.dabe_pu_cache_root}/<dataset>/<stem>.pt"
+        if self.use_tce:
+            tce_manifest = tce_cover_manifest_path(cfg)
+            tce_rows = read_jsonl(tce_manifest)
+            self.tce_cover_map = manifest_to_map(tce_rows, tce_manifest)
+            if max_samples < 0:
+                check_exact_keys("TCE cover cache", self.tce_cover_map.keys(), self.keys)
+            else:
+                missing_tce = sorted(set(self.keys) - set(self.tce_cover_map))
+                if missing_tce:
+                    raise RuntimeError(f"TCE cover cache missing first 10: {missing_tce[:10]}")
+            self.tce_cover_cache_root = str(tce_manifest.parent.resolve())
+        if self.use_lceg:
+            lceg_manifest = lceg_cover_manifest_path(cfg)
+            lceg_rows = read_jsonl(lceg_manifest)
+            self.lceg_cover_map = manifest_to_map(lceg_rows, lceg_manifest)
+            if max_samples < 0:
+                check_exact_keys("LCEG cover cache", self.lceg_cover_map.keys(), self.keys)
+            else:
+                missing_lceg = sorted(set(self.keys) - set(self.lceg_cover_map))
+                if missing_lceg:
+                    raise RuntimeError(f"LCEG cover cache missing first 10: {missing_lceg[:10]}")
+            self.lceg_cover_cache_root = str(lceg_manifest.parent.resolve())
 
         first_dataset, first_stem = self.keys[0]
         if self.use_multi_level_feature:
@@ -1226,6 +1376,22 @@ class CachedTrainDataset(Dataset):
             )
             self.dabe_pu_first_cache_path = self.dabe_pu_map[(first_dataset, first_stem)]["cache_path"]
             self.first_pseudo_cache_path = self.dabe_pu_first_cache_path
+        if self.use_tce:
+            _load_tce_cover(
+                self.tce_cover_map[(first_dataset, first_stem)],
+                first_dataset,
+                first_stem,
+                cfg,
+            )
+            self.tce_cover_first_cache_path = self.tce_cover_map[(first_dataset, first_stem)]["cache_path"]
+        if self.use_lceg:
+            _load_lceg_cover(
+                self.lceg_cover_map[(first_dataset, first_stem)],
+                first_dataset,
+                first_stem,
+                cfg,
+            )
+            self.lceg_cover_first_cache_path = self.lceg_cover_map[(first_dataset, first_stem)]["cache_path"]
         if self.use_hflip_view:
             hflip_feature, _ = _load_feature(
                 self.hflip_feature_map[(first_dataset, first_stem)],
@@ -1481,6 +1647,10 @@ class CachedTrainDataset(Dataset):
             pseudo_safe = pseudo
             p_init_area = float(dabe_pu_payload["pu_target_area"])
             use_fixed_in_pseudo = False
+        if self.use_tce:
+            tce_cover_payload = _load_tce_cover(self.tce_cover_map[key], dataset, stem, self.cfg)
+        if self.use_lceg:
+            lceg_cover_payload = _load_lceg_cover(self.lceg_cover_map[key], dataset, stem, self.cfg)
 
         sample = {
             "feature": feature,
@@ -1608,6 +1778,24 @@ class CachedTrainDataset(Dataset):
                     "pu_unknown_area": float(dabe_pu_payload["pu_unknown_area"]),
                     "use_fixed_in_pseudo": False,
                     "fixed_used_for_training": False,
+                }
+            )
+        if self.use_tce:
+            sample.update(
+                {
+                    "tce_cover_prob_68": tce_cover_payload["tce_cover_prob_68"].float(),
+                    "tce_cover_binary_68": tce_cover_payload["tce_cover_binary_68"].float(),
+                    "tce_cover_conf_68": tce_cover_payload["tce_cover_conf_68"].float(),
+                    "tce_cover_area": float(tce_cover_payload["tce_cover_area"]),
+                }
+            )
+        if self.use_lceg:
+            sample.update(
+                {
+                    "lceg_cover_prob_68": lceg_cover_payload["lceg_cover_prob_68"].float(),
+                    "lceg_cover_binary_68": lceg_cover_payload["lceg_cover_binary_68"].float(),
+                    "lceg_cover_conf_68": lceg_cover_payload["lceg_cover_conf_68"].float(),
+                    "lceg_cover_area": float(lceg_cover_payload["lceg_cover_area"]),
                 }
             )
         if self.use_drepp:

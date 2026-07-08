@@ -313,6 +313,17 @@ class DAGPSafeHead(nn.Module):
         ndr_use_uncertainty_gate=True,
         ndr_use_edge_gate=True,
         ndr_gate_mode="uncertainty_edge_boost",
+        use_ndr_v2=False,
+        ndr_version="v1",
+        ndr_v2_use_shape_gate=False,
+        ndr_v2_shape_gate_mode="soft_boundary_edge_boost",
+        ndr_v2_boundary_source="coarse_prob",
+        ndr_v2_boundary_radius=2,
+        ndr_v2_boundary_detach=True,
+        ndr_v2_shape_alpha_max=0.20,
+        ndr_v2_shape_edge_mix=0.50,
+        ndr_v2_shape_uncert_mix=0.50,
+        ndr_v2_gate_combine="add_clamp",
         use_tadr_router=False,
         tadr_router_in_channels=4,
         tadr_router_hidden=16,
@@ -378,6 +389,17 @@ class DAGPSafeHead(nn.Module):
         self.ndr_use_uncertainty_gate = bool(ndr_use_uncertainty_gate)
         self.ndr_use_edge_gate = bool(ndr_use_edge_gate)
         self.ndr_gate_mode = str(ndr_gate_mode)
+        self.use_ndr_v2 = bool(use_ndr_v2)
+        self.ndr_version = str(ndr_version)
+        self.ndr_v2_use_shape_gate = bool(ndr_v2_use_shape_gate)
+        self.ndr_v2_shape_gate_mode = str(ndr_v2_shape_gate_mode)
+        self.ndr_v2_boundary_source = str(ndr_v2_boundary_source)
+        self.ndr_v2_boundary_radius = int(ndr_v2_boundary_radius)
+        self.ndr_v2_boundary_detach = bool(ndr_v2_boundary_detach)
+        self.ndr_v2_shape_alpha_max = float(ndr_v2_shape_alpha_max)
+        self.ndr_v2_shape_edge_mix = float(ndr_v2_shape_edge_mix)
+        self.ndr_v2_shape_uncert_mix = float(ndr_v2_shape_uncert_mix)
+        self.ndr_v2_gate_combine = str(ndr_v2_gate_combine)
         self.use_tadr_router = bool(use_tadr_router)
         self.tadr_router_in_channels = int(tadr_router_in_channels)
         self.tadr_use_coarse_prob = bool(tadr_use_coarse_prob)
@@ -423,6 +445,23 @@ class DAGPSafeHead(nn.Module):
             )
         else:
             self.proto_proj_head = None
+        if self.use_ndr_v2 and not self.use_ndr_branch:
+            raise ValueError("USE_NDR_V2=True requires USE_NDR_BRANCH=True.")
+        if self.use_ndr_v2:
+            if self.ndr_v2_shape_gate_mode != "soft_boundary_edge_boost":
+                raise ValueError(f"Unsupported NDR_V2_SHAPE_GATE_MODE: {self.ndr_v2_shape_gate_mode}")
+            if self.ndr_v2_boundary_source != "coarse_prob":
+                raise ValueError(f"Unsupported NDR_V2_BOUNDARY_SOURCE: {self.ndr_v2_boundary_source}")
+            if self.ndr_v2_boundary_radius < 0:
+                raise ValueError(f"NDR_V2_BOUNDARY_RADIUS must be non-negative, got {self.ndr_v2_boundary_radius}")
+            if self.ndr_v2_shape_alpha_max < 0.0:
+                raise ValueError(f"NDR_V2_SHAPE_ALPHA_MAX must be non-negative, got {self.ndr_v2_shape_alpha_max}")
+            if not 0.0 <= self.ndr_v2_shape_edge_mix <= 1.0:
+                raise ValueError(f"NDR_V2_SHAPE_EDGE_MIX must be in [0, 1], got {self.ndr_v2_shape_edge_mix}")
+            if not 0.0 <= self.ndr_v2_shape_uncert_mix <= 1.0:
+                raise ValueError(f"NDR_V2_SHAPE_UNCERT_MIX must be in [0, 1], got {self.ndr_v2_shape_uncert_mix}")
+            if self.ndr_v2_gate_combine != "add_clamp":
+                raise ValueError(f"Unsupported NDR_V2_GATE_COMBINE: {self.ndr_v2_gate_combine}")
         if self.use_ndr_branch:
             if self.ndr_loss_size <= 0:
                 raise ValueError(f"LOSS_SIZE for NDR must be positive, got {self.ndr_loss_size}")
@@ -506,6 +545,11 @@ class DAGPSafeHead(nn.Module):
 
     def _ndr_beta_eff(self):
         return self.ndr_beta_max * self._ndr_ramp_scale()
+
+    def _ndr_v2_shape_alpha_eff(self):
+        if not self.use_ndr_v2 or not self.ndr_v2_use_shape_gate:
+            return 0.0
+        return self.ndr_v2_shape_alpha_max * self._ndr_ramp_scale()
 
     @staticmethod
     def _gather_neighbors(v, idx):
@@ -634,6 +678,60 @@ class DAGPSafeHead(nn.Module):
         tensor_detached = tensor.detach()
         return tensor_detached.mean(), tensor_detached.min(), tensor_detached.max()
 
+    @staticmethod
+    def _normalize_map_per_image(tensor, eps=1e-6):
+        flat = tensor.detach().flatten(1)
+        min_val = flat.min(dim=1).values.view(-1, 1, 1, 1)
+        max_val = flat.max(dim=1).values.view(-1, 1, 1, 1)
+        return torch.clamp((tensor.detach() - min_val) / (max_val - min_val + float(eps)), 0.0, 1.0)
+
+    @staticmethod
+    def _soft_morph_boundary(prob, radius=2):
+        radius = int(radius)
+        if radius <= 0:
+            return torch.zeros_like(prob)
+        kernel_size = 2 * radius + 1
+        dilated = F.max_pool2d(prob, kernel_size=kernel_size, stride=1, padding=radius)
+        eroded = -F.max_pool2d(-prob, kernel_size=kernel_size, stride=1, padding=radius)
+        return torch.clamp(dilated - eroded, 0.0, 1.0)
+
+    def _apply_ndr_v2_shape_gate(self, detail_gate_v1, coarse_prob_68, sobel_68, uncertainty_68):
+        if not self.use_ndr_v2 or not self.ndr_v2_use_shape_gate:
+            empty = torch.zeros_like(detail_gate_v1)
+            zero = detail_gate_v1.new_tensor(0.0)
+            return detail_gate_v1, {
+                "detail_gate_v1": detail_gate_v1,
+                "detail_gate_v2": detail_gate_v1,
+                "boundary_band_68": empty,
+                "edge_norm_68": empty,
+                "shape_boost_68": empty,
+                "ndr_v2_shape_alpha_eff": zero,
+            }
+        boundary_source = coarse_prob_68.detach() if self.ndr_v2_boundary_detach else coarse_prob_68
+        boundary_band = self._soft_morph_boundary(boundary_source, self.ndr_v2_boundary_radius)
+        edge_norm = self._normalize_map_per_image(sobel_68)
+        uncertainty_shape = uncertainty_68.detach()
+        edge_factor = (1.0 - self.ndr_v2_shape_edge_mix) + self.ndr_v2_shape_edge_mix * edge_norm
+        uncertainty_factor = (
+            (1.0 - self.ndr_v2_shape_uncert_mix)
+            + self.ndr_v2_shape_uncert_mix * uncertainty_shape
+        )
+        shape_boost = torch.clamp(boundary_band * edge_factor * uncertainty_factor, 0.0, 1.0)
+        shape_alpha_eff = float(self._ndr_v2_shape_alpha_eff())
+        detail_gate_v2 = torch.clamp(
+            detail_gate_v1 + detail_gate_v1.new_tensor(shape_alpha_eff) * shape_boost,
+            0.0,
+            1.0,
+        )
+        return detail_gate_v2, {
+            "detail_gate_v1": detail_gate_v1,
+            "detail_gate_v2": detail_gate_v2,
+            "boundary_band_68": boundary_band,
+            "edge_norm_68": edge_norm,
+            "shape_boost_68": shape_boost,
+            "ndr_v2_shape_alpha_eff": detail_gate_v1.new_tensor(shape_alpha_eff),
+        }
+
     def _build_tadr_router_input(self, coarse_prob_68, uncertainty_68, sobel_68, coarse_boundary_68):
         inputs = []
         if self.tadr_use_coarse_prob:
@@ -715,7 +813,15 @@ class DAGPSafeHead(nn.Module):
             router_map_68 = torch.clamp(router_map_68, self.tadr_router_min, self.tadr_router_max)
             detail_gate = torch.clamp(base_gate * router_map_68, 0.0, 1.0)
         beta_eff = self._ndr_beta_eff()
-        logits = coarse_logits_68 + coarse_logits_68.new_tensor(float(beta_eff)) * detail_gate * residual_logits_68
+        detail_gate_v1 = detail_gate
+        detail_gate, ndr_v2_aux = self._apply_ndr_v2_shape_gate(
+            detail_gate_v1,
+            coarse_prob_68,
+            sobel_68,
+            uncertainty_68,
+        )
+        ndr_delta_logits_68 = coarse_logits_68.new_tensor(float(beta_eff)) * detail_gate * residual_logits_68
+        logits = coarse_logits_68 + ndr_delta_logits_68
 
         if not return_aux:
             return logits
@@ -738,6 +844,7 @@ class DAGPSafeHead(nn.Module):
                 "coarse_prob_68": coarse_prob_68,
                 "uncertainty_68": uncertainty_68,
                 "residual_logits_68": residual_logits_68,
+                "ndr_delta_logits_68": ndr_delta_logits_68,
                 "base_gate": base_gate,
                 "detail_gate": detail_gate,
                 "sobel_68": sobel_68,
@@ -749,6 +856,38 @@ class DAGPSafeHead(nn.Module):
                 "ndr_residual_abs_max": residual_abs.max(),
             }
         )
+        if self.use_ndr_v2:
+            output.update(ndr_v2_aux)
+            gate_v1_mean, gate_v1_min, gate_v1_max = self._tensor_stats(ndr_v2_aux["detail_gate_v1"])
+            gate_v2_mean, gate_v2_min, gate_v2_max = self._tensor_stats(ndr_v2_aux["detail_gate_v2"])
+            boundary_mean, boundary_min, boundary_max = self._tensor_stats(ndr_v2_aux["boundary_band_68"])
+            edge_norm_mean, edge_norm_min, edge_norm_max = self._tensor_stats(ndr_v2_aux["edge_norm_68"])
+            shape_boost_mean, shape_boost_min, shape_boost_max = self._tensor_stats(ndr_v2_aux["shape_boost_68"])
+            output.update(
+                {
+                    "boundary_band": ndr_v2_aux["boundary_band_68"],
+                    "edge_norm": ndr_v2_aux["edge_norm_68"],
+                    "shape_boost": ndr_v2_aux["shape_boost_68"],
+                    "ndr_v2_detail_gate_v1_mean": gate_v1_mean,
+                    "ndr_v2_detail_gate_v1_min": gate_v1_min,
+                    "ndr_v2_detail_gate_v1_max": gate_v1_max,
+                    "ndr_v2_detail_gate_v2_mean": gate_v2_mean,
+                    "ndr_v2_detail_gate_v2_min": gate_v2_min,
+                    "ndr_v2_detail_gate_v2_max": gate_v2_max,
+                    "ndr_v2_boundary_mean": boundary_mean,
+                    "ndr_v2_boundary_min": boundary_min,
+                    "ndr_v2_boundary_max": boundary_max,
+                    "ndr_v2_edge_norm_mean": edge_norm_mean,
+                    "ndr_v2_edge_norm_min": edge_norm_min,
+                    "ndr_v2_edge_norm_max": edge_norm_max,
+                    "ndr_v2_uncertainty_mean": uncertainty_68.detach().mean(),
+                    "ndr_v2_uncertainty_min": uncertainty_68.detach().min(),
+                    "ndr_v2_uncertainty_max": uncertainty_68.detach().max(),
+                    "ndr_v2_shape_boost_mean": shape_boost_mean,
+                    "ndr_v2_shape_boost_min": shape_boost_min,
+                    "ndr_v2_shape_boost_max": shape_boost_max,
+                }
+            )
         if self.use_tadr_router:
             router_mean, router_min, router_max = self._tensor_stats(router_map_68)
             base_gate_mean, base_gate_min, base_gate_max = self._tensor_stats(base_gate)
@@ -1397,6 +1536,17 @@ def build_seg_head(in_channels, cfg):
             ndr_use_uncertainty_gate=bool(getattr(cfg, "NDR_USE_UNCERTAINTY_GATE", True)),
             ndr_use_edge_gate=bool(getattr(cfg, "NDR_USE_EDGE_GATE", True)),
             ndr_gate_mode=str(getattr(cfg, "NDR_GATE_MODE", "uncertainty_edge_boost")),
+            use_ndr_v2=bool(getattr(cfg, "USE_NDR_V2", False)),
+            ndr_version=str(getattr(cfg, "NDR_VERSION", "v1")),
+            ndr_v2_use_shape_gate=bool(getattr(cfg, "NDR_V2_USE_SHAPE_GATE", False)),
+            ndr_v2_shape_gate_mode=str(getattr(cfg, "NDR_V2_SHAPE_GATE_MODE", "soft_boundary_edge_boost")),
+            ndr_v2_boundary_source=str(getattr(cfg, "NDR_V2_BOUNDARY_SOURCE", "coarse_prob")),
+            ndr_v2_boundary_radius=int(getattr(cfg, "NDR_V2_BOUNDARY_RADIUS", 2)),
+            ndr_v2_boundary_detach=bool(getattr(cfg, "NDR_V2_BOUNDARY_DETACH", True)),
+            ndr_v2_shape_alpha_max=float(getattr(cfg, "NDR_V2_SHAPE_ALPHA_MAX", 0.20)),
+            ndr_v2_shape_edge_mix=float(getattr(cfg, "NDR_V2_SHAPE_EDGE_MIX", 0.50)),
+            ndr_v2_shape_uncert_mix=float(getattr(cfg, "NDR_V2_SHAPE_UNCERT_MIX", 0.50)),
+            ndr_v2_gate_combine=str(getattr(cfg, "NDR_V2_GATE_COMBINE", "add_clamp")),
             use_tadr_router=bool(getattr(cfg, "USE_TADR_ROUTER", False)),
             tadr_router_in_channels=int(getattr(cfg, "TADR_ROUTER_IN_CHANNELS", 4)),
             tadr_router_hidden=int(getattr(cfg, "TADR_ROUTER_HIDDEN", 16)),

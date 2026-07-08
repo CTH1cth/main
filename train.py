@@ -33,6 +33,8 @@ from common.utils import (
     check_hflip_feature_cache,
     check_ml_feature_cache,
     check_qra_cache,
+    check_tce_cover_cache,
+    check_lceg_cover_cache,
     config_to_dict,
     current_lr,
     ensure_dir,
@@ -96,6 +98,52 @@ def _linear_schedule_value(epoch, start_epoch, end_epoch, start_value, end_value
     progress = float(int(epoch) - start_epoch) / float(end_epoch - start_epoch)
     progress = max(0.0, min(1.0, progress))
     return start_value + (end_value - start_value) * progress
+
+
+def get_linear_scale(epoch, start, ramp_end, stop):
+    epoch = int(epoch)
+    start = int(start)
+    ramp_end = int(ramp_end)
+    stop = int(stop)
+    if epoch < start or epoch >= stop:
+        return 0.0
+    if epoch <= ramp_end:
+        denom = max(1, ramp_end - start + 1)
+        return float(epoch - start + 1) / float(denom)
+    return 1.0
+
+
+def get_ndr_v2_shape_lb_scale(cfg, epoch):
+    if not bool(getattr(cfg, "NDR_V2_USE_SHAPE_LOWER_BOUND", False)):
+        return 0.0
+    return get_linear_scale(
+        epoch,
+        int(getattr(cfg, "NDR_V2_SHAPE_LB_START_EPOCH", 36)),
+        int(getattr(cfg, "NDR_V2_SHAPE_LB_RAMP_END_EPOCH", 38)),
+        int(getattr(cfg, "NDR_V2_SHAPE_LB_STOP_EPOCH", 46)),
+    )
+
+
+def get_ndr_v2_bg_res_lock_scale(cfg, epoch):
+    if not bool(getattr(cfg, "NDR_V2_USE_BG_RES_LOCK", False)):
+        return 0.0
+    return get_linear_scale(
+        epoch,
+        int(getattr(cfg, "NDR_V2_BG_RES_LOCK_START_EPOCH", 1)),
+        int(getattr(cfg, "NDR_V2_BG_RES_LOCK_RAMP_END_EPOCH", 1)),
+        int(getattr(cfg, "NDR_V2_BG_RES_LOCK_STOP_EPOCH", int(getattr(cfg, "MAX_EPOCH", 25)) + 1)),
+    )
+
+
+def get_ndr_v2_bg_prob_lock_scale(cfg, epoch):
+    if not bool(getattr(cfg, "NDR_V2_USE_BG_PROB_LOCK", False)):
+        return 0.0
+    return get_linear_scale(
+        epoch,
+        int(getattr(cfg, "NDR_V2_BG_PROB_LOCK_START_EPOCH", 36)),
+        int(getattr(cfg, "NDR_V2_BG_PROB_LOCK_RAMP_END_EPOCH", 38)),
+        int(getattr(cfg, "NDR_V2_BG_PROB_LOCK_STOP_EPOCH", 46)),
+    )
 
 
 def get_dabe_pu_schedule(epoch, cfg):
@@ -265,6 +313,36 @@ def get_esa_asym_scale(cfg, epoch):
     start = int(getattr(cfg, "ESA_ASYM_START_EPOCH", 7))
     ramp_end = int(getattr(cfg, "ESA_ASYM_RAMP_END_EPOCH", 15))
     stop = int(getattr(cfg, "ESA_ASYM_STOP_EPOCH", 21))
+    epoch = int(epoch)
+    if epoch < start or epoch >= stop:
+        return 0.0
+    if epoch <= ramp_end:
+        denom = max(1, ramp_end - start + 1)
+        return float(epoch - start + 1) / float(denom)
+    return 1.0
+
+
+def get_tce_scale(cfg, epoch):
+    if not bool(getattr(cfg, "USE_TCE", False)):
+        return 0.0
+    start = int(getattr(cfg, "TCE_START_EPOCH", 31))
+    ramp_end = int(getattr(cfg, "TCE_RAMP_END_EPOCH", 32))
+    stop = int(getattr(cfg, "TCE_STOP_EPOCH", 36))
+    epoch = int(epoch)
+    if epoch < start or epoch >= stop:
+        return 0.0
+    if epoch <= ramp_end:
+        denom = max(1, ramp_end - start + 1)
+        return float(epoch - start + 1) / float(denom)
+    return 1.0
+
+
+def get_lceg_scale(cfg, epoch):
+    if not bool(getattr(cfg, "USE_LCEG", False)):
+        return 0.0
+    start = int(getattr(cfg, "LCEG_START_EPOCH", 26))
+    ramp_end = int(getattr(cfg, "LCEG_RAMP_END_EPOCH", 28))
+    stop = int(getattr(cfg, "LCEG_STOP_EPOCH", 36))
     epoch = int(epoch)
     if epoch < start or epoch >= stop:
         return 0.0
@@ -637,6 +715,10 @@ def use_raw_feature_head(cfg):
 
 def use_ndr_branch(cfg):
     return bool(getattr(cfg, "USE_NDR_BRANCH", False))
+
+
+def use_ndr_v2(cfg):
+    return bool(getattr(cfg, "USE_NDR_V2", False))
 
 
 def use_tadr_router(cfg):
@@ -1330,6 +1412,53 @@ def weighted_bce_with_logits(logits, target, weight_map, eps=1e-6):
     return loss.sum() / (weight_map.sum() + float(eps))
 
 
+def build_ndr_v2_bg_lock_mask(batch, cfg, target_shape, device):
+    bg_core = batch["pu_bg_core"].to(device, non_blocking=True).float()
+    target_soft = batch["pu_target_soft"].to(device, non_blocking=True).float()
+    weight_map = batch["pu_weight_map"].to(device, non_blocking=True).float()
+    if bg_core.shape[-2:] != target_shape:
+        bg_core = F.interpolate(bg_core, size=target_shape, mode="nearest")
+    if target_soft.shape[-2:] != target_shape:
+        target_soft = F.interpolate(target_soft, size=target_shape, mode="bilinear", align_corners=False)
+    if weight_map.shape[-2:] != target_shape:
+        weight_map = F.interpolate(weight_map, size=target_shape, mode="bilinear", align_corners=False)
+
+    use_bg_core = bool(getattr(cfg, "NDR_V2_BG_LOCK_USE_BG_CORE", True))
+    use_low_target = bool(
+        getattr(
+            cfg,
+            "NDR_V2_BG_LOCK_USE_LOW_TARGET_BG",
+            getattr(cfg, "NDR_V2_BG_LOCK_USE_LOW_TARGET", True),
+        )
+    )
+    bg_core_mask = (
+        bg_core > float(getattr(cfg, "NDR_V2_BG_CORE_THRESH", 0.5))
+        if use_bg_core
+        else torch.zeros_like(bg_core, dtype=torch.bool)
+    )
+    low_target_thresh = float(
+        getattr(cfg, "NDR_V2_LOW_TARGET_THRESH", getattr(cfg, "NDR_V2_BG_LOCK_TARGET_THRESH", 0.15))
+    )
+    low_target_weight_thresh = float(
+        getattr(cfg, "NDR_V2_LOW_TARGET_WEIGHT_THRESH", getattr(cfg, "NDR_V2_BG_LOCK_WEIGHT_THRESH", 0.50))
+    )
+    low_target_bg = (
+        (target_soft < low_target_thresh)
+        & (weight_map > low_target_weight_thresh)
+        if use_low_target
+        else torch.zeros_like(bg_core_mask)
+    )
+    bg_lock = bg_core_mask | low_target_bg
+    if bool(getattr(cfg, "NDR_V2_BG_LOCK_DETACH_MASK", True)):
+        bg_lock = bg_lock.detach()
+    stats = {
+        "bg_lock_area": float(bg_lock.float().detach().mean().item()),
+        "bg_core_area": float(bg_core_mask.float().detach().mean().item()),
+        "low_target_bg_area": float(low_target_bg.float().detach().mean().item()),
+    }
+    return bg_lock, stats
+
+
 def masked_bce_with_logits(logits, target, mask, eps=1e-6):
     loss = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
     mask = mask.float()
@@ -1337,6 +1466,244 @@ def masked_bce_with_logits(logits, target, mask, eps=1e-6):
     if float(denom.detach().item()) <= 0.0:
         return logits.sum() * 0.0
     return (loss * mask).sum() / (denom + float(eps))
+
+
+def build_ndr_v2_bg_lock_loss(student_out, batch, cfg):
+    if not isinstance(student_out, dict):
+        raise RuntimeError("USE_NDR_V2=True requires dict output from NDR branch.")
+    if "ndr_delta_logits_68" in student_out:
+        delta_logits = student_out["ndr_delta_logits_68"]
+    elif "detail_gate" in student_out and "residual_logits_68" in student_out:
+        beta_eff = output_scalar(student_out, "ndr_beta_eff", 0.0)
+        delta_logits = student_out["detail_gate"] * student_out["residual_logits_68"] * float(beta_eff)
+    else:
+        raise RuntimeError("USE_NDR_V2=True requires ndr_delta_logits_68 or detail_gate/residual_logits_68.")
+    if "pu_bg_core" not in batch or "pu_target_soft" not in batch or "pu_weight_map" not in batch:
+        raise RuntimeError("NDR-v2 bg lock requires pu_bg_core, pu_target_soft, and pu_weight_map in batch.")
+
+    device = delta_logits.device
+    bg_lock, bg_stats = build_ndr_v2_bg_lock_mask(batch, cfg, delta_logits.shape[-2:], device)
+    bg_weight = bg_lock.float()
+    denom = bg_weight.sum()
+    positive_delta = F.relu(delta_logits)
+    if float(denom.detach().item()) <= 0.0:
+        loss = delta_logits.sum() * 0.0
+        pos_bg_mean = 0.0
+    else:
+        masked_positive_delta = positive_delta * bg_weight
+        loss = (masked_positive_delta.square()).sum() / (
+            denom + float(getattr(cfg, "NDR_V2_BG_LOCK_EPS", 1e-6))
+        )
+        pos_bg_mean = float((masked_positive_delta.sum() / denom).detach().item())
+    stats = {
+        **bg_stats,
+        "positive_delta_bg_mean": pos_bg_mean,
+        "positive_delta_bg_max": float((positive_delta * bg_weight).detach().max().item()),
+        "positive_delta_mean": float(positive_delta.detach().mean().item()),
+        "loss_ndr_bg_lock": float(loss.detach().item()),
+    }
+    return loss, stats
+
+
+def ndr_v2_shape_lower_bound_loss(logits, shape_candidate, floor):
+    mask = shape_candidate.to(device=logits.device).float()
+    if int(mask.sum().detach().item()) < 1:
+        return logits.sum() * 0.0
+    prob = torch.sigmoid(logits)
+    loss_map = F.relu(float(floor) - prob).pow(2)
+    return (loss_map * mask).sum() / mask.sum().clamp_min(1e-6)
+
+
+def build_ndr_v2_shape_lower_bound(
+    cfg,
+    batch,
+    student_logits,
+    student_out,
+    teacher_binary,
+    epoch,
+    device,
+):
+    scale = float(get_ndr_v2_shape_lb_scale(cfg, epoch))
+    lambda_eff = float(getattr(cfg, "NDR_V2_SHAPE_LB_WEIGHT_MAX", 0.0)) * scale
+    zero_mask = torch.zeros_like(student_logits, dtype=torch.bool)
+    stats = {
+        "shape_lb_scale": scale,
+        "lambda_shape_lb_eff": lambda_eff,
+        "shape_candidate_raw_ratio": 0.0,
+        "shape_candidate_capped_ratio": 0.0,
+        "shape_valid_image_ratio": 0.0,
+        "shape_margin_mean": 0.0,
+        "shape_edge_mean": 0.0,
+        "shape_under_floor_mean": 0.0,
+        "shape_lb_skipped_no_fg_proto": 0,
+        "shape_lb_skipped_no_bg_proto": 0,
+    }
+    if scale <= 0.0:
+        return zero_mask, stats
+    if not isinstance(student_out, dict) or "coarse_logits_68" not in student_out:
+        raise RuntimeError("NDR-v2 shape lower-bound requires coarse_logits_68 in student output.")
+
+    final_prob = torch.sigmoid(student_logits.detach())
+    coarse_prob = torch.sigmoid(student_out["coarse_logits_68"].detach())
+    if coarse_prob.shape[-2:] != student_logits.shape[-2:]:
+        coarse_prob = F.interpolate(coarse_prob, size=student_logits.shape[-2:], mode="bilinear", align_corners=False)
+    teacher_bg = (teacher_binary.detach() < 0.5)
+    masks = build_rast_region_masks(batch, device)
+    fg_core = masks["fg_core"]
+    bg_core = masks["bg_core"]
+    extent = masks["extent"]
+    unknown = masks["unknown"]
+
+    if bool(getattr(cfg, "NDR_V2_SHAPE_LB_USE_EDGE", True)):
+        if isinstance(student_out, dict) and "edge_norm_68" in student_out:
+            edge_norm = student_out["edge_norm_68"].detach().to(device=device, dtype=student_logits.dtype)
+        elif isinstance(student_out, dict) and "sobel_68" in student_out:
+            edge_norm = student_out["sobel_68"].detach().to(device=device, dtype=student_logits.dtype)
+        else:
+            edge_norm = compute_sobel_mag_68(batch["image_68"].to(device=device, dtype=student_logits.dtype))
+        q = float(getattr(cfg, "NDR_V2_SHAPE_LB_EDGE_Q", 0.60))
+        edge_thresh = torch.quantile(edge_norm.flatten(1), q, dim=1).view(-1, 1, 1, 1)
+        edge_support = edge_norm >= edge_thresh
+    else:
+        edge_norm = torch.zeros_like(student_logits)
+        edge_support = torch.ones_like(student_logits, dtype=torch.bool)
+
+    if bool(getattr(cfg, "NDR_V2_SHAPE_LB_USE_DINO_MARGIN", True)):
+        margin_68, margin_stats = compute_dino_core_margin_68(
+            cfg,
+            batch,
+            fg_core,
+            bg_core,
+            student_logits.shape[-2:],
+            device,
+            prefix="NDR_V2_SHAPE_LB",
+        )
+        margin_68 = margin_68.detach()
+        stats["shape_lb_skipped_no_fg_proto"] = int(margin_stats.get("ndr_v2_shape_lb_skipped_no_fg_proto", 0))
+        stats["shape_lb_skipped_no_bg_proto"] = int(margin_stats.get("ndr_v2_shape_lb_skipped_no_bg_proto", 0))
+    else:
+        margin_68 = torch.zeros_like(student_logits)
+
+    if bool(getattr(cfg, "NDR_V2_SHAPE_LB_USE_NEAR_FG", True)):
+        near_prob_thresh = float(getattr(cfg, "NDR_V2_SHAPE_LB_NEAR_PROB_THRESH", 0.45))
+        near_seed = (coarse_prob >= near_prob_thresh) | (final_prob >= near_prob_thresh)
+        radius = int(getattr(cfg, "NDR_V2_SHAPE_LB_NEAR_RADIUS", 3))
+        near_fg = F.max_pool2d(
+            near_seed.float(),
+            kernel_size=2 * radius + 1,
+            stride=1,
+            padding=radius,
+        ) > 0.5
+    else:
+        near_fg = torch.ones_like(student_logits, dtype=torch.bool)
+
+    if isinstance(student_out, dict) and "boundary_band_68" in student_out:
+        boundary_band = student_out["boundary_band_68"].detach().to(device=device, dtype=student_logits.dtype)
+    elif isinstance(student_out, dict) and "boundary_band" in student_out:
+        boundary_band = student_out["boundary_band"].detach().to(device=device, dtype=student_logits.dtype)
+    else:
+        radius = int(getattr(cfg, "NDR_V2_BOUNDARY_RADIUS", 2))
+        k = 2 * radius + 1
+        boundary_band = F.max_pool2d(coarse_prob, kernel_size=k, stride=1, padding=radius)
+        boundary_band = boundary_band + F.max_pool2d(-coarse_prob, kernel_size=k, stride=1, padding=radius)
+        boundary_band = boundary_band.clamp(0.0, 1.0)
+    boundary_candidate = boundary_band >= float(getattr(cfg, "NDR_V2_SHAPE_LB_BOUNDARY_THRESH", 0.05))
+
+    region_candidate = torch.zeros_like(student_logits, dtype=torch.bool)
+    if bool(getattr(cfg, "NDR_V2_SHAPE_LB_USE_EXTENT", True)):
+        region_candidate = region_candidate | extent
+    if bool(getattr(cfg, "NDR_V2_SHAPE_LB_USE_UNKNOWN", False)):
+        region_candidate = region_candidate | unknown
+    non_bg = ~bg_core if bool(getattr(cfg, "NDR_V2_SHAPE_LB_EXCLUDE_BG_CORE", True)) else torch.ones_like(bg_core)
+    non_unknown = ~unknown if not bool(getattr(cfg, "NDR_V2_SHAPE_LB_USE_UNKNOWN", False)) else torch.ones_like(unknown)
+    shape_candidate_raw = (
+        boundary_candidate
+        & region_candidate
+        & edge_support
+        & (margin_68 >= float(getattr(cfg, "NDR_V2_SHAPE_LB_MARGIN_THRESH", 0.00)))
+        & near_fg
+        & non_bg
+        & non_unknown
+    )
+    if bool(getattr(cfg, "NDR_V2_SHAPE_LB_REQUIRE_TEACHER_BG", True)):
+        shape_candidate_raw = shape_candidate_raw & teacher_bg
+
+    under_floor = F.relu(float(getattr(cfg, "NDR_V2_SHAPE_LB_FLOOR", 0.35)) - final_prob)
+    margin_pos = F.relu(margin_68)
+    shape_score = 0.4 * boundary_band + 0.3 * edge_norm + 0.2 * margin_pos + 0.3 * under_floor
+    shape_candidate = cap_mask_by_score_per_image(
+        shape_candidate_raw,
+        shape_score,
+        float(getattr(cfg, "NDR_V2_SHAPE_LB_MAX_RATIO_PER_IMAGE", 0.005)),
+        int(getattr(cfg, "NDR_V2_SHAPE_LB_MIN_PIXELS_PER_IMAGE", 4)),
+    )
+    if bool(getattr(cfg, "NDR_V2_SHAPE_LB_DETACH_MASK", True)):
+        shape_candidate = shape_candidate.detach()
+        shape_candidate_raw = shape_candidate_raw.detach()
+
+    stats.update(
+        {
+            "shape_candidate_raw_ratio": float(shape_candidate_raw.float().detach().mean().item()),
+            "shape_candidate_capped_ratio": float(shape_candidate.float().detach().mean().item()),
+            "shape_valid_image_ratio": float(
+                (shape_candidate.float().flatten(1).sum(dim=1) > 0).float().detach().mean().item()
+            ),
+            "shape_margin_mean": _mean_on_mask(margin_68, shape_candidate),
+            "shape_edge_mean": _mean_on_mask(edge_norm, shape_candidate),
+            "shape_under_floor_mean": _mean_on_mask(under_floor, shape_candidate),
+        }
+    )
+    return shape_candidate, stats
+
+
+def build_ndr_v2_bg_lock_losses(final_logits, student_out, batch, cfg, epoch):
+    loss_res, base_stats = build_ndr_v2_bg_lock_loss(student_out, batch, cfg)
+    bg_res_scale = float(get_ndr_v2_bg_res_lock_scale(cfg, epoch))
+    bg_prob_scale = float(get_ndr_v2_bg_prob_lock_scale(cfg, epoch))
+    lambda_res = float(
+        getattr(cfg, "NDR_V2_BG_RES_LOCK_WEIGHT_MAX", getattr(cfg, "NDR_V2_BG_LOCK_WEIGHT", 0.005))
+    ) * bg_res_scale
+    lambda_prob = float(getattr(cfg, "NDR_V2_BG_PROB_LOCK_WEIGHT_MAX", 0.0)) * bg_prob_scale
+
+    device = final_logits.device
+    bg_lock, _ = build_ndr_v2_bg_lock_mask(batch, cfg, final_logits.shape[-2:], device)
+    bg_weight = bg_lock.float()
+    denom = bg_weight.sum()
+    if (
+        "coarse_logits_68" in student_out
+        and student_out["coarse_logits_68"].shape[-2:] == final_logits.shape[-2:]
+    ):
+        p_anchor = torch.sigmoid(student_out["coarse_logits_68"].detach())
+    elif "coarse_logits_68" in student_out:
+        p_anchor = torch.sigmoid(
+            F.interpolate(
+                student_out["coarse_logits_68"].detach(),
+                size=final_logits.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        )
+    else:
+        p_anchor = torch.zeros_like(final_logits)
+    p_final = torch.sigmoid(final_logits)
+    if float(denom.detach().item()) <= 0.0 or not bool(getattr(cfg, "NDR_V2_USE_BG_PROB_LOCK", False)):
+        loss_prob = final_logits.sum() * 0.0
+    else:
+        delta = float(getattr(cfg, "NDR_V2_BG_PROB_LOCK_DELTA", 0.02))
+        loss_prob_map = F.relu(p_final - p_anchor - delta).pow(2)
+        loss_prob = (loss_prob_map * bg_weight).sum() / (
+            denom + float(getattr(cfg, "NDR_V2_BG_LOCK_EPS", 1e-6))
+        )
+    stats = {
+        **base_stats,
+        "bg_res_lock_scale": bg_res_scale,
+        "lambda_bg_res_lock_eff": lambda_res,
+        "bg_prob_lock_scale": bg_prob_scale,
+        "lambda_bg_prob_lock_eff": lambda_prob,
+        "loss_bg_res_lock": float(loss_res.detach().item()),
+        "loss_bg_prob_lock": float(loss_prob.detach().item()),
+    }
+    return loss_res, loss_prob, stats
 
 
 def combine_group_losses(loss_items, eps=1e-6):
@@ -1682,6 +2049,641 @@ def cap_mask_by_score_per_image(mask, score, max_ratio, min_pixels):
             keep_idx = candidate_idx[topk.indices]
         capped[idx].flatten().index_fill_(0, keep_idx, True)
     return capped
+
+
+def compute_sobel_mag_68(image_68):
+    if image_68 is None:
+        raise RuntimeError("TCE edge support requires image_68 from USE_NDR_BRANCH=True.")
+    if image_68.ndim != 4 or image_68.shape[1] != 3:
+        raise RuntimeError(f"TCE expects image_68 [B,3,H,W], got {list(image_68.shape)}.")
+    gray = 0.299 * image_68[:, 0:1] + 0.587 * image_68[:, 1:2] + 0.114 * image_68[:, 2:3]
+    sobel_x = torch.tensor(
+        [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]],
+        device=image_68.device,
+        dtype=image_68.dtype,
+    ).unsqueeze(0)
+    sobel_y = torch.tensor(
+        [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]],
+        device=image_68.device,
+        dtype=image_68.dtype,
+    ).unsqueeze(0)
+    dx = F.conv2d(gray, sobel_x, padding=1)
+    dy = F.conv2d(gray, sobel_y, padding=1)
+    sobel = torch.sqrt(dx * dx + dy * dy + 1e-6)
+    sobel = sobel / (sobel.amax(dim=(2, 3), keepdim=True) + 1e-6)
+    return sobel.clamp(0.0, 1.0)
+
+
+def _mean_on_mask(value, mask):
+    mask_f = mask.float()
+    denom = mask_f.sum()
+    if float(denom.detach().item()) <= 0.0:
+        return 0.0
+    return float((value * mask_f).sum().detach().item() / (denom.detach().item() + 1e-6))
+
+
+def tce_lower_bound_loss_for_logits(logits, lost_cover_mask, new_boundary_mask, cfg):
+    mask = (lost_cover_mask | new_boundary_mask).to(device=logits.device)
+    if int(mask.sum().detach().item()) <= 0:
+        return logits.sum() * 0.0
+    prob = torch.sigmoid(logits)
+    floor = torch.zeros_like(prob)
+    floor = torch.where(
+        lost_cover_mask.to(device=logits.device),
+        torch.full_like(floor, float(getattr(cfg, "TCE_LOST_TARGET_FLOOR", 0.45))),
+        floor,
+    )
+    floor = torch.where(
+        new_boundary_mask.to(device=logits.device),
+        torch.full_like(floor, float(getattr(cfg, "TCE_NEW_TARGET_FLOOR", 0.35))),
+        floor,
+    )
+    loss_map = F.relu(floor - prob).pow(2)
+    mask_f = mask.float()
+    return (loss_map * mask_f).sum() / (mask_f.sum() + 1e-6)
+
+
+def tce_teacher_bce_with_logits(logits, target, weight_map, cfg, eps=1e-6):
+    if weight_map is None:
+        return F.binary_cross_entropy_with_logits(logits, target, reduction="mean")
+    weight_map = weight_map.to(device=logits.device, dtype=logits.dtype)
+    if bool(getattr(cfg, "TCE_WEIGHTED_NORMALIZE", True)):
+        return weighted_bce_with_logits(logits, target, weight_map, eps=eps)
+    loss = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    return (loss * weight_map).mean()
+
+
+def build_tce_masks_and_teacher_map(
+    cfg,
+    batch,
+    student_logits,
+    teacher_prob,
+    teacher_binary,
+    rast_teacher_map_eff,
+    epoch,
+    device,
+    image_68=None,
+):
+    if image_68 is None:
+        image_68 = batch.get("image_68")
+    base_teacher_map = (
+        rast_teacher_map_eff.to(device=device, dtype=student_logits.dtype)
+        if rast_teacher_map_eff is not None
+        else torch.ones_like(student_logits)
+    )
+    cover_prob = batch["tce_cover_prob_68"].to(device, non_blocking=True).float().clamp(0.0, 1.0)
+    cover_binary = batch["tce_cover_binary_68"].to(device, non_blocking=True).float() >= 0.5
+    cover_conf = batch["tce_cover_conf_68"].to(device, non_blocking=True).float().clamp(0.0, 1.0)
+    if bool(getattr(cfg, "TCE_DETACH_COVER", True)):
+        cover_prob = cover_prob.detach()
+        cover_binary = cover_binary.detach()
+        cover_conf = cover_conf.detach()
+    cover_area_batch = batch["tce_cover_area"].to(device, non_blocking=True).float()
+    if cover_area_batch.ndim == 0:
+        cover_area_batch = cover_area_batch.view(1)
+    tce_scale = float(get_tce_scale(cfg, epoch))
+    lambda_tce_eff = float(getattr(cfg, "TCE_LAMBDA_MAX", 0.010)) * tce_scale
+    zero_mask = torch.zeros_like(student_logits, dtype=torch.bool)
+    stats = {
+        "tce_scale": tce_scale,
+        "lambda_tce_eff": lambda_tce_eff,
+        "cover_area_mean": float(cover_area_batch.mean().detach().item()),
+        "current_area_mean": 0.0,
+        "shrink_gate_ratio": 0.0,
+        "bg_safe_gate_ratio": 0.0,
+        "image_gate_ratio": 0.0,
+        "lost_raw_ratio": 0.0,
+        "lost_capped_ratio": 0.0,
+        "new_raw_ratio": 0.0,
+        "new_capped_ratio": 0.0,
+        "tce_total_ratio": 0.0,
+        "tce_valid_image_ratio": 0.0,
+        "lost_margin_mean": 0.0,
+        "new_margin_mean": 0.0,
+        "lost_cover_conf_mean": 0.0,
+        "current_teacher_conf_lost_mean": 0.0,
+        "current_teacher_conf_new_mean": 0.0,
+        "teacher_map_final_mean": float(base_teacher_map.detach().mean().item()),
+        "teacher_map_final_tce_mean": 1.0,
+        "loss_tce": 0.0,
+        "tce_skipped_no_fg_proto": 0,
+        "tce_skipped_no_bg_proto": 0,
+    }
+    if tce_scale <= 0.0:
+        student_prob_for_area = torch.sigmoid(student_logits.detach())
+        stats["current_area_mean"] = float((student_prob_for_area >= 0.5).float().mean().detach().item())
+        return None, zero_mask, zero_mask, stats
+
+    region_masks = build_rast_region_masks(batch, device)
+    fg_core = region_masks["fg_core"]
+    bg_core = region_masks["bg_core"]
+    extent = region_masks["extent"]
+    if bool(getattr(cfg, "TCE_USE_UNKNOWN", False)):
+        extent = extent | region_masks["unknown"]
+
+    student_prob_src = student_logits.detach() if bool(getattr(cfg, "TCE_DETACH_MASK", True)) else student_logits
+    student_prob = torch.sigmoid(student_prob_src)
+    teacher_prob = teacher_prob.detach()
+    teacher_binary = teacher_binary.detach() >= 0.5
+    current_teacher_bg = ~teacher_binary
+    current_teacher_conf = (2.0 * (teacher_prob - 0.5).abs()).clamp(0.0, 1.0)
+
+    if bool(getattr(cfg, "TCE_USE_DINO_MARGIN", True)):
+        margin_68, margin_stats = compute_dino_core_margin_68(
+            cfg,
+            batch,
+            fg_core,
+            bg_core,
+            student_logits.shape[-2:],
+            device,
+            prefix="TCE",
+        )
+        if bool(getattr(cfg, "TCE_DETACH_MARGIN", True)):
+            margin_68 = margin_68.detach()
+        stats["tce_skipped_no_fg_proto"] = int(margin_stats.get("tce_skipped_no_fg_proto", 0))
+        stats["tce_skipped_no_bg_proto"] = int(margin_stats.get("tce_skipped_no_bg_proto", 0))
+    else:
+        margin_68 = torch.zeros_like(student_logits)
+
+    if bool(getattr(cfg, "TCE_USE_NEAR_CURRENT_FG", True)):
+        current_fg = student_prob >= float(getattr(cfg, "TCE_NEAR_FG_THRESH", 0.50))
+        radius = int(getattr(cfg, "TCE_NEAR_FG_RADIUS", 3))
+        near_current_fg = F.max_pool2d(
+            current_fg.float(),
+            kernel_size=2 * radius + 1,
+            stride=1,
+            padding=radius,
+        ) > 0.5
+    else:
+        near_current_fg = torch.ones_like(student_logits, dtype=torch.bool)
+
+    if bool(getattr(cfg, "TCE_USE_EDGE_SUPPORT", True)):
+        if image_68 is None:
+            raise RuntimeError("TCE_USE_EDGE_SUPPORT=True requires image_68 in batch or helper input.")
+        edge_score = compute_sobel_mag_68(image_68.to(device=device, dtype=student_logits.dtype))
+        q = float(getattr(cfg, "TCE_EDGE_Q", 0.60))
+        edge_thresh = torch.quantile(edge_score.flatten(1), q, dim=1).view(-1, 1, 1, 1)
+        edge_support = edge_score >= edge_thresh
+    else:
+        edge_score = torch.zeros_like(student_logits)
+        edge_support = torch.ones_like(student_logits, dtype=torch.bool)
+
+    current_pred = student_prob >= 0.5
+    current_area = current_pred.float().flatten(1).mean(dim=1)
+    extent_f = extent.float()
+    extent_sum = extent_f.flatten(1).sum(dim=1).clamp_min(1e-6)
+    current_fg_extent_ratio = (current_pred & extent).float().flatten(1).sum(dim=1) / extent_sum
+    cover_fg_extent_ratio = (cover_binary & extent).float().flatten(1).sum(dim=1) / extent_sum
+    shrink_risk = (
+        current_area < cover_area_batch * float(getattr(cfg, "TCE_SHRINK_AREA_RATIO", 0.90))
+    ) | (
+        current_fg_extent_ratio
+        < cover_fg_extent_ratio * float(getattr(cfg, "TCE_SHRINK_EXTENT_RATIO", 0.85))
+    )
+    if not bool(getattr(cfg, "TCE_USE_IMAGE_GATE", True)):
+        shrink_risk = torch.ones_like(shrink_risk, dtype=torch.bool)
+
+    bg_sum = bg_core.float().flatten(1).sum(dim=1).clamp_min(1e-6)
+    bg_core_teacher_fg_ratio = (bg_core & teacher_binary).float().flatten(1).sum(dim=1) / bg_sum
+    background_safe = bg_core_teacher_fg_ratio <= float(getattr(cfg, "TCE_BG_CORE_TEACHER_FG_MAX", 0.015))
+    if not bool(getattr(cfg, "TCE_USE_BG_RISK_GATE", True)):
+        background_safe = torch.ones_like(background_safe, dtype=torch.bool)
+    image_gate = (shrink_risk & background_safe).view(-1, 1, 1, 1)
+
+    non_bg = ~bg_core if bool(getattr(cfg, "TCE_EXCLUDE_BG_CORE", True)) else torch.ones_like(bg_core)
+    if bool(getattr(cfg, "TCE_USE_LOST_COVER", True)):
+        lost_raw = (
+            extent
+            & cover_binary
+            & current_teacher_bg
+            & (cover_conf >= float(getattr(cfg, "TCE_COVER_CONF_THRESH", 0.60)))
+            & (current_teacher_conf <= float(getattr(cfg, "TCE_CURRENT_BG_CONF_MAX", 0.90)))
+            & (margin_68 >= float(getattr(cfg, "TCE_LOST_MARGIN_THRESH", 0.05)))
+            & near_current_fg
+            & non_bg
+            & image_gate
+        )
+    else:
+        lost_raw = torch.zeros_like(student_logits, dtype=torch.bool)
+    if bool(getattr(cfg, "TCE_USE_NEW_BOUNDARY", True)):
+        new_raw = (
+            extent
+            & (~cover_binary)
+            & current_teacher_bg
+            & (margin_68 >= float(getattr(cfg, "TCE_NEW_MARGIN_THRESH", 0.10)))
+            & (student_prob >= float(getattr(cfg, "TCE_NEW_STUDENT_PROB_THRESH", 0.25)))
+            & near_current_fg
+            & edge_support
+            & non_bg
+            & image_gate
+        )
+    else:
+        new_raw = torch.zeros_like(student_logits, dtype=torch.bool)
+    lost_score = margin_68 + 0.5 * cover_conf - 0.3 * current_teacher_conf
+    new_score = margin_68 + 0.3 * student_prob + 0.2 * edge_score - 0.3 * current_teacher_conf
+    lost_capped = cap_mask_by_score_per_image(
+        lost_raw,
+        lost_score,
+        float(getattr(cfg, "TCE_LOST_MAX_RATIO_PER_IMAGE", 0.004)),
+        0,
+    )
+    new_capped = cap_mask_by_score_per_image(
+        new_raw,
+        new_score,
+        float(getattr(cfg, "TCE_NEW_MAX_RATIO_PER_IMAGE", 0.002)),
+        0,
+    )
+    total_raw = lost_capped | new_capped
+    total_score = torch.maximum(lost_score, new_score)
+    total_capped = cap_mask_by_score_per_image(
+        total_raw,
+        total_score,
+        float(getattr(cfg, "TCE_TOTAL_MAX_RATIO_PER_IMAGE", 0.005)),
+        int(getattr(cfg, "TCE_MIN_PIXELS_PER_IMAGE", 4)),
+    )
+    lost_final = lost_capped & total_capped
+    new_final = new_capped & total_capped & (~lost_final)
+
+    teacher_map_final = base_teacher_map.clone()
+    if bool(getattr(cfg, "TCE_USE_TEACHER_BG_REWEIGHT", True)) and bool(getattr(cfg, "TCE_APPLY_TO_FINAL", True)):
+        teacher_map_final = torch.where(
+            lost_final & current_teacher_bg,
+            teacher_map_final * float(getattr(cfg, "TCE_LOST_BG_TEACHER_MULT", 0.60)),
+            teacher_map_final,
+        )
+        teacher_map_final = torch.where(
+            new_final & current_teacher_bg,
+            teacher_map_final * float(getattr(cfg, "TCE_NEW_BG_TEACHER_MULT", 0.75)),
+            teacher_map_final,
+        )
+
+    total_final = lost_final | new_final
+    valid_images = total_final.float().flatten(1).sum(dim=1) >= int(getattr(cfg, "TCE_MIN_PIXELS_PER_IMAGE", 4))
+    stats.update(
+        {
+            "current_area_mean": float(current_area.detach().mean().item()),
+            "shrink_gate_ratio": float(shrink_risk.float().detach().mean().item()),
+            "bg_safe_gate_ratio": float(background_safe.float().detach().mean().item()),
+            "image_gate_ratio": float(image_gate.float().detach().mean().item()),
+            "lost_raw_ratio": float(lost_raw.float().detach().mean().item()),
+            "lost_capped_ratio": float(lost_final.float().detach().mean().item()),
+            "new_raw_ratio": float(new_raw.float().detach().mean().item()),
+            "new_capped_ratio": float(new_final.float().detach().mean().item()),
+            "tce_total_ratio": float(total_final.float().detach().mean().item()),
+            "tce_valid_image_ratio": float(valid_images.float().detach().mean().item()),
+            "lost_margin_mean": _mean_on_mask(margin_68, lost_final),
+            "new_margin_mean": _mean_on_mask(margin_68, new_final),
+            "lost_cover_conf_mean": _mean_on_mask(cover_conf, lost_final),
+            "current_teacher_conf_lost_mean": _mean_on_mask(current_teacher_conf, lost_final),
+            "current_teacher_conf_new_mean": _mean_on_mask(current_teacher_conf, new_final),
+            "teacher_map_final_mean": float(teacher_map_final.detach().mean().item()),
+            "teacher_map_final_tce_mean": _mean_on_mask(teacher_map_final, total_final),
+        }
+    )
+    return teacher_map_final, lost_final.detach(), new_final.detach(), stats
+
+
+def lceg_teacher_bce_with_logits(logits, target, weight_map, cfg, eps=1e-6):
+    if weight_map is None:
+        return F.binary_cross_entropy_with_logits(logits, target, reduction="mean")
+    weight_map = weight_map.to(device=logits.device, dtype=logits.dtype)
+    if bool(getattr(cfg, "LCEG_WEIGHTED_NORMALIZE", True)):
+        return weighted_bce_with_logits(logits, target, weight_map, eps=eps)
+    loss = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    return (loss * weight_map).mean()
+
+
+def _lceg_branch_lower_bound_loss(logits, mask, floor_value, eps=1e-6):
+    mask = mask.to(device=logits.device)
+    if int(mask.sum().detach().item()) <= 0:
+        return logits.sum() * 0.0
+    prob = torch.sigmoid(logits)
+    loss_map = F.relu(float(floor_value) - prob).pow(2)
+    mask_f = mask.float()
+    return (loss_map * mask_f).sum() / (mask_f.sum().clamp_min(float(eps)))
+
+
+def lceg_lower_bound_loss_for_logits(logits, core_mask, lost_mask, new_mask, cfg):
+    loss_core = _lceg_branch_lower_bound_loss(
+        logits,
+        core_mask,
+        float(getattr(cfg, "LCEG_CORE_TARGET_FLOOR", 0.55)),
+    )
+    loss_lost = _lceg_branch_lower_bound_loss(
+        logits,
+        lost_mask,
+        float(getattr(cfg, "LCEG_LOST_TARGET_FLOOR", 0.45)),
+    )
+    loss_new = _lceg_branch_lower_bound_loss(
+        logits,
+        new_mask,
+        float(getattr(cfg, "LCEG_NEW_TARGET_FLOOR", 0.35)),
+    )
+    loss_total = (
+        float(getattr(cfg, "LCEG_BRANCH_WEIGHT_CORE", 1.0)) * loss_core
+        + float(getattr(cfg, "LCEG_BRANCH_WEIGHT_LOST", 0.8)) * loss_lost
+        + float(getattr(cfg, "LCEG_BRANCH_WEIGHT_NEW", 0.5)) * loss_new
+    )
+    return loss_total, {
+        "core": loss_core,
+        "lost": loss_lost,
+        "new": loss_new,
+    }
+
+
+def build_lceg_masks_and_teacher_maps(
+    cfg,
+    batch,
+    student_logits,
+    teacher_prob,
+    teacher_binary,
+    rast_teacher_map_eff,
+    epoch,
+    device,
+    image_68=None,
+):
+    if image_68 is None:
+        image_68 = batch.get("image_68")
+    base_teacher_map = (
+        rast_teacher_map_eff.to(device=device, dtype=student_logits.dtype)
+        if rast_teacher_map_eff is not None
+        else torch.ones_like(student_logits)
+    )
+    cover_prob = batch["lceg_cover_prob_68"].to(device, non_blocking=True).float().clamp(0.0, 1.0)
+    cover_binary = batch["lceg_cover_binary_68"].to(device, non_blocking=True).float() >= 0.5
+    cover_conf = batch["lceg_cover_conf_68"].to(device, non_blocking=True).float().clamp(0.0, 1.0)
+    if bool(getattr(cfg, "LCEG_DETACH_COVER", True)):
+        cover_prob = cover_prob.detach()
+        cover_binary = cover_binary.detach()
+        cover_conf = cover_conf.detach()
+    cover_area_batch = batch["lceg_cover_area"].to(device, non_blocking=True).float()
+    if cover_area_batch.ndim == 0:
+        cover_area_batch = cover_area_batch.view(1)
+
+    lceg_scale = float(get_lceg_scale(cfg, epoch))
+    lambda_lceg_eff = float(getattr(cfg, "LCEG_LAMBDA_MAX", 0.020)) * lceg_scale
+    zero_mask = torch.zeros_like(student_logits, dtype=torch.bool)
+    stats = {
+        "lceg_scale": lceg_scale,
+        "lambda_lceg_eff": lambda_lceg_eff,
+        "cover_area_mean": float(cover_area_batch.mean().detach().item()),
+        "cover_binary_area_mean": float(cover_binary.float().detach().mean().item()),
+        "cover_conf_mean": float(cover_conf.detach().mean().item()),
+        "current_area_mean": 0.0,
+        "current_fg_extent_ratio": 0.0,
+        "cover_fg_extent_ratio": 0.0,
+        "shrink_gate_ratio": 0.0,
+        "bg_safe_gate_ratio": 0.0,
+        "core_raw_ratio": 0.0,
+        "core_capped_ratio": 0.0,
+        "lost_raw_ratio": 0.0,
+        "lost_capped_ratio": 0.0,
+        "new_raw_ratio": 0.0,
+        "new_capped_ratio": 0.0,
+        "lceg_total_ratio": 0.0,
+        "lceg_valid_image_ratio": 0.0,
+        "core_conf_mean": 0.0,
+        "lost_cover_prob_mean": 0.0,
+        "lost_margin_mean": 0.0,
+        "new_margin_mean": 0.0,
+        "teacher_map_final_mean": float(base_teacher_map.detach().mean().item()),
+        "teacher_map_final_lceg_mean": 1.0,
+        "teacher_map_coarse_mean": float(base_teacher_map.detach().mean().item()),
+        "teacher_map_coarse_lceg_mean": 1.0,
+        "lceg_skipped_no_fg_proto": 0,
+        "lceg_skipped_no_bg_proto": 0,
+    }
+    if lceg_scale <= 0.0:
+        student_prob_for_area = torch.sigmoid(student_logits.detach())
+        stats["current_area_mean"] = float((student_prob_for_area >= 0.5).float().mean().detach().item())
+        return None, None, zero_mask, zero_mask, zero_mask, stats
+
+    region_masks = build_rast_region_masks(batch, device)
+    fg_core = region_masks["fg_core"]
+    bg_core = region_masks["bg_core"]
+    extent = region_masks["extent"]
+
+    student_prob_src = student_logits.detach() if bool(getattr(cfg, "LCEG_DETACH_MASK", True)) else student_logits
+    student_prob = torch.sigmoid(student_prob_src)
+    teacher_prob = teacher_prob.detach()
+    teacher_binary = teacher_binary.detach() >= 0.5
+    teacher_bg = ~teacher_binary
+    teacher_conf = (2.0 * (teacher_prob - 0.5).abs()).clamp(0.0, 1.0)
+
+    if bool(getattr(cfg, "LCEG_USE_DINO_MARGIN", True)):
+        margin_68, margin_stats = compute_dino_core_margin_68(
+            cfg,
+            batch,
+            fg_core,
+            bg_core,
+            student_logits.shape[-2:],
+            device,
+            prefix="LCEG",
+        )
+        if bool(getattr(cfg, "LCEG_DETACH_MARGIN", True)):
+            margin_68 = margin_68.detach()
+        stats["lceg_skipped_no_fg_proto"] = int(margin_stats.get("lceg_skipped_no_fg_proto", 0))
+        stats["lceg_skipped_no_bg_proto"] = int(margin_stats.get("lceg_skipped_no_bg_proto", 0))
+    else:
+        margin_68 = torch.zeros_like(student_logits)
+
+    if bool(getattr(cfg, "LCEG_USE_NEAR_FG", True)):
+        current_fg_for_near = student_prob >= float(getattr(cfg, "LCEG_NEAR_CURRENT_FG_THRESH", 0.50))
+        cover_fg_for_near = cover_prob >= float(getattr(cfg, "LCEG_NEAR_COVER_PROB_THRESH", 0.40))
+        near_seed = current_fg_for_near | cover_fg_for_near
+        radius = int(getattr(cfg, "LCEG_NEAR_FG_RADIUS", 3))
+        near_fg = F.max_pool2d(
+            near_seed.float(),
+            kernel_size=2 * radius + 1,
+            stride=1,
+            padding=radius,
+        ) > 0.5
+    else:
+        near_fg = torch.ones_like(student_logits, dtype=torch.bool)
+
+    if bool(getattr(cfg, "LCEG_USE_EDGE_SUPPORT", True)):
+        if image_68 is None:
+            raise RuntimeError("LCEG_USE_EDGE_SUPPORT=True requires image_68 in batch or helper input.")
+        edge_score = compute_sobel_mag_68(image_68.to(device=device, dtype=student_logits.dtype))
+        q = float(getattr(cfg, "LCEG_EDGE_Q", 0.60))
+        edge_thresh = torch.quantile(edge_score.flatten(1), q, dim=1).view(-1, 1, 1, 1)
+        edge_support = edge_score >= edge_thresh
+    else:
+        edge_score = torch.zeros_like(student_logits)
+        edge_support = torch.ones_like(student_logits, dtype=torch.bool)
+
+    current_pred = student_prob >= 0.5
+    current_area = current_pred.float().flatten(1).mean(dim=1)
+    extent_f = extent.float()
+    extent_sum = extent_f.flatten(1).sum(dim=1).clamp_min(1e-6)
+    current_fg_extent_ratio = (current_pred & extent).float().flatten(1).sum(dim=1) / extent_sum
+    cover_extent_fg = cover_prob >= float(getattr(cfg, "LCEG_LOST_COVER_PROB_THRESH", 0.40))
+    cover_fg_extent_ratio = (cover_extent_fg & extent).float().flatten(1).sum(dim=1) / extent_sum
+    shrink_gate = (
+        current_area < cover_area_batch * float(getattr(cfg, "LCEG_SHRINK_AREA_RATIO", 0.98))
+    ) | (
+        current_fg_extent_ratio
+        < cover_fg_extent_ratio * float(getattr(cfg, "LCEG_SHRINK_EXTENT_RATIO", 0.95))
+    )
+    if not bool(getattr(cfg, "LCEG_USE_IMAGE_GATE_FOR_EXTENT", True)):
+        shrink_gate = torch.ones_like(shrink_gate, dtype=torch.bool)
+
+    bg_sum = bg_core.float().flatten(1).sum(dim=1).clamp_min(1e-6)
+    bg_core_teacher_fg_ratio = (bg_core & teacher_binary).float().flatten(1).sum(dim=1) / bg_sum
+    bg_safe = bg_core_teacher_fg_ratio <= float(getattr(cfg, "LCEG_BG_CORE_TEACHER_FG_MAX", 0.020))
+    if not bool(getattr(cfg, "LCEG_USE_BG_RISK_GATE", True)):
+        bg_safe = torch.ones_like(bg_safe, dtype=torch.bool)
+    bg_safe_gate = bg_safe.view(-1, 1, 1, 1)
+    extent_image_gate = (shrink_gate & bg_safe).view(-1, 1, 1, 1)
+
+    non_bg = ~bg_core if bool(getattr(cfg, "LCEG_EXCLUDE_BG_CORE", True)) else torch.ones_like(bg_core)
+    if bool(getattr(cfg, "LCEG_USE_CORE_GUARD", True)):
+        core_raw = (
+            fg_core
+            & teacher_bg
+            & (teacher_conf <= float(getattr(cfg, "LCEG_CURRENT_BG_CONF_MAX_CORE", 0.98)))
+            & (student_prob >= float(getattr(cfg, "LCEG_CORE_STUDENT_PROB_MIN", 0.0)))
+            & bg_safe_gate
+        )
+    else:
+        core_raw = torch.zeros_like(student_logits, dtype=torch.bool)
+    if bool(getattr(cfg, "LCEG_USE_LOST_EXTENT", True)):
+        lost_raw = (
+            extent
+            & (cover_prob >= float(getattr(cfg, "LCEG_LOST_COVER_PROB_THRESH", 0.40)))
+            & teacher_bg
+            & (teacher_conf <= float(getattr(cfg, "LCEG_CURRENT_BG_CONF_MAX_EXTENT", 0.95)))
+            & (student_prob >= float(getattr(cfg, "LCEG_LOST_STUDENT_PROB_MIN", 0.05)))
+            & (margin_68 >= float(getattr(cfg, "LCEG_LOST_MARGIN_THRESH", -0.02)))
+            & near_fg
+            & non_bg
+            & extent_image_gate
+        )
+    else:
+        lost_raw = torch.zeros_like(student_logits, dtype=torch.bool)
+    if bool(getattr(cfg, "LCEG_USE_NEW_BOUNDARY", True)):
+        new_raw = (
+            extent
+            & (cover_prob < float(getattr(cfg, "LCEG_NEW_COVER_PROB_MAX", 0.40)))
+            & teacher_bg
+            & (teacher_conf <= float(getattr(cfg, "LCEG_CURRENT_BG_CONF_MAX_EXTENT", 0.95)))
+            & (student_prob >= float(getattr(cfg, "LCEG_NEW_STUDENT_PROB_MIN", 0.15)))
+            & (margin_68 >= float(getattr(cfg, "LCEG_NEW_MARGIN_THRESH", 0.05)))
+            & near_fg
+            & edge_support
+            & non_bg
+            & extent_image_gate
+        )
+    else:
+        new_raw = torch.zeros_like(student_logits, dtype=torch.bool)
+
+    core_score = (1.0 - teacher_conf) + 0.3 * cover_prob + 0.2 * student_prob
+    lost_score = margin_68 + 0.5 * cover_prob + 0.3 * student_prob - 0.3 * teacher_conf
+    new_score = margin_68 + 0.3 * student_prob + 0.2 * edge_score - 0.3 * teacher_conf
+    min_pixels = int(getattr(cfg, "LCEG_MIN_PIXELS_PER_IMAGE", 4))
+    core_capped = cap_mask_by_score_per_image(
+        core_raw,
+        core_score,
+        float(getattr(cfg, "LCEG_CORE_MAX_RATIO_PER_IMAGE", 0.010)),
+        min_pixels,
+    )
+    lost_capped = cap_mask_by_score_per_image(
+        lost_raw,
+        lost_score,
+        float(getattr(cfg, "LCEG_LOST_MAX_RATIO_PER_IMAGE", 0.010)),
+        min_pixels,
+    )
+    new_capped = cap_mask_by_score_per_image(
+        new_raw,
+        new_score,
+        float(getattr(cfg, "LCEG_NEW_MAX_RATIO_PER_IMAGE", 0.003)),
+        min_pixels,
+    )
+
+    neg = torch.full_like(student_logits, -1e6)
+    total_raw = core_capped | lost_capped | new_capped
+    total_score = torch.maximum(
+        torch.where(core_capped, core_score, neg),
+        torch.maximum(
+            torch.where(lost_capped, lost_score, neg),
+            torch.where(new_capped, new_score, neg),
+        ),
+    )
+    total_capped = cap_mask_by_score_per_image(
+        total_raw,
+        total_score,
+        float(getattr(cfg, "LCEG_TOTAL_MAX_RATIO_PER_IMAGE", 0.020)),
+        min_pixels,
+    )
+    core_final = core_capped & total_capped
+    lost_final = lost_capped & total_capped
+    new_final = new_capped & total_capped
+    total_final = core_final | lost_final | new_final
+
+    teacher_map_final = base_teacher_map.clone()
+    teacher_map_coarse = base_teacher_map.clone()
+    if bool(getattr(cfg, "LCEG_USE_TEACHER_BG_REWEIGHT", True)):
+        for apply_map, allow_apply in (
+            (teacher_map_final, bool(getattr(cfg, "LCEG_APPLY_TO_FINAL", True))),
+            (teacher_map_coarse, bool(getattr(cfg, "LCEG_APPLY_TO_COARSE_AUX", True))),
+        ):
+            if allow_apply:
+                apply_map.copy_(
+                    torch.where(
+                        core_final & teacher_bg,
+                        apply_map * float(getattr(cfg, "LCEG_CORE_BG_TEACHER_MULT", 0.50)),
+                        apply_map,
+                    )
+                )
+                apply_map.copy_(
+                    torch.where(
+                        lost_final & teacher_bg,
+                        apply_map * float(getattr(cfg, "LCEG_LOST_BG_TEACHER_MULT", 0.60)),
+                        apply_map,
+                    )
+                )
+                apply_map.copy_(
+                    torch.where(
+                        new_final & teacher_bg,
+                        apply_map * float(getattr(cfg, "LCEG_NEW_BG_TEACHER_MULT", 0.75)),
+                        apply_map,
+                    )
+                )
+
+    valid_images = total_final.float().flatten(1).sum(dim=1) >= min_pixels
+    stats.update(
+        {
+            "current_area_mean": float(current_area.detach().mean().item()),
+            "current_fg_extent_ratio": float(current_fg_extent_ratio.detach().mean().item()),
+            "cover_fg_extent_ratio": float(cover_fg_extent_ratio.detach().mean().item()),
+            "shrink_gate_ratio": float(shrink_gate.float().detach().mean().item()),
+            "bg_safe_gate_ratio": float(bg_safe.float().detach().mean().item()),
+            "core_raw_ratio": float(core_raw.float().detach().mean().item()),
+            "core_capped_ratio": float(core_final.float().detach().mean().item()),
+            "lost_raw_ratio": float(lost_raw.float().detach().mean().item()),
+            "lost_capped_ratio": float(lost_final.float().detach().mean().item()),
+            "new_raw_ratio": float(new_raw.float().detach().mean().item()),
+            "new_capped_ratio": float(new_final.float().detach().mean().item()),
+            "lceg_total_ratio": float(total_final.float().detach().mean().item()),
+            "lceg_valid_image_ratio": float(valid_images.float().detach().mean().item()),
+            "core_conf_mean": _mean_on_mask(teacher_conf, core_final),
+            "lost_cover_prob_mean": _mean_on_mask(cover_prob, lost_final),
+            "lost_margin_mean": _mean_on_mask(margin_68, lost_final),
+            "new_margin_mean": _mean_on_mask(margin_68, new_final),
+            "teacher_map_final_mean": float(teacher_map_final.detach().mean().item()),
+            "teacher_map_final_lceg_mean": _mean_on_mask(teacher_map_final, total_final),
+            "teacher_map_coarse_mean": float(teacher_map_coarse.detach().mean().item()),
+            "teacher_map_coarse_lceg_mean": _mean_on_mask(teacher_map_coarse, total_final),
+        }
+    )
+    return (
+        teacher_map_final,
+        teacher_map_coarse,
+        core_final.detach(),
+        lost_final.detach(),
+        new_final.detach(),
+        stats,
+    )
 
 
 def build_hbns_hard_bg_mask(cfg, batch, logits, teacher_binary, region_masks, device):
@@ -2585,6 +3587,34 @@ def log_ndr_first_batch(logger, image_68, output, pseudo):
         f"[NDR FirstBatch] residual abs mean/max = "
         f"{residual_abs_mean:.8f}/{residual_abs_max:.8f}"
     )
+    if "ndr_v2_shape_alpha_eff" in output:
+        logger.log(f"[NDR-v2 FirstBatch] shape_alpha_eff = {output_scalar(output, 'ndr_v2_shape_alpha_eff'):.8f}")
+        logger.log(f"[NDR-v2 FirstBatch] boundary_band shape = {list(output['boundary_band_68'].shape)}")
+        logger.log(f"[NDR-v2 FirstBatch] edge_norm shape = {list(output['edge_norm_68'].shape)}")
+        logger.log(f"[NDR-v2 FirstBatch] shape_boost shape = {list(output['shape_boost_68'].shape)}")
+        logger.log(
+            "[NDR-v2 FirstBatch] detail_gate_v1/v2 mean = "
+            f"{output_scalar(output, 'ndr_v2_detail_gate_v1_mean'):.8f}/"
+            f"{output_scalar(output, 'ndr_v2_detail_gate_v2_mean'):.8f}"
+        )
+        logger.log(
+            "[NDR-v2 FirstBatch] boundary mean/min/max = "
+            f"{output_scalar(output, 'ndr_v2_boundary_mean'):.8f}/"
+            f"{output_scalar(output, 'ndr_v2_boundary_min'):.8f}/"
+            f"{output_scalar(output, 'ndr_v2_boundary_max'):.8f}"
+        )
+        logger.log(
+            "[NDR-v2 FirstBatch] edge_norm mean/min/max = "
+            f"{output_scalar(output, 'ndr_v2_edge_norm_mean'):.8f}/"
+            f"{output_scalar(output, 'ndr_v2_edge_norm_min'):.8f}/"
+            f"{output_scalar(output, 'ndr_v2_edge_norm_max'):.8f}"
+        )
+        logger.log(
+            "[NDR-v2 FirstBatch] shape_boost mean/min/max = "
+            f"{output_scalar(output, 'ndr_v2_shape_boost_mean'):.8f}/"
+            f"{output_scalar(output, 'ndr_v2_shape_boost_min'):.8f}/"
+            f"{output_scalar(output, 'ndr_v2_shape_boost_max'):.8f}"
+        )
 
 
 def log_tadr_first_batch(logger, output):
@@ -2819,6 +3849,20 @@ def log_cache_summary(logger, cfg, train_dataset):
             logger.log("use_despl_pseudo = False")
             logger.log("use_fixed_in_pseudo = False")
             logger.log("fixed_used_for_training = False")
+    if getattr(cfg, "USE_TCE", False):
+        logger.log(f"TCE cover cache path = {train_dataset.tce_cover_cache_root}")
+        logger.log(f"first TCE cover file = {train_dataset.tce_cover_first_cache_path}")
+        logger.log(f"use_tce = {bool(getattr(cfg, 'USE_TCE', False))}")
+        logger.log(f"tce_version = {getattr(cfg, 'TCE_VERSION', 'v1_temporal_coverage_expansion')}")
+        logger.log(f"tce_cover_epoch = {int(getattr(cfg, 'TCE_COVER_EPOCH', 30))}")
+        logger.log(f"tce_cover_model = {getattr(cfg, 'TCE_COVER_MODEL', 'student')}")
+    if getattr(cfg, "USE_LCEG", False):
+        logger.log(f"LCEG cover cache path = {train_dataset.lceg_cover_cache_root}")
+        logger.log(f"first LCEG cover file = {train_dataset.lceg_cover_first_cache_path}")
+        logger.log(f"use_lceg = {bool(getattr(cfg, 'USE_LCEG', False))}")
+        logger.log(f"lceg_version = {getattr(cfg, 'LCEG_VERSION', 'v1_late_core_extent_guard')}")
+        logger.log(f"lceg_cover_epoch = {int(getattr(cfg, 'LCEG_COVER_EPOCH', 25))}")
+        logger.log(f"lceg_cover_model = {getattr(cfg, 'LCEG_COVER_MODEL', 'student')}")
     if getattr(cfg, "USE_QRA", False):
         logger.log(f"QRA cache path = {train_dataset.qra_cache_root}")
         logger.log(f"first QRA cache file = {train_dataset.qra_first_cache_path}")
@@ -3129,6 +4173,44 @@ def log_first_batch_pseudo(logger, cfg, train_dataset):
             f"{float(batch['pu_unknown'].float().mean().item()):.6f}"
         )
         logger.log(f"first batch pu effective weight sum = {float(pu_weight.sum().item()):.6f}")
+    if getattr(cfg, "USE_TCE", False):
+        cover_prob = batch["tce_cover_prob_68"].float()
+        cover_binary = batch["tce_cover_binary_68"].float()
+        cover_conf = batch["tce_cover_conf_68"].float()
+        logger.log(f"[TCE FirstBatch] USE_TCE = {bool(getattr(cfg, 'USE_TCE', False))}")
+        logger.log(f"[TCE FirstBatch] TCE_VERSION = {getattr(cfg, 'TCE_VERSION', 'v1_temporal_coverage_expansion')}")
+        logger.log(f"[TCE FirstBatch] tce_scale = {get_tce_scale(cfg, 1):.6f}")
+        logger.log(f"[TCE FirstBatch] TCE_COVER_CACHE_ROOT = {getattr(cfg, 'TCE_COVER_CACHE_ROOT', '')}")
+        logger.log(f"[TCE FirstBatch] cover_prob shape = {list(cover_prob.shape)}")
+        logger.log(
+            "[TCE FirstBatch] cover_prob min/mean/max = "
+            f"{float(cover_prob.min().item()):.6f}/"
+            f"{float(cover_prob.mean().item()):.6f}/"
+            f"{float(cover_prob.max().item()):.6f}"
+        )
+        logger.log(f"[TCE FirstBatch] cover_binary area = {float(cover_binary.mean().item()):.6f}")
+        logger.log(f"[TCE FirstBatch] cover_conf mean = {float(cover_conf.mean().item()):.6f}")
+        logger.log("[TCE FirstBatch] lost/new candidate ratio = 0.000000/0.000000 because tce_scale=0")
+    if getattr(cfg, "USE_LCEG", False):
+        cover_prob = batch["lceg_cover_prob_68"].float()
+        cover_binary = batch["lceg_cover_binary_68"].float()
+        cover_conf = batch["lceg_cover_conf_68"].float()
+        cover_area = batch["lceg_cover_area"].float()
+        logger.log(f"[LCEG FirstBatch] USE_LCEG = {bool(getattr(cfg, 'USE_LCEG', False))}")
+        logger.log(f"[LCEG FirstBatch] LCEG_VERSION = {getattr(cfg, 'LCEG_VERSION', 'v1_late_core_extent_guard')}")
+        logger.log(f"[LCEG FirstBatch] lceg_scale = {get_lceg_scale(cfg, 1):.6f}")
+        logger.log(f"[LCEG FirstBatch] LCEG_COVER_CACHE_ROOT = {getattr(cfg, 'LCEG_COVER_CACHE_ROOT', '')}")
+        logger.log(f"[LCEG FirstBatch] cover_prob shape = {list(cover_prob.shape)}")
+        logger.log(
+            "[LCEG FirstBatch] cover_prob min/mean/max = "
+            f"{float(cover_prob.min().item()):.6f}/"
+            f"{float(cover_prob.mean().item()):.6f}/"
+            f"{float(cover_prob.max().item()):.6f}"
+        )
+        logger.log(f"[LCEG FirstBatch] cover_binary area = {float(cover_binary.mean().item()):.6f}")
+        logger.log(f"[LCEG FirstBatch] cover_conf mean = {float(cover_conf.mean().item()):.6f}")
+        logger.log(f"[LCEG FirstBatch] cover_area mean = {float(cover_area.mean().item()):.6f}")
+        logger.log("[LCEG FirstBatch] core/lost/new candidate ratio = 0.000000/0.000000/0.000000 because lceg_scale=0")
 
 
 def init_gkd_epoch_stats():
@@ -4521,6 +5603,21 @@ def main():
                     raise RuntimeError("USE_ESA_ASYM=True currently requires ESA_TOUCH_UNKNOWN=False.")
                 if not bool(getattr(cfg, "ESA_USE_DINO_MARGIN", True)):
                     raise RuntimeError("USE_ESA_ASYM=True requires ESA_USE_DINO_MARGIN=True.")
+            if bool(getattr(cfg, "USE_LCEG", False)):
+                if bool(getattr(cfg, "USE_TCE", False)):
+                    raise RuntimeError("USE_LCEG=True cannot be combined with USE_TCE=True.")
+                if bool(getattr(cfg, "USE_HBNS_LITE", False)) or bool(getattr(cfg, "USE_EPR_POS", False)):
+                    raise RuntimeError("USE_LCEG=True cannot be combined with HBNS-lite or EPR-pos.")
+                if bool(getattr(cfg, "USE_PROTO_CONTRAST", False)):
+                    raise RuntimeError("USE_LCEG=True cannot be combined with proto contrast.")
+                if teacher_target_mode != "binary":
+                    raise RuntimeError("USE_LCEG=True requires binary teacher target in dabe_pu_despl_sched.")
+                if static_target_mode != "soft":
+                    raise RuntimeError("USE_LCEG=True requires DABE-PU static target mode 'soft'.")
+                if bool(getattr(cfg, "LCEG_USE_UNKNOWN", False)):
+                    raise RuntimeError("LCEG-v1 requires LCEG_USE_UNKNOWN=False.")
+                if bool(getattr(cfg, "LCEG_APPLY_TO_BASE_AUX", False)):
+                    raise RuntimeError("LCEG-v1 must not apply to base aux.")
         elif bool(getattr(cfg, "USE_RAST", False)):
             raise RuntimeError("USE_RAST=True requires TEACHER_FUSION_MODE='dabe_pu_despl_sched'.")
         elif bool(getattr(cfg, "USE_HBNS_LITE", False)):
@@ -4529,6 +5626,8 @@ def main():
             raise RuntimeError("USE_EPR_POS=True requires TEACHER_FUSION_MODE='dabe_pu_despl_sched'.")
         elif bool(getattr(cfg, "USE_ESA_ASYM", False)):
             raise RuntimeError("USE_ESA_ASYM=True requires TEACHER_FUSION_MODE='dabe_pu_despl_sched'.")
+        elif bool(getattr(cfg, "USE_LCEG", False)):
+            raise RuntimeError("USE_LCEG=True requires TEACHER_FUSION_MODE='dabe_pu_despl_sched'.")
         if bool(getattr(cfg, "USE_QRA", False)) or bool(getattr(cfg, "USE_CCR", False)):
             raise RuntimeError("USE_DABE_PU=True cannot be combined with USE_QRA=True or USE_CCR=True.")
         if bool(getattr(cfg, "USE_DABE_AWARE_LOSS", False)):
@@ -4541,12 +5640,27 @@ def main():
             raise RuntimeError("USE_DABE_PU=True cannot be combined with proto contrast or multi-view feature.")
         if bool(getattr(cfg, "USE_VIEW_CONSISTENCY", False)) or bool(getattr(cfg, "USE_TADR_ROUTER", False)):
             raise RuntimeError("USE_DABE_PU=True cannot be combined with view consistency or TADR router.")
+        if use_ndr_v2(cfg):
+            if not use_ndr_branch(cfg):
+                raise RuntimeError("USE_NDR_V2=True requires USE_NDR_BRANCH=True.")
+            if not bool(getattr(cfg, "USE_DABE_PU", False)):
+                raise RuntimeError("USE_NDR_V2=True currently requires USE_DABE_PU=True.")
+            if str(getattr(cfg, "TEACHER_FUSION_MODE", "")).lower() != "dabe_pu_despl_sched":
+                raise RuntimeError("USE_NDR_V2=True currently requires TEACHER_FUSION_MODE='dabe_pu_despl_sched'.")
+            if bool(getattr(cfg, "NDR_V2_USE_SHAPE_LOWER_BOUND", False)):
+                version = str(getattr(cfg, "NDR_VERSION", "")).lower()
+                if not version.startswith("v2b"):
+                    raise RuntimeError("NDR_V2_USE_SHAPE_LOWER_BOUND=True is reserved for NDR-v2b configs.")
+            if float(getattr(cfg, "NDR_V2_SHAPE_LOWER_BOUND_WEIGHT", 0.0)) != 0.0:
+                raise RuntimeError("Use NDR_V2_SHAPE_LB_WEIGHT_MAX instead of NDR_V2_SHAPE_LOWER_BOUND_WEIGHT.")
     elif bool(getattr(cfg, "USE_HBNS_LITE", False)):
         raise RuntimeError("USE_HBNS_LITE=True requires USE_DABE_PU=True.")
     elif bool(getattr(cfg, "USE_EPR_POS", False)):
         raise RuntimeError("USE_EPR_POS=True requires USE_DABE_PU=True.")
     elif bool(getattr(cfg, "USE_ESA_ASYM", False)):
         raise RuntimeError("USE_ESA_ASYM=True requires USE_DABE_PU=True.")
+    elif use_ndr_v2(cfg):
+        raise RuntimeError("USE_NDR_V2=True requires USE_DABE_PU=True.")
     if bool(getattr(cfg, "USE_DABE_AWARE_LOSS", False)):
         if not bool(getattr(cfg, "USE_DABE_PSEUDO", False)):
             raise RuntimeError("USE_DABE_AWARE_LOSS=True requires USE_DABE_PSEUDO=True.")
@@ -4820,6 +5934,76 @@ def main():
             logger.log(f"ESA_DETACH_PROTO = {bool(getattr(cfg, 'ESA_DETACH_PROTO', True))}")
             logger.log(f"USE_ESA_DIAGNOSTIC = {bool(getattr(cfg, 'USE_ESA_DIAGNOSTIC', False))}")
             logger.log(f"ESA_DIAG_LOG_INTERVAL_EPOCH = {int(getattr(cfg, 'ESA_DIAG_LOG_INTERVAL_EPOCH', 1))}")
+            logger.log(f"USE_TCE = {bool(getattr(cfg, 'USE_TCE', False))}")
+            logger.log(f"TCE_VERSION = {getattr(cfg, 'TCE_VERSION', 'v1_temporal_coverage_expansion')}")
+            logger.log(f"TCE_COVER_CACHE_ROOT = {getattr(cfg, 'TCE_COVER_CACHE_ROOT', '')}")
+            logger.log(f"TCE_COVER_MODEL = {getattr(cfg, 'TCE_COVER_MODEL', 'student')}")
+            logger.log(f"TCE_COVER_EPOCH = {int(getattr(cfg, 'TCE_COVER_EPOCH', 30))}")
+            logger.log(f"TCE_START_EPOCH = {int(getattr(cfg, 'TCE_START_EPOCH', 31))}")
+            logger.log(f"TCE_RAMP_END_EPOCH = {int(getattr(cfg, 'TCE_RAMP_END_EPOCH', 32))}")
+            logger.log(f"TCE_STOP_EPOCH = {int(getattr(cfg, 'TCE_STOP_EPOCH', 36))}")
+            logger.log(f"TCE_REGION = {getattr(cfg, 'TCE_REGION', 'extent')}")
+            logger.log(f"TCE_USE_UNKNOWN = {bool(getattr(cfg, 'TCE_USE_UNKNOWN', False))}")
+            logger.log(f"TCE_USE_DINO_MARGIN = {bool(getattr(cfg, 'TCE_USE_DINO_MARGIN', True))}")
+            logger.log(f"TCE_LOST_MARGIN_THRESH = {float(getattr(cfg, 'TCE_LOST_MARGIN_THRESH', 0.05)):.6f}")
+            logger.log(f"TCE_NEW_MARGIN_THRESH = {float(getattr(cfg, 'TCE_NEW_MARGIN_THRESH', 0.10)):.6f}")
+            logger.log(f"TCE_COVER_CONF_THRESH = {float(getattr(cfg, 'TCE_COVER_CONF_THRESH', 0.60)):.6f}")
+            logger.log(f"TCE_CURRENT_BG_CONF_MAX = {float(getattr(cfg, 'TCE_CURRENT_BG_CONF_MAX', 0.90)):.6f}")
+            logger.log(f"TCE_NEAR_FG_THRESH = {float(getattr(cfg, 'TCE_NEAR_FG_THRESH', 0.50)):.6f}")
+            logger.log(f"TCE_NEAR_FG_RADIUS = {int(getattr(cfg, 'TCE_NEAR_FG_RADIUS', 3))}")
+            logger.log(f"TCE_EDGE_Q = {float(getattr(cfg, 'TCE_EDGE_Q', 0.60)):.6f}")
+            logger.log(f"TCE_SHRINK_AREA_RATIO = {float(getattr(cfg, 'TCE_SHRINK_AREA_RATIO', 0.90)):.6f}")
+            logger.log(f"TCE_SHRINK_EXTENT_RATIO = {float(getattr(cfg, 'TCE_SHRINK_EXTENT_RATIO', 0.85)):.6f}")
+            logger.log(f"TCE_BG_CORE_TEACHER_FG_MAX = {float(getattr(cfg, 'TCE_BG_CORE_TEACHER_FG_MAX', 0.015)):.6f}")
+            logger.log(f"TCE_LOST_MAX_RATIO_PER_IMAGE = {float(getattr(cfg, 'TCE_LOST_MAX_RATIO_PER_IMAGE', 0.004)):.6f}")
+            logger.log(f"TCE_NEW_MAX_RATIO_PER_IMAGE = {float(getattr(cfg, 'TCE_NEW_MAX_RATIO_PER_IMAGE', 0.002)):.6f}")
+            logger.log(f"TCE_TOTAL_MAX_RATIO_PER_IMAGE = {float(getattr(cfg, 'TCE_TOTAL_MAX_RATIO_PER_IMAGE', 0.005)):.6f}")
+            logger.log(f"TCE_MIN_PIXELS_PER_IMAGE = {int(getattr(cfg, 'TCE_MIN_PIXELS_PER_IMAGE', 4))}")
+            logger.log(f"TCE_LAMBDA_MAX = {float(getattr(cfg, 'TCE_LAMBDA_MAX', 0.010)):.8f}")
+            logger.log(f"TCE_LOST_TARGET_FLOOR = {float(getattr(cfg, 'TCE_LOST_TARGET_FLOOR', 0.45)):.6f}")
+            logger.log(f"TCE_NEW_TARGET_FLOOR = {float(getattr(cfg, 'TCE_NEW_TARGET_FLOOR', 0.35)):.6f}")
+            logger.log(f"TCE_LOST_BG_TEACHER_MULT = {float(getattr(cfg, 'TCE_LOST_BG_TEACHER_MULT', 0.60)):.6f}")
+            logger.log(f"TCE_NEW_BG_TEACHER_MULT = {float(getattr(cfg, 'TCE_NEW_BG_TEACHER_MULT', 0.75)):.6f}")
+            logger.log(f"TCE_APPLY_TO_FINAL = {bool(getattr(cfg, 'TCE_APPLY_TO_FINAL', True))}")
+            logger.log(f"TCE_APPLY_TO_COARSE_AUX = {bool(getattr(cfg, 'TCE_APPLY_TO_COARSE_AUX', False))}")
+            logger.log(f"TCE_APPLY_TO_BASE_AUX = {bool(getattr(cfg, 'TCE_APPLY_TO_BASE_AUX', False))}")
+            logger.log(f"TCE_WEIGHTED_NORMALIZE = {bool(getattr(cfg, 'TCE_WEIGHTED_NORMALIZE', True))}")
+            logger.log(f"USE_TCE_DIAGNOSTIC = {bool(getattr(cfg, 'USE_TCE_DIAGNOSTIC', False))}")
+            logger.log(f"TCE_DIAG_LOG_INTERVAL_EPOCH = {int(getattr(cfg, 'TCE_DIAG_LOG_INTERVAL_EPOCH', 1))}")
+            logger.log(f"USE_LCEG = {bool(getattr(cfg, 'USE_LCEG', False))}")
+            logger.log(f"LCEG_VERSION = {getattr(cfg, 'LCEG_VERSION', 'v1_late_core_extent_guard')}")
+            logger.log(f"LCEG_COVER_CACHE_ROOT = {getattr(cfg, 'LCEG_COVER_CACHE_ROOT', '')}")
+            logger.log(f"LCEG_COVER_MODEL = {getattr(cfg, 'LCEG_COVER_MODEL', 'student')}")
+            logger.log(f"LCEG_COVER_EPOCH = {int(getattr(cfg, 'LCEG_COVER_EPOCH', 25))}")
+            logger.log(f"LCEG_START_EPOCH = {int(getattr(cfg, 'LCEG_START_EPOCH', 26))}")
+            logger.log(f"LCEG_RAMP_END_EPOCH = {int(getattr(cfg, 'LCEG_RAMP_END_EPOCH', 28))}")
+            logger.log(f"LCEG_STOP_EPOCH = {int(getattr(cfg, 'LCEG_STOP_EPOCH', 36))}")
+            logger.log(f"LCEG_USE_CORE_GUARD = {bool(getattr(cfg, 'LCEG_USE_CORE_GUARD', True))}")
+            logger.log(f"LCEG_USE_LOST_EXTENT = {bool(getattr(cfg, 'LCEG_USE_LOST_EXTENT', True))}")
+            logger.log(f"LCEG_USE_NEW_BOUNDARY = {bool(getattr(cfg, 'LCEG_USE_NEW_BOUNDARY', True))}")
+            logger.log(f"LCEG_USE_UNKNOWN = {bool(getattr(cfg, 'LCEG_USE_UNKNOWN', False))}")
+            logger.log(f"LCEG_USE_DINO_MARGIN = {bool(getattr(cfg, 'LCEG_USE_DINO_MARGIN', True))}")
+            logger.log(f"LCEG_LOST_MARGIN_THRESH = {float(getattr(cfg, 'LCEG_LOST_MARGIN_THRESH', -0.02)):.6f}")
+            logger.log(f"LCEG_NEW_MARGIN_THRESH = {float(getattr(cfg, 'LCEG_NEW_MARGIN_THRESH', 0.05)):.6f}")
+            logger.log(f"LCEG_LOST_COVER_PROB_THRESH = {float(getattr(cfg, 'LCEG_LOST_COVER_PROB_THRESH', 0.40)):.6f}")
+            logger.log(f"LCEG_NEW_COVER_PROB_MAX = {float(getattr(cfg, 'LCEG_NEW_COVER_PROB_MAX', 0.40)):.6f}")
+            logger.log(f"LCEG_CURRENT_BG_CONF_MAX_CORE = {float(getattr(cfg, 'LCEG_CURRENT_BG_CONF_MAX_CORE', 0.98)):.6f}")
+            logger.log(f"LCEG_CURRENT_BG_CONF_MAX_EXTENT = {float(getattr(cfg, 'LCEG_CURRENT_BG_CONF_MAX_EXTENT', 0.95)):.6f}")
+            logger.log(f"LCEG_CORE_MAX_RATIO_PER_IMAGE = {float(getattr(cfg, 'LCEG_CORE_MAX_RATIO_PER_IMAGE', 0.010)):.6f}")
+            logger.log(f"LCEG_LOST_MAX_RATIO_PER_IMAGE = {float(getattr(cfg, 'LCEG_LOST_MAX_RATIO_PER_IMAGE', 0.010)):.6f}")
+            logger.log(f"LCEG_NEW_MAX_RATIO_PER_IMAGE = {float(getattr(cfg, 'LCEG_NEW_MAX_RATIO_PER_IMAGE', 0.003)):.6f}")
+            logger.log(f"LCEG_TOTAL_MAX_RATIO_PER_IMAGE = {float(getattr(cfg, 'LCEG_TOTAL_MAX_RATIO_PER_IMAGE', 0.020)):.6f}")
+            logger.log(f"LCEG_MIN_PIXELS_PER_IMAGE = {int(getattr(cfg, 'LCEG_MIN_PIXELS_PER_IMAGE', 4))}")
+            logger.log(f"LCEG_CORE_TARGET_FLOOR = {float(getattr(cfg, 'LCEG_CORE_TARGET_FLOOR', 0.55)):.6f}")
+            logger.log(f"LCEG_LOST_TARGET_FLOOR = {float(getattr(cfg, 'LCEG_LOST_TARGET_FLOOR', 0.45)):.6f}")
+            logger.log(f"LCEG_NEW_TARGET_FLOOR = {float(getattr(cfg, 'LCEG_NEW_TARGET_FLOOR', 0.35)):.6f}")
+            logger.log(f"LCEG_LAMBDA_MAX = {float(getattr(cfg, 'LCEG_LAMBDA_MAX', 0.020)):.8f}")
+            logger.log(f"LCEG_APPLY_TO_FINAL = {bool(getattr(cfg, 'LCEG_APPLY_TO_FINAL', True))}")
+            logger.log(f"LCEG_APPLY_TO_COARSE_AUX = {bool(getattr(cfg, 'LCEG_APPLY_TO_COARSE_AUX', True))}")
+            logger.log(f"LCEG_APPLY_TO_BASE_AUX = {bool(getattr(cfg, 'LCEG_APPLY_TO_BASE_AUX', False))}")
+            logger.log(f"LCEG_COARSE_LOSS_WEIGHT = {float(getattr(cfg, 'LCEG_COARSE_LOSS_WEIGHT', 0.50)):.6f}")
+            logger.log(f"USE_LCEG_DIAGNOSTIC = {bool(getattr(cfg, 'USE_LCEG_DIAGNOSTIC', False))}")
+            logger.log(f"LCEG_DIAG_LOG_INTERVAL_EPOCH = {int(getattr(cfg, 'LCEG_DIAG_LOG_INTERVAL_EPOCH', 1))}")
         if str(getattr(cfg, "TEACHER_FUSION_MODE", "")).lower() == "dabe_pu_balanced_v2":
             logger.log(f"USE_DABE_PU = {bool(getattr(cfg, 'USE_DABE_PU', False))}")
             logger.log(f"DABE_PU_VERSION = {getattr(cfg, 'DABE_PU_VERSION', 'pu_v11')}")
@@ -4984,6 +6168,44 @@ def main():
             logger.log(f"LAMBDA_NDR_COARSE_AUX = {float(getattr(cfg, 'LAMBDA_NDR_COARSE_AUX', 0.0)):.6f}")
             logger.log(f"NDR_USE_RES_REG = {bool(getattr(cfg, 'NDR_USE_RES_REG', False))}")
             logger.log(f"NDR_RES_REG_WEIGHT = {float(getattr(cfg, 'NDR_RES_REG_WEIGHT', 0.0)):.6f}")
+            logger.log(f"USE_NDR_V2 = {bool(getattr(cfg, 'USE_NDR_V2', False))}")
+            logger.log(f"NDR_VERSION = {getattr(cfg, 'NDR_VERSION', 'v1')}")
+            logger.log(f"NDR_V2_USE_SHAPE_GATE = {bool(getattr(cfg, 'NDR_V2_USE_SHAPE_GATE', False))}")
+            logger.log(f"NDR_V2_SHAPE_GATE_MODE = {getattr(cfg, 'NDR_V2_SHAPE_GATE_MODE', 'soft_boundary_edge_boost')}")
+            logger.log(f"NDR_V2_BOUNDARY_SOURCE = {getattr(cfg, 'NDR_V2_BOUNDARY_SOURCE', 'coarse_prob')}")
+            logger.log(f"NDR_V2_BOUNDARY_RADIUS = {int(getattr(cfg, 'NDR_V2_BOUNDARY_RADIUS', 2))}")
+            logger.log(f"NDR_V2_BOUNDARY_DETACH = {bool(getattr(cfg, 'NDR_V2_BOUNDARY_DETACH', True))}")
+            logger.log(f"NDR_V2_BOUNDARY_SOFT = {bool(getattr(cfg, 'NDR_V2_BOUNDARY_SOFT', True))}")
+            logger.log(f"NDR_V2_SHAPE_ALPHA_MAX = {float(getattr(cfg, 'NDR_V2_SHAPE_ALPHA_MAX', 0.20)):.6f}")
+            logger.log(f"NDR_V2_SHAPE_EDGE_MIX = {float(getattr(cfg, 'NDR_V2_SHAPE_EDGE_MIX', 0.50)):.6f}")
+            logger.log(f"NDR_V2_SHAPE_UNCERT_MIX = {float(getattr(cfg, 'NDR_V2_SHAPE_UNCERT_MIX', 0.50)):.6f}")
+            logger.log(f"NDR_V2_GATE_COMBINE = {getattr(cfg, 'NDR_V2_GATE_COMBINE', 'add_clamp')}")
+            logger.log(f"NDR_V2_USE_SHAPE_LOWER_BOUND = {bool(getattr(cfg, 'NDR_V2_USE_SHAPE_LOWER_BOUND', False))}")
+            logger.log(f"NDR_V2_SHAPE_LB_START_EPOCH = {int(getattr(cfg, 'NDR_V2_SHAPE_LB_START_EPOCH', 36))}")
+            logger.log(f"NDR_V2_SHAPE_LB_RAMP_END_EPOCH = {int(getattr(cfg, 'NDR_V2_SHAPE_LB_RAMP_END_EPOCH', 38))}")
+            logger.log(f"NDR_V2_SHAPE_LB_STOP_EPOCH = {int(getattr(cfg, 'NDR_V2_SHAPE_LB_STOP_EPOCH', 46))}")
+            logger.log(f"NDR_V2_SHAPE_LB_WEIGHT_MAX = {float(getattr(cfg, 'NDR_V2_SHAPE_LB_WEIGHT_MAX', 0.0)):.8f}")
+            logger.log(f"NDR_V2_SHAPE_LB_FLOOR = {float(getattr(cfg, 'NDR_V2_SHAPE_LB_FLOOR', 0.35)):.6f}")
+            logger.log(f"NDR_V2_SHAPE_LB_MAX_RATIO_PER_IMAGE = {float(getattr(cfg, 'NDR_V2_SHAPE_LB_MAX_RATIO_PER_IMAGE', 0.005)):.6f}")
+            logger.log(f"NDR_V2_SHAPE_LB_WEIGHTED_NORMALIZE = {bool(getattr(cfg, 'NDR_V2_SHAPE_LB_WEIGHTED_NORMALIZE', True))}")
+            logger.log(f"NDR_V2_SHAPE_LB_USE_EXTENT = {bool(getattr(cfg, 'NDR_V2_SHAPE_LB_USE_EXTENT', True))}")
+            logger.log(f"NDR_V2_SHAPE_LB_USE_UNKNOWN = {bool(getattr(cfg, 'NDR_V2_SHAPE_LB_USE_UNKNOWN', False))}")
+            logger.log(f"NDR_V2_SHAPE_LB_REQUIRE_TEACHER_BG = {bool(getattr(cfg, 'NDR_V2_SHAPE_LB_REQUIRE_TEACHER_BG', True))}")
+            logger.log(f"NDR_V2_USE_BG_RES_LOCK = {bool(getattr(cfg, 'NDR_V2_USE_BG_RES_LOCK', False))}")
+            logger.log(f"NDR_V2_BG_LOCK_WEIGHT = {float(getattr(cfg, 'NDR_V2_BG_LOCK_WEIGHT', 0.0)):.8f}")
+            logger.log(f"NDR_V2_BG_RES_LOCK_START_EPOCH = {int(getattr(cfg, 'NDR_V2_BG_RES_LOCK_START_EPOCH', 1))}")
+            logger.log(f"NDR_V2_BG_RES_LOCK_RAMP_END_EPOCH = {int(getattr(cfg, 'NDR_V2_BG_RES_LOCK_RAMP_END_EPOCH', 1))}")
+            logger.log(f"NDR_V2_BG_RES_LOCK_STOP_EPOCH = {int(getattr(cfg, 'NDR_V2_BG_RES_LOCK_STOP_EPOCH', int(getattr(cfg, 'MAX_EPOCH', 25)) + 1))}")
+            logger.log(f"NDR_V2_BG_RES_LOCK_WEIGHT_MAX = {float(getattr(cfg, 'NDR_V2_BG_RES_LOCK_WEIGHT_MAX', getattr(cfg, 'NDR_V2_BG_LOCK_WEIGHT', 0.0))):.8f}")
+            logger.log(f"NDR_V2_USE_BG_PROB_LOCK = {bool(getattr(cfg, 'NDR_V2_USE_BG_PROB_LOCK', False))}")
+            logger.log(f"NDR_V2_BG_PROB_LOCK_START_EPOCH = {int(getattr(cfg, 'NDR_V2_BG_PROB_LOCK_START_EPOCH', 36))}")
+            logger.log(f"NDR_V2_BG_PROB_LOCK_RAMP_END_EPOCH = {int(getattr(cfg, 'NDR_V2_BG_PROB_LOCK_RAMP_END_EPOCH', 38))}")
+            logger.log(f"NDR_V2_BG_PROB_LOCK_STOP_EPOCH = {int(getattr(cfg, 'NDR_V2_BG_PROB_LOCK_STOP_EPOCH', 46))}")
+            logger.log(f"NDR_V2_BG_PROB_LOCK_WEIGHT_MAX = {float(getattr(cfg, 'NDR_V2_BG_PROB_LOCK_WEIGHT_MAX', 0.0)):.8f}")
+            logger.log(f"NDR_V2_BG_PROB_LOCK_DELTA = {float(getattr(cfg, 'NDR_V2_BG_PROB_LOCK_DELTA', 0.02)):.6f}")
+            logger.log(f"NDR_V2_BG_CORE_THRESH = {float(getattr(cfg, 'NDR_V2_BG_CORE_THRESH', 0.5)):.6f}")
+            logger.log(f"NDR_V2_LOW_TARGET_THRESH = {float(getattr(cfg, 'NDR_V2_LOW_TARGET_THRESH', getattr(cfg, 'NDR_V2_BG_LOCK_TARGET_THRESH', 0.15))):.6f}")
+            logger.log(f"NDR_V2_LOW_TARGET_WEIGHT_THRESH = {float(getattr(cfg, 'NDR_V2_LOW_TARGET_WEIGHT_THRESH', getattr(cfg, 'NDR_V2_BG_LOCK_WEIGHT_THRESH', 0.50))):.6f}")
             logger.log(f"USE_TADR_ROUTER = {bool(getattr(cfg, 'USE_TADR_ROUTER', False))}")
             if use_tadr_router(cfg):
                 logger.log(f"TADR_ROUTER_IN_CHANNELS = {int(getattr(cfg, 'TADR_ROUTER_IN_CHANNELS', 4))}")
@@ -5220,6 +6442,8 @@ def main():
         use_epr_pos = bool(getattr(cfg, "USE_EPR_POS", False)) and use_dabe_pu_despl_sched
         use_esa_asym = bool(getattr(cfg, "USE_ESA_ASYM", False)) and use_dabe_pu_despl_sched
         use_esa_diagnostic = bool(getattr(cfg, "USE_ESA_DIAGNOSTIC", False)) and use_dabe_pu_despl_sched
+        use_tce = bool(getattr(cfg, "USE_TCE", False)) and use_dabe_pu_despl_sched
+        use_lceg = bool(getattr(cfg, "USE_LCEG", False)) and use_dabe_pu_despl_sched
         dabe_pu_despl_teacher_target_mode = (
             get_dabe_pu_despl_teacher_target_mode(cfg) if use_dabe_pu_despl_sched else "binary"
         )
@@ -5250,6 +6474,30 @@ def main():
                 raise RuntimeError("USE_PURE_DESPL_SUPERVISION=True cannot be combined with QRA, CCR, or DRE++.")
         if use_fast_teacher_fusion and teacher_fusion_mode != "fast_t10":
             raise RuntimeError("USE_FAST_TEACHER_FUSION=True currently supports TEACHER_FUSION_MODE='fast_t10' only.")
+        if bool(getattr(cfg, "USE_TCE", False)):
+            if not use_dabe_pu_despl_sched:
+                raise RuntimeError("USE_TCE=True requires TEACHER_FUSION_MODE='dabe_pu_despl_sched'.")
+            if dabe_pu_despl_teacher_target_mode != "binary":
+                raise RuntimeError("USE_TCE=True requires binary full teacher target.")
+            if dabe_pu_despl_static_target_mode != "soft":
+                raise RuntimeError("USE_TCE=True requires DABE_PU_STATIC_TARGET_MODE='soft'.")
+            if use_hbns_lite or use_epr_pos or use_proto:
+                raise RuntimeError("USE_TCE=True cannot be combined with HBNS-lite, EPR-pos, or proto contrast.")
+            if str(getattr(cfg, "TCE_REGION", "extent")).lower() != "extent":
+                raise RuntimeError("TCE-v1 currently supports TCE_REGION='extent' only.")
+        if bool(getattr(cfg, "USE_LCEG", False)):
+            if not use_dabe_pu_despl_sched:
+                raise RuntimeError("USE_LCEG=True requires TEACHER_FUSION_MODE='dabe_pu_despl_sched'.")
+            if dabe_pu_despl_teacher_target_mode != "binary":
+                raise RuntimeError("USE_LCEG=True requires binary full teacher target.")
+            if dabe_pu_despl_static_target_mode != "soft":
+                raise RuntimeError("USE_LCEG=True requires DABE_PU_STATIC_TARGET_MODE='soft'.")
+            if bool(getattr(cfg, "USE_TCE", False)) or use_hbns_lite or use_epr_pos or use_proto:
+                raise RuntimeError("USE_LCEG=True cannot be combined with TCE, HBNS-lite, EPR-pos, or proto contrast.")
+            if bool(getattr(cfg, "LCEG_USE_UNKNOWN", False)):
+                raise RuntimeError("LCEG-v1 requires LCEG_USE_UNKNOWN=False.")
+            if bool(getattr(cfg, "LCEG_APPLY_TO_BASE_AUX", False)):
+                raise RuntimeError("LCEG-v1 must not apply to base aux.")
         if use_hflip_mv and use_ml_feature:
             raise RuntimeError("HFlip multi-view consistency currently supports single-level cached DINO features only.")
         if use_hflip_mv and not (bool(getattr(cfg, "USE_VIEW_CONSISTENCY", False)) or use_proto):
@@ -5376,6 +6624,18 @@ def main():
             logger.log(f"[Cache] DABE-PU cache ready | {dabe_pu_reason}")
         else:
             ensure_cache_available(cfg, "pseudo", logger=logger.log)
+        if use_tce:
+            _, tce_reason = check_tce_cover_cache(
+                cfg,
+                max_samples=sample_limit if sample_limit >= 0 else None,
+            )
+            logger.log(f"[Cache] TCE cover cache ready | {tce_reason}")
+        if use_lceg:
+            _, lceg_reason = check_lceg_cover_cache(
+                cfg,
+                max_samples=sample_limit if sample_limit >= 0 else None,
+            )
+            logger.log(f"[Cache] LCEG cover cache ready | {lceg_reason}")
         if use_qra:
             _, qra_reason = check_qra_cache(
                 cfg,
@@ -5420,6 +6680,7 @@ def main():
         dagp_first_batch_logged = False
         dagp_safe_first_batch_logged = False
         ndr_first_batch_logged = False
+        ndr_v2_bg_lock_first_batch_logged = False
         tadr_first_batch_logged = False
         mvflip_first_batch_logged = False
         mvproto_first_batch_logged = False
@@ -5427,6 +6688,8 @@ def main():
         hbns_first_batch_logged = False
         epr_first_batch_logged = False
         esa_asym_first_batch_logged = False
+        tce_train_first_batch_logged = False
+        lceg_train_first_batch_logged = False
         lr_floor_activated_logged = False
         gkd_first_batch_path = train_dir / "gkd_first_batch.csv"
         gkd_audit_csv_path = train_dir / "gkd_audit_epoch.csv"
@@ -5646,6 +6909,63 @@ def main():
             esa_teacher_loss_extent_sum = 0.0
             esa_teacher_loss_unknown_sum = 0.0
             esa_stat_batches = 0
+            tce_scale_sum = 0.0
+            tce_lambda_sum = 0.0
+            tce_cover_area_sum = 0.0
+            tce_current_area_sum = 0.0
+            tce_shrink_gate_ratio_sum = 0.0
+            tce_bg_safe_gate_ratio_sum = 0.0
+            tce_image_gate_ratio_sum = 0.0
+            tce_lost_raw_ratio_sum = 0.0
+            tce_lost_capped_ratio_sum = 0.0
+            tce_new_raw_ratio_sum = 0.0
+            tce_new_capped_ratio_sum = 0.0
+            tce_total_ratio_sum = 0.0
+            tce_valid_image_ratio_sum = 0.0
+            tce_lost_margin_mean_sum = 0.0
+            tce_new_margin_mean_sum = 0.0
+            tce_lost_cover_conf_mean_sum = 0.0
+            tce_current_teacher_conf_lost_mean_sum = 0.0
+            tce_current_teacher_conf_new_mean_sum = 0.0
+            tce_teacher_map_final_mean_sum = 0.0
+            tce_teacher_map_final_tce_mean_sum = 0.0
+            tce_loss_sum = 0.0
+            tce_skipped_no_fg_proto_sum = 0
+            tce_skipped_no_bg_proto_sum = 0
+            tce_stat_batches = 0
+            lceg_scale_sum = 0.0
+            lceg_lambda_sum = 0.0
+            lceg_cover_area_sum = 0.0
+            lceg_current_area_sum = 0.0
+            lceg_current_fg_extent_ratio_sum = 0.0
+            lceg_cover_fg_extent_ratio_sum = 0.0
+            lceg_shrink_gate_ratio_sum = 0.0
+            lceg_bg_safe_gate_ratio_sum = 0.0
+            lceg_core_raw_ratio_sum = 0.0
+            lceg_core_capped_ratio_sum = 0.0
+            lceg_lost_raw_ratio_sum = 0.0
+            lceg_lost_capped_ratio_sum = 0.0
+            lceg_new_raw_ratio_sum = 0.0
+            lceg_new_capped_ratio_sum = 0.0
+            lceg_total_ratio_sum = 0.0
+            lceg_valid_image_ratio_sum = 0.0
+            lceg_core_conf_mean_sum = 0.0
+            lceg_lost_cover_prob_mean_sum = 0.0
+            lceg_lost_margin_mean_sum = 0.0
+            lceg_new_margin_mean_sum = 0.0
+            lceg_teacher_map_final_mean_sum = 0.0
+            lceg_teacher_map_final_lceg_mean_sum = 0.0
+            lceg_teacher_map_coarse_mean_sum = 0.0
+            lceg_teacher_map_coarse_lceg_mean_sum = 0.0
+            lceg_loss_core_sum = 0.0
+            lceg_loss_lost_sum = 0.0
+            lceg_loss_new_sum = 0.0
+            lceg_loss_final_sum = 0.0
+            lceg_loss_coarse_sum = 0.0
+            lceg_loss_sum = 0.0
+            lceg_skipped_no_fg_proto_sum = 0
+            lceg_skipped_no_bg_proto_sum = 0
+            lceg_stat_batches = 0
             dre_safe_p_base_area_sum = 0.0
             dre_safe_p_safe_area_sum = 0.0
             dre_safe_candidate_ratio_sum = 0.0
@@ -5671,6 +6991,8 @@ def main():
             drepp_beta_epoch = 0.0
             total_local_loss = 0.0
             total_aux_base_loss = 0.0
+            total_ndr_v2_bg_lock_loss = 0.0
+            total_ndr_v2_weighted_loss = 0.0
             mlc_context_scale_sum = 0.0
             mlc_base_abs_sum = 0.0
             mlc_context_abs_sum = 0.0
@@ -5703,6 +7025,37 @@ def main():
             ndr_residual_abs_mean_sum = 0.0
             ndr_residual_abs_max = None
             ndr_stat_batches = 0
+            ndr_v2_shape_alpha_sum = 0.0
+            ndr_v2_gate_v1_mean_sum = 0.0
+            ndr_v2_gate_v2_mean_sum = 0.0
+            ndr_v2_boundary_mean_sum = 0.0
+            ndr_v2_boundary_min = None
+            ndr_v2_boundary_max = None
+            ndr_v2_edge_norm_mean_sum = 0.0
+            ndr_v2_shape_boost_mean_sum = 0.0
+            ndr_v2_shape_boost_max = None
+            ndr_v2_shape_lb_scale_sum = 0.0
+            ndr_v2_shape_lb_lambda_sum = 0.0
+            ndr_v2_shape_candidate_raw_ratio_sum = 0.0
+            ndr_v2_shape_candidate_capped_ratio_sum = 0.0
+            ndr_v2_shape_valid_image_ratio_sum = 0.0
+            ndr_v2_shape_margin_mean_sum = 0.0
+            ndr_v2_shape_edge_mean_sum = 0.0
+            ndr_v2_shape_under_floor_mean_sum = 0.0
+            ndr_v2_loss_shape_lb_sum = 0.0
+            ndr_v2_bg_res_lock_scale_sum = 0.0
+            ndr_v2_bg_res_lock_lambda_sum = 0.0
+            ndr_v2_bg_prob_lock_scale_sum = 0.0
+            ndr_v2_bg_prob_lock_lambda_sum = 0.0
+            ndr_v2_bg_lock_area_sum = 0.0
+            ndr_v2_bg_core_area_sum = 0.0
+            ndr_v2_low_target_bg_area_sum = 0.0
+            ndr_v2_positive_delta_bg_mean_sum = 0.0
+            ndr_v2_positive_delta_bg_max = None
+            ndr_v2_loss_bg_lock_sum = 0.0
+            ndr_v2_loss_bg_prob_lock_sum = 0.0
+            ndr_v2_weighted_loss_sum = 0.0
+            ndr_v2_stat_batches = 0
             tadr_router_mean_sum = 0.0
             tadr_router_min = None
             tadr_router_max = None
@@ -6063,6 +7416,160 @@ def main():
                         )
                         esa_asym_first_batch_logged = True
 
+                tce_teacher_map_final = None
+                tce_lost_mask = torch.zeros_like(student_logits, dtype=torch.bool)
+                tce_new_mask = torch.zeros_like(student_logits, dtype=torch.bool)
+                tce_stats = {
+                    "tce_scale": 0.0,
+                    "lambda_tce_eff": 0.0,
+                    "cover_area_mean": 0.0,
+                    "current_area_mean": 0.0,
+                    "shrink_gate_ratio": 0.0,
+                    "bg_safe_gate_ratio": 0.0,
+                    "image_gate_ratio": 0.0,
+                    "lost_raw_ratio": 0.0,
+                    "lost_capped_ratio": 0.0,
+                    "new_raw_ratio": 0.0,
+                    "new_capped_ratio": 0.0,
+                    "tce_total_ratio": 0.0,
+                    "tce_valid_image_ratio": 0.0,
+                    "lost_margin_mean": 0.0,
+                    "new_margin_mean": 0.0,
+                    "lost_cover_conf_mean": 0.0,
+                    "current_teacher_conf_lost_mean": 0.0,
+                    "current_teacher_conf_new_mean": 0.0,
+                    "teacher_map_final_mean": 1.0,
+                    "teacher_map_final_tce_mean": 1.0,
+                    "loss_tce": 0.0,
+                    "tce_skipped_no_fg_proto": 0,
+                    "tce_skipped_no_bg_proto": 0,
+                }
+                loss_tce_final = student_logits.sum() * 0.0
+                if use_tce:
+                    tce_teacher_map_final, tce_lost_mask, tce_new_mask, tce_stats = build_tce_masks_and_teacher_map(
+                        cfg,
+                        batch,
+                        student_logits,
+                        teacher_prob,
+                        teacher_binary,
+                        rast_teacher_map_eff,
+                        epoch,
+                        device,
+                        image_68=image_68,
+                    )
+                    loss_tce_final = tce_lower_bound_loss_for_logits(
+                        student_logits,
+                        tce_lost_mask,
+                        tce_new_mask,
+                        cfg,
+                    )
+                    tce_stats["loss_tce"] = float(loss_tce_final.detach().item())
+                    if not tce_train_first_batch_logged:
+                        logger.log(f"[TCE Train FirstBatch] USE_TCE = {bool(getattr(cfg, 'USE_TCE', False))}")
+                        logger.log(f"[TCE Train FirstBatch] TCE_VERSION = {getattr(cfg, 'TCE_VERSION', 'v1_temporal_coverage_expansion')}")
+                        logger.log(f"[TCE Train FirstBatch] tce_scale = {float(tce_stats['tce_scale']):.8f}")
+                        logger.log(f"[TCE Train FirstBatch] lambda_tce_eff = {float(tce_stats['lambda_tce_eff']):.8f}")
+                        logger.log(f"[TCE Train FirstBatch] tce_candidate shape = {list(tce_lost_mask.shape)}")
+                        logger.log(
+                            "[TCE Train FirstBatch] lost/new candidate ratio = "
+                            f"{float(tce_stats['lost_capped_ratio']):.6f}/"
+                            f"{float(tce_stats['new_capped_ratio']):.6f}"
+                        )
+                        logger.log(
+                            "[TCE Train FirstBatch] teacher_map_final mean/tce_mean = "
+                            f"{float(tce_stats['teacher_map_final_mean']):.6f}/"
+                            f"{float(tce_stats['teacher_map_final_tce_mean']):.6f}"
+                        )
+                        tce_train_first_batch_logged = True
+
+                lceg_teacher_map_final = None
+                lceg_teacher_map_coarse = None
+                lceg_core_mask = torch.zeros_like(student_logits, dtype=torch.bool)
+                lceg_lost_mask = torch.zeros_like(student_logits, dtype=torch.bool)
+                lceg_new_mask = torch.zeros_like(student_logits, dtype=torch.bool)
+                lceg_stats = {
+                    "lceg_scale": 0.0,
+                    "lambda_lceg_eff": 0.0,
+                    "cover_area_mean": 0.0,
+                    "cover_binary_area_mean": 0.0,
+                    "cover_conf_mean": 0.0,
+                    "current_area_mean": 0.0,
+                    "current_fg_extent_ratio": 0.0,
+                    "cover_fg_extent_ratio": 0.0,
+                    "shrink_gate_ratio": 0.0,
+                    "bg_safe_gate_ratio": 0.0,
+                    "core_raw_ratio": 0.0,
+                    "core_capped_ratio": 0.0,
+                    "lost_raw_ratio": 0.0,
+                    "lost_capped_ratio": 0.0,
+                    "new_raw_ratio": 0.0,
+                    "new_capped_ratio": 0.0,
+                    "lceg_total_ratio": 0.0,
+                    "lceg_valid_image_ratio": 0.0,
+                    "core_conf_mean": 0.0,
+                    "lost_cover_prob_mean": 0.0,
+                    "lost_margin_mean": 0.0,
+                    "new_margin_mean": 0.0,
+                    "teacher_map_final_mean": 1.0,
+                    "teacher_map_final_lceg_mean": 1.0,
+                    "teacher_map_coarse_mean": 1.0,
+                    "teacher_map_coarse_lceg_mean": 1.0,
+                    "lceg_skipped_no_fg_proto": 0,
+                    "lceg_skipped_no_bg_proto": 0,
+                }
+                loss_lceg_final = student_logits.sum() * 0.0
+                loss_lceg_coarse = student_logits.sum() * 0.0
+                loss_lceg = student_logits.sum() * 0.0
+                loss_lceg_final_parts = {
+                    "core": student_logits.sum() * 0.0,
+                    "lost": student_logits.sum() * 0.0,
+                    "new": student_logits.sum() * 0.0,
+                }
+                if use_lceg:
+                    (
+                        lceg_teacher_map_final,
+                        lceg_teacher_map_coarse,
+                        lceg_core_mask,
+                        lceg_lost_mask,
+                        lceg_new_mask,
+                        lceg_stats,
+                    ) = build_lceg_masks_and_teacher_maps(
+                        cfg,
+                        batch,
+                        student_logits,
+                        teacher_prob,
+                        teacher_binary,
+                        rast_teacher_map_eff,
+                        epoch,
+                        device,
+                        image_68=image_68,
+                    )
+                    loss_lceg_final, loss_lceg_final_parts = lceg_lower_bound_loss_for_logits(
+                        student_logits,
+                        lceg_core_mask,
+                        lceg_lost_mask,
+                        lceg_new_mask,
+                        cfg,
+                    )
+                    if not lceg_train_first_batch_logged:
+                        logger.log(f"[LCEG Train FirstBatch] USE_LCEG = {bool(getattr(cfg, 'USE_LCEG', False))}")
+                        logger.log(f"[LCEG Train FirstBatch] LCEG_VERSION = {getattr(cfg, 'LCEG_VERSION', 'v1_late_core_extent_guard')}")
+                        logger.log(f"[LCEG Train FirstBatch] lceg_scale = {float(lceg_stats['lceg_scale']):.8f}")
+                        logger.log(f"[LCEG Train FirstBatch] lambda_lceg_eff = {float(lceg_stats['lambda_lceg_eff']):.8f}")
+                        logger.log(f"[LCEG Train FirstBatch] lceg_candidate shape = {list(lceg_core_mask.shape)}")
+                        logger.log(
+                            "[LCEG Train FirstBatch] core/lost/new candidate ratio = "
+                            f"{float(lceg_stats['core_capped_ratio']):.6f}/"
+                            f"{float(lceg_stats['lost_capped_ratio']):.6f}/"
+                            f"{float(lceg_stats['new_capped_ratio']):.6f}"
+                        )
+                        logger.log(
+                            "[LCEG Train FirstBatch] teacher_map final/coarse lceg mean = "
+                            f"{float(lceg_stats['teacher_map_final_lceg_mean']):.6f}/"
+                            f"{float(lceg_stats['teacher_map_coarse_lceg_mean']):.6f}"
+                        )
+                        lceg_train_first_batch_logged = True
+
                 fixed_target = pseudo_68
                 if use_ccr:
                     fixed_target = batch["ccr_p_corr"].to(device, non_blocking=True).float()
@@ -6393,15 +7900,32 @@ def main():
                             pu_static_weight_map,
                             eps=eps,
                         )
-                        loss_pu_teacher_final = rast_teacher_bce_with_logits(
-                            student_logits,
-                            teacher_full_target,
-                            rast_teacher_map_eff,
-                            cfg,
-                            rast_stats["rast_scale"],
-                            apply_to_loss=bool(getattr(cfg, "RAST_APPLY_TO_FINAL", True)),
-                            eps=eps,
-                        )
+                        if lceg_teacher_map_final is not None and bool(getattr(cfg, "LCEG_APPLY_TO_FINAL", True)):
+                            loss_pu_teacher_final = lceg_teacher_bce_with_logits(
+                                student_logits,
+                                teacher_full_target,
+                                lceg_teacher_map_final,
+                                cfg,
+                                eps=eps,
+                            )
+                        elif tce_teacher_map_final is not None and bool(getattr(cfg, "TCE_APPLY_TO_FINAL", True)):
+                            loss_pu_teacher_final = tce_teacher_bce_with_logits(
+                                student_logits,
+                                teacher_full_target,
+                                tce_teacher_map_final,
+                                cfg,
+                                eps=eps,
+                            )
+                        else:
+                            loss_pu_teacher_final = rast_teacher_bce_with_logits(
+                                student_logits,
+                                teacher_full_target,
+                                rast_teacher_map_eff,
+                                cfg,
+                                rast_stats["rast_scale"],
+                                apply_to_loss=bool(getattr(cfg, "RAST_APPLY_TO_FINAL", True)),
+                                eps=eps,
+                            )
                         pu_static_loss_weight, pu_teacher_loss_weight = get_dabe_pu_despl_schedule(epoch, cfg)
                         loss_pu_static_group = loss_pu_static_final
                         loss_pu_teacher_group = loss_pu_teacher_final
@@ -6461,6 +7985,37 @@ def main():
                 loss_aux_base = student_logits.sum() * 0.0
                 loss_ndr_coarse_aux = student_logits.sum() * 0.0
                 loss_ndr_res_reg = student_logits.sum() * 0.0
+                loss_ndr_v2_shape_lb = student_logits.sum() * 0.0
+                loss_ndr_v2_bg_lock = student_logits.sum() * 0.0
+                loss_ndr_v2_bg_prob_lock = student_logits.sum() * 0.0
+                loss_ndr_v2_weighted = student_logits.sum() * 0.0
+                ndr_v2_shape_stats = {
+                    "shape_lb_scale": 0.0,
+                    "lambda_shape_lb_eff": 0.0,
+                    "shape_candidate_raw_ratio": 0.0,
+                    "shape_candidate_capped_ratio": 0.0,
+                    "shape_valid_image_ratio": 0.0,
+                    "shape_margin_mean": 0.0,
+                    "shape_edge_mean": 0.0,
+                    "shape_under_floor_mean": 0.0,
+                    "shape_lb_skipped_no_fg_proto": 0,
+                    "shape_lb_skipped_no_bg_proto": 0,
+                }
+                ndr_v2_shape_candidate = torch.zeros_like(student_logits, dtype=torch.bool)
+                ndr_v2_bg_lock_stats = {
+                    "bg_lock_area": 0.0,
+                    "bg_core_area": 0.0,
+                    "low_target_bg_area": 0.0,
+                    "positive_delta_bg_mean": 0.0,
+                    "positive_delta_bg_max": 0.0,
+                    "positive_delta_mean": 0.0,
+                    "bg_res_lock_scale": 0.0,
+                    "lambda_bg_res_lock_eff": 0.0,
+                    "bg_prob_lock_scale": 0.0,
+                    "lambda_bg_prob_lock_eff": 0.0,
+                    "loss_bg_res_lock": 0.0,
+                    "loss_bg_prob_lock": 0.0,
+                }
                 loss_area_guard = student_logits.sum() * 0.0
                 if use_qra:
                     loss_anchor, loss_soft = compute_qra_losses(
@@ -6645,15 +8200,31 @@ def main():
                                 pu_static_weight_map,
                                 eps=eps,
                             )
-                            loss_pu_teacher_coarse = rast_teacher_bce_with_logits(
-                                coarse_logits,
-                                teacher_full_target,
-                                rast_teacher_map_eff,
-                                cfg,
-                                rast_stats["rast_scale"],
-                                apply_to_loss=bool(getattr(cfg, "RAST_APPLY_TO_COARSE_AUX", True)),
-                                eps=eps,
-                            )
+                            if lceg_teacher_map_coarse is not None and bool(getattr(cfg, "LCEG_APPLY_TO_COARSE_AUX", True)):
+                                loss_pu_teacher_coarse = lceg_teacher_bce_with_logits(
+                                    coarse_logits,
+                                    teacher_full_target,
+                                    lceg_teacher_map_coarse,
+                                    cfg,
+                                    eps=eps,
+                                )
+                                loss_lceg_coarse, _ = lceg_lower_bound_loss_for_logits(
+                                    coarse_logits,
+                                    lceg_core_mask,
+                                    lceg_lost_mask,
+                                    lceg_new_mask,
+                                    cfg,
+                                )
+                            else:
+                                loss_pu_teacher_coarse = rast_teacher_bce_with_logits(
+                                    coarse_logits,
+                                    teacher_full_target,
+                                    rast_teacher_map_eff,
+                                    cfg,
+                                    rast_stats["rast_scale"],
+                                    apply_to_loss=bool(getattr(cfg, "RAST_APPLY_TO_COARSE_AUX", True)),
+                                    eps=eps,
+                                )
                             static_terms.append(loss_pu_static_coarse)
                             teacher_terms.append(loss_pu_teacher_coarse)
                             pu_aux_weights.append(float(getattr(cfg, "LAMBDA_NDR_COARSE_AUX", 0.5)))
@@ -6820,6 +8391,78 @@ def main():
                         residual_logits = student_out["residual_logits_68"]
                         loss_ndr_res_reg = torch.mean(torch.abs(detail_gate * residual_logits))
                         loss = loss + float(getattr(cfg, "NDR_RES_REG_WEIGHT", 0.001)) * loss_ndr_res_reg
+                    if use_ndr_v2(cfg):
+                        ndr_v2_shape_candidate, ndr_v2_shape_stats = build_ndr_v2_shape_lower_bound(
+                            cfg,
+                            batch,
+                            student_logits,
+                            student_out,
+                            teacher_binary,
+                            epoch,
+                            device,
+                        )
+                        loss_ndr_v2_shape_lb = ndr_v2_shape_lower_bound_loss(
+                            student_logits,
+                            ndr_v2_shape_candidate,
+                            float(getattr(cfg, "NDR_V2_SHAPE_LB_FLOOR", 0.35)),
+                        )
+                        loss_ndr_v2_bg_lock, loss_ndr_v2_bg_prob_lock, ndr_v2_bg_lock_stats = (
+                            build_ndr_v2_bg_lock_losses(
+                                student_logits,
+                                student_out,
+                                batch,
+                                cfg,
+                                epoch,
+                            )
+                        )
+                        loss_ndr_v2_weighted = (
+                            float(ndr_v2_shape_stats["lambda_shape_lb_eff"]) * loss_ndr_v2_shape_lb
+                            + float(ndr_v2_bg_lock_stats["lambda_bg_res_lock_eff"]) * loss_ndr_v2_bg_lock
+                            + float(ndr_v2_bg_lock_stats["lambda_bg_prob_lock_eff"]) * loss_ndr_v2_bg_prob_lock
+                        )
+                        loss = loss + loss_ndr_v2_weighted
+                        if not ndr_v2_bg_lock_first_batch_logged:
+                            logger.log(f"[NDR-v2 FirstBatch] USE_NDR_V2 = {bool(getattr(cfg, 'USE_NDR_V2', False))}")
+                            logger.log(f"[NDR-v2 FirstBatch] NDR_VERSION = {getattr(cfg, 'NDR_VERSION', 'v2a_shape_gate_bg_lock')}")
+                            if str(getattr(cfg, "NDR_VERSION", "")).lower().startswith("v2b"):
+                                logger.log(f"[NDR-v2b FirstBatch] USE_NDR_V2 = {bool(getattr(cfg, 'USE_NDR_V2', False))}")
+                                logger.log(f"[NDR-v2b FirstBatch] NDR_VERSION = {getattr(cfg, 'NDR_VERSION', 'v2b_shape_lb_bg_prob_lock')}")
+                                logger.log(f"[NDR-v2b FirstBatch] shape_lb_scale = {float(ndr_v2_shape_stats['shape_lb_scale']):.8f}")
+                                logger.log(f"[NDR-v2b FirstBatch] lambda_shape_lb_eff = {float(ndr_v2_shape_stats['lambda_shape_lb_eff']):.8f}")
+                                logger.log(f"[NDR-v2b FirstBatch] bg_res_lock_scale = {float(ndr_v2_bg_lock_stats['bg_res_lock_scale']):.8f}")
+                                logger.log(f"[NDR-v2b FirstBatch] bg_prob_lock_scale = {float(ndr_v2_bg_lock_stats['bg_prob_lock_scale']):.8f}")
+                                logger.log(f"[NDR-v2b FirstBatch] shape_candidate shape = {list(ndr_v2_shape_candidate.shape)}")
+                                logger.log(
+                                    "[NDR-v2b FirstBatch] shape_candidate raw/capped ratio = "
+                                    f"{float(ndr_v2_shape_stats['shape_candidate_raw_ratio']):.8f}/"
+                                    f"{float(ndr_v2_shape_stats['shape_candidate_capped_ratio']):.8f}"
+                                )
+                            logger.log(
+                                "[NDR-v2 FirstBatch] lambda shape/bg_res/bg_prob = "
+                                f"{float(ndr_v2_shape_stats['lambda_shape_lb_eff']):.8f}/"
+                                f"{float(ndr_v2_bg_lock_stats['lambda_bg_res_lock_eff']):.8f}/"
+                                f"{float(ndr_v2_bg_lock_stats['lambda_bg_prob_lock_eff']):.8f}"
+                            )
+                            logger.log(
+                                "[NDR-v2 FirstBatch] bg_lock/bg_core/low_target_bg area = "
+                                f"{float(ndr_v2_bg_lock_stats['bg_lock_area']):.8f}/"
+                                f"{float(ndr_v2_bg_lock_stats['bg_core_area']):.8f}/"
+                                f"{float(ndr_v2_bg_lock_stats['low_target_bg_area']):.8f}"
+                            )
+                            logger.log(
+                                "[NDR-v2 FirstBatch] positive_delta bg_mean/bg_max/all_mean = "
+                                f"{float(ndr_v2_bg_lock_stats['positive_delta_bg_mean']):.8f}/"
+                                f"{float(ndr_v2_bg_lock_stats['positive_delta_bg_max']):.8f}/"
+                                f"{float(ndr_v2_bg_lock_stats['positive_delta_mean']):.8f}"
+                            )
+                            logger.log(
+                                "[NDR-v2 FirstBatch] loss shape_lb/bg_res/bg_prob/weighted = "
+                                f"{float(loss_ndr_v2_shape_lb.detach().item()):.8f}/"
+                                f"{float(loss_ndr_v2_bg_lock.detach().item()):.8f}/"
+                                f"{float(loss_ndr_v2_bg_prob_lock.detach().item()):.8f}/"
+                                f"{float(loss_ndr_v2_weighted.detach().item()):.8f}"
+                            )
+                            ndr_v2_bg_lock_first_batch_logged = True
                 elif (
                     bool(getattr(cfg, "USE_BASE_AUX_LOSS", False))
                     and isinstance(student_out, dict)
@@ -7156,6 +8799,18 @@ def main():
                         teacher_prob,
                         teacher_binary,
                     )
+                if use_tce:
+                    lambda_tce_eff = float(tce_stats["lambda_tce_eff"])
+                    if bool(getattr(cfg, "TCE_USE_LOWER_BOUND_LOSS", True)) and bool(getattr(cfg, "TCE_APPLY_TO_FINAL", True)):
+                        loss = loss + lambda_tce_eff * loss_tce_final
+                if use_lceg:
+                    lambda_lceg_eff = float(lceg_stats["lambda_lceg_eff"])
+                    loss_lceg = student_logits.sum() * 0.0
+                    if bool(getattr(cfg, "LCEG_APPLY_TO_FINAL", True)):
+                        loss_lceg = loss_lceg + loss_lceg_final
+                    if bool(getattr(cfg, "LCEG_APPLY_TO_COARSE_AUX", True)):
+                        loss_lceg = loss_lceg + float(getattr(cfg, "LCEG_COARSE_LOSS_WEIGHT", 0.50)) * loss_lceg_coarse
+                    loss = loss + lambda_lceg_eff * loss_lceg
 
                 if use_linear_floor_two_stage_lr(cfg):
                     set_optimizer_lr(
@@ -7195,6 +8850,8 @@ def main():
                 total_aux_base_loss += float(loss_aux_base.item())
                 total_ndr_coarse_aux_loss += float(loss_ndr_coarse_aux.item())
                 total_ndr_res_reg_loss += float(loss_ndr_res_reg.item())
+                total_ndr_v2_bg_lock_loss += float(loss_ndr_v2_bg_lock.item())
+                total_ndr_v2_weighted_loss += float(loss_ndr_v2_weighted.item())
                 if use_dabe_aware:
                     dabe_aware_fg_core_area_sum += float(dabe_aware_stats["fg_core_area"])
                     dabe_aware_bg_core_area_sum += float(dabe_aware_stats["bg_core_area"])
@@ -7349,6 +9006,65 @@ def main():
                         epr_loss_base_sum += float(loss_epr_base.detach().item())
                         epr_loss_sum += float(loss_epr.detach().item())
                         epr_stat_batches += 1
+                    if use_tce:
+                        tce_scale_sum += float(tce_stats["tce_scale"])
+                        tce_lambda_sum += float(tce_stats["lambda_tce_eff"])
+                        tce_cover_area_sum += float(tce_stats["cover_area_mean"])
+                        tce_current_area_sum += float(tce_stats["current_area_mean"])
+                        tce_shrink_gate_ratio_sum += float(tce_stats["shrink_gate_ratio"])
+                        tce_bg_safe_gate_ratio_sum += float(tce_stats["bg_safe_gate_ratio"])
+                        tce_image_gate_ratio_sum += float(tce_stats["image_gate_ratio"])
+                        tce_lost_raw_ratio_sum += float(tce_stats["lost_raw_ratio"])
+                        tce_lost_capped_ratio_sum += float(tce_stats["lost_capped_ratio"])
+                        tce_new_raw_ratio_sum += float(tce_stats["new_raw_ratio"])
+                        tce_new_capped_ratio_sum += float(tce_stats["new_capped_ratio"])
+                        tce_total_ratio_sum += float(tce_stats["tce_total_ratio"])
+                        tce_valid_image_ratio_sum += float(tce_stats["tce_valid_image_ratio"])
+                        tce_lost_margin_mean_sum += float(tce_stats["lost_margin_mean"])
+                        tce_new_margin_mean_sum += float(tce_stats["new_margin_mean"])
+                        tce_lost_cover_conf_mean_sum += float(tce_stats["lost_cover_conf_mean"])
+                        tce_current_teacher_conf_lost_mean_sum += float(tce_stats["current_teacher_conf_lost_mean"])
+                        tce_current_teacher_conf_new_mean_sum += float(tce_stats["current_teacher_conf_new_mean"])
+                        tce_teacher_map_final_mean_sum += float(tce_stats["teacher_map_final_mean"])
+                        tce_teacher_map_final_tce_mean_sum += float(tce_stats["teacher_map_final_tce_mean"])
+                        tce_loss_sum += float(loss_tce_final.detach().item())
+                        tce_skipped_no_fg_proto_sum += int(tce_stats.get("tce_skipped_no_fg_proto", 0))
+                        tce_skipped_no_bg_proto_sum += int(tce_stats.get("tce_skipped_no_bg_proto", 0))
+                        tce_stat_batches += 1
+                    if use_lceg:
+                        lceg_scale_sum += float(lceg_stats["lceg_scale"])
+                        lceg_lambda_sum += float(lceg_stats["lambda_lceg_eff"])
+                        lceg_cover_area_sum += float(lceg_stats["cover_area_mean"])
+                        lceg_current_area_sum += float(lceg_stats["current_area_mean"])
+                        lceg_current_fg_extent_ratio_sum += float(lceg_stats["current_fg_extent_ratio"])
+                        lceg_cover_fg_extent_ratio_sum += float(lceg_stats["cover_fg_extent_ratio"])
+                        lceg_shrink_gate_ratio_sum += float(lceg_stats["shrink_gate_ratio"])
+                        lceg_bg_safe_gate_ratio_sum += float(lceg_stats["bg_safe_gate_ratio"])
+                        lceg_core_raw_ratio_sum += float(lceg_stats["core_raw_ratio"])
+                        lceg_core_capped_ratio_sum += float(lceg_stats["core_capped_ratio"])
+                        lceg_lost_raw_ratio_sum += float(lceg_stats["lost_raw_ratio"])
+                        lceg_lost_capped_ratio_sum += float(lceg_stats["lost_capped_ratio"])
+                        lceg_new_raw_ratio_sum += float(lceg_stats["new_raw_ratio"])
+                        lceg_new_capped_ratio_sum += float(lceg_stats["new_capped_ratio"])
+                        lceg_total_ratio_sum += float(lceg_stats["lceg_total_ratio"])
+                        lceg_valid_image_ratio_sum += float(lceg_stats["lceg_valid_image_ratio"])
+                        lceg_core_conf_mean_sum += float(lceg_stats["core_conf_mean"])
+                        lceg_lost_cover_prob_mean_sum += float(lceg_stats["lost_cover_prob_mean"])
+                        lceg_lost_margin_mean_sum += float(lceg_stats["lost_margin_mean"])
+                        lceg_new_margin_mean_sum += float(lceg_stats["new_margin_mean"])
+                        lceg_teacher_map_final_mean_sum += float(lceg_stats["teacher_map_final_mean"])
+                        lceg_teacher_map_final_lceg_mean_sum += float(lceg_stats["teacher_map_final_lceg_mean"])
+                        lceg_teacher_map_coarse_mean_sum += float(lceg_stats["teacher_map_coarse_mean"])
+                        lceg_teacher_map_coarse_lceg_mean_sum += float(lceg_stats["teacher_map_coarse_lceg_mean"])
+                        lceg_loss_core_sum += float(loss_lceg_final_parts["core"].detach().item())
+                        lceg_loss_lost_sum += float(loss_lceg_final_parts["lost"].detach().item())
+                        lceg_loss_new_sum += float(loss_lceg_final_parts["new"].detach().item())
+                        lceg_loss_final_sum += float(loss_lceg_final.detach().item())
+                        lceg_loss_coarse_sum += float(loss_lceg_coarse.detach().item())
+                        lceg_loss_sum += float(loss_lceg.detach().item())
+                        lceg_skipped_no_fg_proto_sum += int(lceg_stats.get("lceg_skipped_no_fg_proto", 0))
+                        lceg_skipped_no_bg_proto_sum += int(lceg_stats.get("lceg_skipped_no_bg_proto", 0))
+                        lceg_stat_batches += 1
                     if use_esa_diagnostic:
                         esa_student_prob_fg_core_sum += float(esa_stats["student_prob_fg_core"])
                         esa_student_prob_bg_core_sum += float(esa_stats["student_prob_bg_core"])
@@ -7514,6 +9230,71 @@ def main():
                             else max(ndr_residual_abs_max, ndr_residual_abs_max_value)
                         )
                         ndr_stat_batches += 1
+                        if use_ndr_v2(cfg):
+                            ndr_v2_shape_alpha_sum += output_scalar(student_out, "ndr_v2_shape_alpha_eff")
+                            ndr_v2_gate_v1_mean_sum += output_scalar(student_out, "ndr_v2_detail_gate_v1_mean")
+                            ndr_v2_gate_v2_mean_sum += output_scalar(student_out, "ndr_v2_detail_gate_v2_mean")
+                            ndr_v2_boundary_mean = output_scalar(student_out, "ndr_v2_boundary_mean")
+                            ndr_v2_boundary_min_value = output_scalar(student_out, "ndr_v2_boundary_min")
+                            ndr_v2_boundary_max_value = output_scalar(student_out, "ndr_v2_boundary_max")
+                            ndr_v2_edge_norm_mean_sum += output_scalar(student_out, "ndr_v2_edge_norm_mean")
+                            ndr_v2_shape_boost_mean_sum += output_scalar(student_out, "ndr_v2_shape_boost_mean")
+                            ndr_v2_shape_boost_max_value = output_scalar(student_out, "ndr_v2_shape_boost_max")
+                            ndr_v2_boundary_mean_sum += ndr_v2_boundary_mean
+                            ndr_v2_boundary_min = (
+                                ndr_v2_boundary_min_value
+                                if ndr_v2_boundary_min is None
+                                else min(ndr_v2_boundary_min, ndr_v2_boundary_min_value)
+                            )
+                            ndr_v2_boundary_max = (
+                                ndr_v2_boundary_max_value
+                                if ndr_v2_boundary_max is None
+                                else max(ndr_v2_boundary_max, ndr_v2_boundary_max_value)
+                            )
+                            ndr_v2_shape_boost_max = (
+                                ndr_v2_shape_boost_max_value
+                                if ndr_v2_shape_boost_max is None
+                                else max(ndr_v2_shape_boost_max, ndr_v2_shape_boost_max_value)
+                            )
+                            ndr_v2_shape_lb_scale_sum += float(ndr_v2_shape_stats["shape_lb_scale"])
+                            ndr_v2_shape_lb_lambda_sum += float(ndr_v2_shape_stats["lambda_shape_lb_eff"])
+                            ndr_v2_shape_candidate_raw_ratio_sum += float(
+                                ndr_v2_shape_stats["shape_candidate_raw_ratio"]
+                            )
+                            ndr_v2_shape_candidate_capped_ratio_sum += float(
+                                ndr_v2_shape_stats["shape_candidate_capped_ratio"]
+                            )
+                            ndr_v2_shape_valid_image_ratio_sum += float(
+                                ndr_v2_shape_stats["shape_valid_image_ratio"]
+                            )
+                            ndr_v2_shape_margin_mean_sum += float(ndr_v2_shape_stats["shape_margin_mean"])
+                            ndr_v2_shape_edge_mean_sum += float(ndr_v2_shape_stats["shape_edge_mean"])
+                            ndr_v2_shape_under_floor_mean_sum += float(
+                                ndr_v2_shape_stats["shape_under_floor_mean"]
+                            )
+                            ndr_v2_bg_lock_area_sum += float(ndr_v2_bg_lock_stats["bg_lock_area"])
+                            ndr_v2_bg_core_area_sum += float(ndr_v2_bg_lock_stats["bg_core_area"])
+                            ndr_v2_low_target_bg_area_sum += float(ndr_v2_bg_lock_stats["low_target_bg_area"])
+                            ndr_v2_bg_res_lock_scale_sum += float(ndr_v2_bg_lock_stats["bg_res_lock_scale"])
+                            ndr_v2_bg_res_lock_lambda_sum += float(
+                                ndr_v2_bg_lock_stats["lambda_bg_res_lock_eff"]
+                            )
+                            ndr_v2_bg_prob_lock_scale_sum += float(ndr_v2_bg_lock_stats["bg_prob_lock_scale"])
+                            ndr_v2_bg_prob_lock_lambda_sum += float(
+                                ndr_v2_bg_lock_stats["lambda_bg_prob_lock_eff"]
+                            )
+                            ndr_v2_positive_delta_bg_mean_sum += float(ndr_v2_bg_lock_stats["positive_delta_bg_mean"])
+                            ndr_v2_positive_delta_bg_max_value = float(ndr_v2_bg_lock_stats["positive_delta_bg_max"])
+                            ndr_v2_positive_delta_bg_max = (
+                                ndr_v2_positive_delta_bg_max_value
+                                if ndr_v2_positive_delta_bg_max is None
+                                else max(ndr_v2_positive_delta_bg_max, ndr_v2_positive_delta_bg_max_value)
+                            )
+                            ndr_v2_loss_shape_lb_sum += float(loss_ndr_v2_shape_lb.detach().item())
+                            ndr_v2_loss_bg_lock_sum += float(loss_ndr_v2_bg_lock.detach().item())
+                            ndr_v2_loss_bg_prob_lock_sum += float(loss_ndr_v2_bg_prob_lock.detach().item())
+                            ndr_v2_weighted_loss_sum += float(loss_ndr_v2_weighted.detach().item())
+                            ndr_v2_stat_batches += 1
                         if use_tadr_router(cfg):
                             router_mean = output_scalar(student_out, "tadr_router_mean")
                             router_min = output_scalar(student_out, "tadr_router_min")
@@ -7876,6 +9657,109 @@ def main():
                         f"loss_epr={epr_loss_sum / epr_batches:.6f}"
                     )
                 if (
+                    use_tce
+                    and bool(getattr(cfg, "USE_TCE_DIAGNOSTIC", True))
+                    and int(epoch) % max(1, int(getattr(cfg, "TCE_DIAG_LOG_INTERVAL_EPOCH", 1))) == 0
+                ):
+                    tce_batches = max(tce_stat_batches, 1)
+                    logger.log(
+                        f"[TCE] epoch={epoch:03d} | "
+                        f"tce_scale={tce_scale_sum / tce_batches:.6f} | "
+                        f"lambda_tce_eff={tce_lambda_sum / tce_batches:.8f} | "
+                        f"cover_area_mean={tce_cover_area_sum / tce_batches:.6f} | "
+                        f"current_area_mean={tce_current_area_sum / tce_batches:.6f} | "
+                        f"shrink_gate_ratio={tce_shrink_gate_ratio_sum / tce_batches:.6f} | "
+                        f"bg_safe_gate_ratio={tce_bg_safe_gate_ratio_sum / tce_batches:.6f} | "
+                        f"image_gate_ratio={tce_image_gate_ratio_sum / tce_batches:.6f} | "
+                        f"lost_raw_ratio={tce_lost_raw_ratio_sum / tce_batches:.6f} | "
+                        f"lost_capped_ratio={tce_lost_capped_ratio_sum / tce_batches:.6f} | "
+                        f"new_raw_ratio={tce_new_raw_ratio_sum / tce_batches:.6f} | "
+                        f"new_capped_ratio={tce_new_capped_ratio_sum / tce_batches:.6f} | "
+                        f"tce_total_ratio={tce_total_ratio_sum / tce_batches:.6f} | "
+                        f"tce_valid_image_ratio={tce_valid_image_ratio_sum / tce_batches:.6f} | "
+                        f"lost_margin_mean={tce_lost_margin_mean_sum / tce_batches:.6f} | "
+                        f"new_margin_mean={tce_new_margin_mean_sum / tce_batches:.6f} | "
+                        f"lost_cover_conf_mean={tce_lost_cover_conf_mean_sum / tce_batches:.6f} | "
+                        f"current_teacher_conf_lost_mean={tce_current_teacher_conf_lost_mean_sum / tce_batches:.6f} | "
+                        f"current_teacher_conf_new_mean={tce_current_teacher_conf_new_mean_sum / tce_batches:.6f} | "
+                        f"teacher_map_final_mean={tce_teacher_map_final_mean_sum / tce_batches:.6f} | "
+                        f"teacher_map_final_tce_mean={tce_teacher_map_final_tce_mean_sum / tce_batches:.6f} | "
+                        f"skipped_no_fg_proto={tce_skipped_no_fg_proto_sum} | "
+                        f"skipped_no_bg_proto={tce_skipped_no_bg_proto_sum} | "
+                        f"loss_tce={tce_loss_sum / tce_batches:.6f}"
+                    )
+                if (
+                    use_lceg
+                    and bool(getattr(cfg, "USE_LCEG_DIAGNOSTIC", True))
+                    and int(epoch) % max(1, int(getattr(cfg, "LCEG_DIAG_LOG_INTERVAL_EPOCH", 1))) == 0
+                ):
+                    lceg_batches = max(lceg_stat_batches, 1)
+                    logger.log(
+                        f"[LCEG] epoch={epoch:03d} | "
+                        f"lceg_scale={lceg_scale_sum / lceg_batches:.6f} | "
+                        f"lambda_lceg_eff={lceg_lambda_sum / lceg_batches:.8f} | "
+                        f"cover_area_mean={lceg_cover_area_sum / lceg_batches:.6f} | "
+                        f"current_area_mean={lceg_current_area_sum / lceg_batches:.6f} | "
+                        f"current_fg_extent_ratio={lceg_current_fg_extent_ratio_sum / lceg_batches:.6f} | "
+                        f"cover_fg_extent_ratio={lceg_cover_fg_extent_ratio_sum / lceg_batches:.6f} | "
+                        f"shrink_gate_ratio={lceg_shrink_gate_ratio_sum / lceg_batches:.6f} | "
+                        f"bg_safe_gate_ratio={lceg_bg_safe_gate_ratio_sum / lceg_batches:.6f} | "
+                        f"core_raw_ratio={lceg_core_raw_ratio_sum / lceg_batches:.6f} | "
+                        f"core_capped_ratio={lceg_core_capped_ratio_sum / lceg_batches:.6f} | "
+                        f"lost_raw_ratio={lceg_lost_raw_ratio_sum / lceg_batches:.6f} | "
+                        f"lost_capped_ratio={lceg_lost_capped_ratio_sum / lceg_batches:.6f} | "
+                        f"new_raw_ratio={lceg_new_raw_ratio_sum / lceg_batches:.6f} | "
+                        f"new_capped_ratio={lceg_new_capped_ratio_sum / lceg_batches:.6f} | "
+                        f"lceg_total_ratio={lceg_total_ratio_sum / lceg_batches:.6f} | "
+                        f"lceg_valid_image_ratio={lceg_valid_image_ratio_sum / lceg_batches:.6f} | "
+                        f"core_conf_mean={lceg_core_conf_mean_sum / lceg_batches:.6f} | "
+                        f"lost_cover_prob_mean={lceg_lost_cover_prob_mean_sum / lceg_batches:.6f} | "
+                        f"lost_margin_mean={lceg_lost_margin_mean_sum / lceg_batches:.6f} | "
+                        f"new_margin_mean={lceg_new_margin_mean_sum / lceg_batches:.6f} | "
+                        f"teacher_map_final_mean={lceg_teacher_map_final_mean_sum / lceg_batches:.6f} | "
+                        f"teacher_map_final_lceg_mean={lceg_teacher_map_final_lceg_mean_sum / lceg_batches:.6f} | "
+                        f"teacher_map_coarse_mean={lceg_teacher_map_coarse_mean_sum / lceg_batches:.6f} | "
+                        f"teacher_map_coarse_lceg_mean={lceg_teacher_map_coarse_lceg_mean_sum / lceg_batches:.6f} | "
+                        f"skipped_no_fg_proto={lceg_skipped_no_fg_proto_sum} | "
+                        f"skipped_no_bg_proto={lceg_skipped_no_bg_proto_sum} | "
+                        f"loss_lceg_core={lceg_loss_core_sum / lceg_batches:.6f} | "
+                        f"loss_lceg_lost={lceg_loss_lost_sum / lceg_batches:.6f} | "
+                        f"loss_lceg_new={lceg_loss_new_sum / lceg_batches:.6f} | "
+                        f"loss_lceg_final={lceg_loss_final_sum / lceg_batches:.6f} | "
+                        f"loss_lceg_coarse={lceg_loss_coarse_sum / lceg_batches:.6f} | "
+                        f"loss_lceg={lceg_loss_sum / lceg_batches:.6f}"
+                    )
+                if (
+                    bool(getattr(cfg, "USE_CLEAN_CONSOLIDATION_LOG", False))
+                    and use_dabe_pu_despl_sched
+                    and int(epoch) >= int(getattr(cfg, "LCEG_STOP_EPOCH", max_epoch + 1))
+                ):
+                    cc_batches = max(num_batches, 1)
+                    cc_rast_batches = max(rast_stat_batches, 1)
+                    cc_esa_batches = max(esa_asym_stat_batches, 1)
+                    cc_lceg_batches = max(lceg_stat_batches, 1)
+                    logger.log(
+                        f"[CleanConsolidation] epoch={epoch:03d} | "
+                        "is_clean_consolidation=True | "
+                        f"static_weight={static_weight_log:.2f} | "
+                        f"teacher_weight={teacher_weight_log:.2f} | "
+                        f"rast_scale={rast_scale_effective_sum / cc_rast_batches:.6f} | "
+                        f"esa_asym_scale={esa_asym_scale_sum / cc_esa_batches:.6f} | "
+                        f"lceg_scale={lceg_scale_sum / cc_lceg_batches:.6f} | "
+                        f"lambda_lceg_eff={lceg_lambda_sum / cc_lceg_batches:.8f} | "
+                        f"student_pred_area_mean={student_pred_area_sum / cc_batches:.6f} | "
+                        f"teacher_pred_area_mean={teacher_pred_area_sum / cc_batches:.6f} | "
+                        f"fg_conflict_ratio={rast_fg_conflict_ratio_sum / cc_rast_batches:.6f} | "
+                        f"extent_teacher_fg_ratio={esa_extent_teacher_fg_ratio_sum / cc_esa_batches:.6f} | "
+                        f"teacher_map_final_lceg_mean={lceg_teacher_map_final_lceg_mean_sum / cc_lceg_batches:.6f} | "
+                        f"teacher_map_coarse_lceg_mean={lceg_teacher_map_coarse_lceg_mean_sum / cc_lceg_batches:.6f} | "
+                        f"loss_lceg={lceg_loss_sum / cc_lceg_batches:.6f} | "
+                        f"teacher_loss_final={dabe_pu_teacher_final_loss_sum / max(dabe_pu_stat_batches, 1):.6f} | "
+                        f"teacher_loss_coarse={dabe_pu_teacher_coarse_loss_sum / max(dabe_pu_stat_batches, 1):.6f} | "
+                        f"teacher_loss_base={dabe_pu_teacher_base_loss_sum / max(dabe_pu_stat_batches, 1):.6f} | "
+                        f"lr={current_lr(optimizer):.8f}"
+                    )
+                if (
                     use_esa_diagnostic
                     and int(epoch) % max(1, int(getattr(cfg, "ESA_DIAG_LOG_INTERVAL_EPOCH", 1))) == 0
                 ):
@@ -8099,6 +9983,41 @@ def main():
                     f"loss_base_aux={total_aux_base_loss / max(num_batches, 1):.6f} | "
                     f"loss_res_reg={total_ndr_res_reg_loss / max(num_batches, 1):.6f}"
                 )
+                if use_ndr_v2(cfg):
+                    v2_batches = max(ndr_v2_stat_batches, 1)
+                    logger.log(
+                        f"[NDR-v2] epoch={epoch:03d} | "
+                        f"shape_alpha_eff={ndr_v2_shape_alpha_sum / v2_batches:.8f} | "
+                        f"gate_v1_mean={ndr_v2_gate_v1_mean_sum / v2_batches:.8f} | "
+                        f"gate_v2_mean={ndr_v2_gate_v2_mean_sum / v2_batches:.8f} | "
+                        f"boundary_mean={ndr_v2_boundary_mean_sum / v2_batches:.8f} | "
+                        f"boundary_min={(ndr_v2_boundary_min if ndr_v2_boundary_min is not None else 0.0):.8f} | "
+                        f"boundary_max={(ndr_v2_boundary_max if ndr_v2_boundary_max is not None else 0.0):.8f} | "
+                        f"edge_norm_mean={ndr_v2_edge_norm_mean_sum / v2_batches:.8f} | "
+                        f"shape_boost_mean={ndr_v2_shape_boost_mean_sum / v2_batches:.8f} | "
+                        f"shape_boost_max={(ndr_v2_shape_boost_max if ndr_v2_shape_boost_max is not None else 0.0):.8f} | "
+                        f"shape_lb_scale={ndr_v2_shape_lb_scale_sum / v2_batches:.8f} | "
+                        f"lambda_shape_lb_eff={ndr_v2_shape_lb_lambda_sum / v2_batches:.8f} | "
+                        f"shape_candidate_raw_ratio={ndr_v2_shape_candidate_raw_ratio_sum / v2_batches:.8f} | "
+                        f"shape_candidate_capped_ratio={ndr_v2_shape_candidate_capped_ratio_sum / v2_batches:.8f} | "
+                        f"shape_valid_image_ratio={ndr_v2_shape_valid_image_ratio_sum / v2_batches:.8f} | "
+                        f"shape_margin_mean={ndr_v2_shape_margin_mean_sum / v2_batches:.8f} | "
+                        f"shape_edge_mean={ndr_v2_shape_edge_mean_sum / v2_batches:.8f} | "
+                        f"shape_under_floor_mean={ndr_v2_shape_under_floor_mean_sum / v2_batches:.8f} | "
+                        f"bg_lock_area={ndr_v2_bg_lock_area_sum / v2_batches:.8f} | "
+                        f"bg_core_area={ndr_v2_bg_core_area_sum / v2_batches:.8f} | "
+                        f"low_target_bg_area={ndr_v2_low_target_bg_area_sum / v2_batches:.8f} | "
+                        f"bg_res_lock_scale={ndr_v2_bg_res_lock_scale_sum / v2_batches:.8f} | "
+                        f"lambda_bg_res_lock_eff={ndr_v2_bg_res_lock_lambda_sum / v2_batches:.8f} | "
+                        f"bg_prob_lock_scale={ndr_v2_bg_prob_lock_scale_sum / v2_batches:.8f} | "
+                        f"lambda_bg_prob_lock_eff={ndr_v2_bg_prob_lock_lambda_sum / v2_batches:.8f} | "
+                        f"positive_delta_bg_mean={ndr_v2_positive_delta_bg_mean_sum / v2_batches:.8f} | "
+                        f"positive_delta_bg_max={(ndr_v2_positive_delta_bg_max if ndr_v2_positive_delta_bg_max is not None else 0.0):.8f} | "
+                        f"loss_shape_lb={ndr_v2_loss_shape_lb_sum / v2_batches:.8f} | "
+                        f"loss_bg_res_lock={ndr_v2_loss_bg_lock_sum / v2_batches:.8f} | "
+                        f"loss_bg_prob_lock={ndr_v2_loss_bg_prob_lock_sum / v2_batches:.8f} | "
+                        f"loss_ndr_v2b={ndr_v2_weighted_loss_sum / v2_batches:.8f}"
+                    )
             if use_view_consistency(cfg):
                 stat_batches = max(mv_stat_batches, 1)
                 if torch.cuda.is_available():
