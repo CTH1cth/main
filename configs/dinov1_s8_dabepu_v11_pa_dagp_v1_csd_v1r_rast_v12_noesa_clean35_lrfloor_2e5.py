@@ -1,0 +1,100 @@
+from configs.dinov1_s8_dabepu_v11_dagp_uncgate_csd_v1r_rast_v12_noesa_clean35_lrfloor_2e5 import *  # noqa: F401,F403
+
+
+EXP_NAME = "dinov1_s8_dabepu_v11_pa_dagp_v1_csd_v1r_rast_v12_noesa_clean35_lrfloor_2e5"
+
+USE_PA_DAGP = True
+PA_DAGP_VERSION = "v1_cross_polarity_edge_cut"
+
+# Polarity embedding.
+PA_DAGP_POL_DIM = 32
+PA_DAGP_POL_GN_GROUPS = 4
+PA_DAGP_POL_ACT = "gelu"
+
+# Soft foreground/background anchors from native DAGP base probability.
+PA_DAGP_ANCHOR_WEIGHT_POWER = 2.0
+PA_DAGP_ANCHOR_EPS = 1e-6
+PA_DAGP_DETACH_BASE_PROB = True
+PA_DAGP_DETACH_ANCHORS = True
+PA_DAGP_DETACH_RHO = True
+PA_DAGP_MIN_ANCHOR_NORM = 1e-6
+
+# Polarity calibration.
+PA_DAGP_USE_CALIB_HEAD = True
+PA_DAGP_CALIB_HIDDEN = 32
+PA_DAGP_CALIB_ZERO_INIT = True
+PA_DAGP_POLARITY_TAU = 0.50
+
+# Cross-polarity edge suppression only.
+PA_DAGP_EDGE_CUT_MAX = 0.50
+PA_DAGP_EDGE_GATE_MIN = 0.50
+PA_DAGP_USE_SAME_POLARITY_BOOST = False
+PA_DAGP_RENORMALIZE_EDGE = True
+
+# Edge schedule.
+PA_DAGP_WARMUP_EPOCH = 6
+PA_DAGP_START_EPOCH = 7
+PA_DAGP_RAMP_END_EPOCH = 15
+PA_DAGP_EDGE_STOP_EPOCH = 36
+
+# Polarity auxiliary loss.
+PA_DAGP_USE_AUX_LOSS = True
+PA_DAGP_AUX_LOSS_WEIGHT_MAX = 0.020
+PA_DAGP_AUX_LOSS_STOP_EPOCH = 21
+PA_DAGP_CORE_MARGIN = 0.50
+PA_DAGP_HARD_MARGIN = 0.75
+PA_DAGP_HARD_LOSS_MULT = 0.50
+PA_DAGP_HARD_FG_PROB_THRESH = 0.50
+PA_DAGP_HARD_BG_PROB_THRESH = 0.50
+PA_DAGP_MIN_CORE_PIXELS_PER_IMAGE = 4
+PA_DAGP_MIN_HARD_PIXELS_PER_IMAGE = 1
+
+# Explicitly forbidden PA-DAGP-v1 losses.
+PA_DAGP_USE_EXTENT_LOSS = False
+PA_DAGP_USE_UNKNOWN_LOSS = False
+PA_DAGP_USE_SEPARATION_LOSS = False
+PA_DAGP_USE_AREA_LOSS = False
+PA_DAGP_USE_CONTRASTIVE_LOSS = False
+
+# Diagnostics.
+USE_PA_DAGP_DIAGNOSTIC = True
+PA_DAGP_DIAG_LOG_INTERVAL_EPOCH = 1
+PA_DAGP_DIAG_AMBIG_THRESH = 0.20
+PA_DAGP_DIAG_COMPARE_ORIGINAL_FIRST_BATCH = True
+
+# Keep the original DAGP-Safe coarse-anchor settings explicit.
+DAGP_SAFE_HIDDEN = 64
+DAGP_SAFE_TOPK = 12
+DAGP_SAFE_TAU = 0.07
+DAGP_SAFE_ALPHA_MAX = 0.05
+DAGP_SAFE_GAMMA_MAX = 0.03
+DAGP_SAFE_WARMUP_EPOCH = 6
+DAGP_SAFE_RAMP_START_EPOCH = 7
+DAGP_SAFE_RAMP_END_EPOCH = 15
+DAGP_SAFE_USE_PROB_GATE = True
+DAGP_SAFE_PROB_GATE_SIGMA = 0.25
+DAGP_SAFE_USE_UNCERTAINTY_OUTPUT_GATE = True
+DAGP_SAFE_UNCERTAINTY_POWER = 1.0
+DAGP_SAFE_UNCERTAINTY_DETACH = True
+
+# PA-DAGP replaces ESA-Asym only. RAST and CSD-v1R remain unchanged.
+USE_ESA_ASYM = False
+USE_RAST = True
+RAST_VERSION = "v1.2_pa_dagp_v1_noesa"
+USE_CSD_V1R = True
+
+# Incompatible experimental branches stay disabled.
+USE_LCEG = False
+USE_TCE = False
+USE_HR_BFR = False
+USE_CSSD = False
+USE_NDR_BRANCH = False
+USE_NDR_V2 = False
+USE_HBNS_LITE = False
+USE_EPR_POS = False
+USE_PROTO_CONTRAST = False
+USE_MULTI_VIEW_FEATURE = False
+use_multi_view_feature = False
+USE_VIEW_CONSISTENCY = False
+use_view_consistency = False
+USE_TADR_ROUTER = False

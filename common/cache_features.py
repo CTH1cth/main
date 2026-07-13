@@ -32,10 +32,31 @@ def preprocess_image(image_path, size):
     return tensor.unsqueeze(0), original_size
 
 
+def resolve_key_projection_at_layer(model, layer_index):
+    """Resolve one ViT attention-key projection by zero-based encoder index."""
+    layers = getattr(getattr(model, "encoder", None), "layer", None)
+    if layers is None:
+        raise AttributeError("DINO model has no encoder.layer sequence.")
+    layer_index = int(layer_index)
+    if layer_index < 0:
+        layer_index += len(layers)
+    if layer_index < 0 or layer_index >= len(layers):
+        raise IndexError(
+            f"DINO key projection layer index out of range: {layer_index} for {len(layers)} layers."
+        )
+    try:
+        module = layers[layer_index].attention.attention.key
+    except AttributeError as exc:
+        raise AttributeError(
+            f"Could not resolve attention key projection for encoder layer {layer_index}."
+        ) from exc
+    return module, f"encoder.layer[{layer_index}].attention.attention.key"
+
+
 def resolve_key_projection(model):
     # DINOv1/DINOv2 在 transformers 中都优先取最后一层 attention key 投影。
     try:
-        return model.encoder.layer[-1].attention.attention.key, "encoder.layer[-1].attention.attention.key"
+        return resolve_key_projection_at_layer(model, -1)
     except AttributeError:
         pass
 

@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from models.cacd import CACDV1BaseHead
+
 
 class SimpleConvSegHead(nn.Module):
     def __init__(self, in_channels):
@@ -208,7 +210,7 @@ class NativeDetailResidualBranch(nn.Module):
         )
         return self.compute_sobel_map(gray)
 
-    def forward(self, image_68, coarse_prob_68):
+    def forward(self, image_68, coarse_prob_68, return_probe_aux=False):
         sobel_68 = self.compute_sobel(image_68)
         inputs = []
         if self.input_rgb:
@@ -218,9 +220,950 @@ class NativeDetailResidualBranch(nn.Module):
         if self.input_coarse_prob:
             inputs.append(coarse_prob_68)
         ndr_input = torch.cat(inputs, dim=1)
-        raw_residual = self.out_conv(self.block3(self.block2(self.block1(ndr_input))))
+        hidden1 = self.block1(ndr_input)
+        hidden2 = self.block2(hidden1)
+        hidden3 = self.block3(hidden2)
+        raw_residual = self.out_conv(hidden3)
         residual = raw_residual.tanh() * raw_residual.new_tensor(self.residual_clip)
+        if return_probe_aux:
+            return residual, sobel_68, hidden2.detach()
         return residual, sobel_68
+
+
+class _CSDConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1, groups=1, dilation=1, use_gn=True):
+        super().__init__()
+        self.conv = nn.Conv2d(
+            int(in_channels),
+            int(out_channels),
+            kernel_size=int(kernel_size),
+            padding=int(padding),
+            dilation=int(dilation),
+            groups=int(groups),
+            bias=True,
+        )
+        if bool(use_gn):
+            group_count = max(1, min(8, int(out_channels)))
+            while int(out_channels) % group_count != 0 and group_count > 1:
+                group_count -= 1
+            self.norm = nn.GroupNorm(group_count, int(out_channels))
+        else:
+            self.norm = nn.Identity()
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        return self.act(self.norm(self.conv(x)))
+
+
+class _CSDDepthwiseSeparableBlock(nn.Module):
+    def __init__(self, channels, dilation=1, use_gn=True):
+        super().__init__()
+        channels = int(channels)
+        dilation = int(dilation)
+        self.dw = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=3,
+            padding=dilation,
+            dilation=dilation,
+            groups=channels,
+            bias=True,
+        )
+        self.pw = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        if bool(use_gn):
+            group_count = max(1, min(8, channels))
+            while channels % group_count != 0 and group_count > 1:
+                group_count -= 1
+            self.norm = nn.GroupNorm(group_count, channels)
+        else:
+            self.norm = nn.Identity()
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        return self.act(self.norm(self.pw(self.dw(x))))
+
+
+class CSDV1Head(nn.Module):
+    def __init__(
+        self,
+        in_channels=384,
+        loss_size=68,
+        sem_dim=64,
+        detail_dim=32,
+        fusion_dim=64,
+        use_dagp_semantic=True,
+        use_local_context=True,
+        use_global_context=True,
+        dagp_topk=12,
+        dagp_tau=0.07,
+        dagp_alpha_max=0.05,
+        dagp_gamma_max=0.03,
+        warmup_epoch=6,
+        ramp_start_epoch=7,
+        ramp_end_epoch=15,
+        beta_max=0.10,
+        residual_clip=2.0,
+        bg_suppress_strength=0.70,
+        use_bg_detail_lock=True,
+        use_boundary_aux=True,
+    ):
+        super().__init__()
+        if int(in_channels) <= 0:
+            raise ValueError(f"CSD in_channels must be positive, got {in_channels}")
+        if int(loss_size) <= 0:
+            raise ValueError(f"CSD loss_size must be positive, got {loss_size}")
+        if int(sem_dim) <= 0 or int(detail_dim) <= 0 or int(fusion_dim) <= 0:
+            raise ValueError("CSD dims must be positive.")
+        if int(dagp_topk) <= 0:
+            raise ValueError(f"CSD DAGP topk must be positive, got {dagp_topk}")
+        if float(dagp_tau) <= 0.0:
+            raise ValueError(f"CSD DAGP tau must be positive, got {dagp_tau}")
+        if float(residual_clip) <= 0.0:
+            raise ValueError(f"CSD residual_clip must be positive, got {residual_clip}")
+        self.loss_size = int(loss_size)
+        self.sem_dim = int(sem_dim)
+        self.detail_dim = int(detail_dim)
+        self.fusion_dim = int(fusion_dim)
+        self.use_dagp_semantic = bool(use_dagp_semantic)
+        self.use_local_context = bool(use_local_context)
+        self.use_global_context = bool(use_global_context)
+        self.topk = int(dagp_topk)
+        self.tau = float(dagp_tau)
+        self.alpha_max = float(dagp_alpha_max)
+        self.gamma_max = float(dagp_gamma_max)
+        self.warmup_epoch = int(warmup_epoch)
+        self.ramp_start_epoch = int(ramp_start_epoch)
+        self.ramp_end_epoch = int(ramp_end_epoch)
+        self.beta_max = float(beta_max)
+        self.residual_clip = float(residual_clip)
+        self.bg_suppress_strength = float(bg_suppress_strength)
+        self.use_bg_detail_lock = bool(use_bg_detail_lock)
+        self.use_boundary_aux = bool(use_boundary_aux)
+
+        sem_groups = max(1, min(8, self.sem_dim))
+        while self.sem_dim % sem_groups != 0 and sem_groups > 1:
+            sem_groups -= 1
+        self.sem_proj = nn.Sequential(
+            nn.Conv2d(int(in_channels), self.sem_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(sem_groups, self.sem_dim),
+            nn.GELU(),
+        )
+        self.sem_local = _CSDDepthwiseSeparableBlock(self.sem_dim, dilation=1)
+        self.sem_mid = _CSDDepthwiseSeparableBlock(self.sem_dim, dilation=2)
+        self.sem_global = nn.Sequential(
+            nn.Conv2d(self.sem_dim, self.sem_dim, kernel_size=1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(self.sem_dim, self.sem_dim, kernel_size=1, bias=True),
+        )
+        self.value = nn.Linear(self.sem_dim, self.sem_dim)
+        self.graph_proj = nn.Conv2d(self.sem_dim, self.sem_dim, kernel_size=1, bias=True)
+        self.base_head = nn.Conv2d(self.sem_dim, 1, kernel_size=1)
+        self.coarse_head = nn.Conv2d(self.sem_dim, 1, kernel_size=1)
+
+        self.detail_block1 = _CSDConvBlock(5, self.detail_dim)
+        self.detail_block2 = _CSDConvBlock(self.detail_dim, self.detail_dim)
+        self.detail_block3 = _CSDDepthwiseSeparableBlock(self.detail_dim, dilation=1)
+        self.detail_proj = nn.Conv2d(self.detail_dim, self.sem_dim, kernel_size=1, bias=True)
+
+        fusion_in = self.sem_dim + self.detail_dim + 3
+        self.detail_gate = nn.Sequential(
+            _CSDConvBlock(fusion_in, self.fusion_dim),
+            nn.Conv2d(self.fusion_dim, 1, kernel_size=1, bias=True),
+        )
+        self.residual_head = nn.Sequential(
+            _CSDConvBlock(self.sem_dim, self.fusion_dim),
+            nn.Conv2d(self.fusion_dim, 1, kernel_size=1, bias=True),
+        )
+        self.boundary_head = nn.Conv2d(self.sem_dim, 1, kernel_size=1, bias=True)
+        nn.init.zeros_(self.residual_head[-1].weight)
+        nn.init.zeros_(self.residual_head[-1].bias)
+        nn.init.zeros_(self.boundary_head.weight)
+        nn.init.zeros_(self.boundary_head.bias)
+
+        sobel_x = torch.tensor(
+            [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]],
+            dtype=torch.float32,
+        ).unsqueeze(0)
+        sobel_y = torch.tensor(
+            [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]],
+            dtype=torch.float32,
+        ).unsqueeze(0)
+        self.register_buffer("sobel_x", sobel_x)
+        self.register_buffer("sobel_y", sobel_y)
+        self.register_buffer("current_epoch_tensor", torch.zeros(1, dtype=torch.float32))
+
+    def set_epoch(self, epoch):
+        self.current_epoch_tensor.fill_(float(epoch))
+
+    def _ramp_scale(self):
+        epoch = int(self.current_epoch_tensor.item())
+        if epoch <= self.warmup_epoch:
+            return 0.0
+        if epoch < self.ramp_start_epoch:
+            return 0.0
+        if epoch >= self.ramp_end_epoch:
+            return 1.0
+        denom = max(1, self.ramp_end_epoch - self.ramp_start_epoch + 1)
+        return float(epoch - self.ramp_start_epoch + 1) / float(denom)
+
+    def _compute_sobel(self, image_68):
+        if image_68.ndim != 4 or image_68.shape[1] != 3:
+            raise ValueError(f"CSD image_68 must be [B,3,H,W], got {list(image_68.shape)}")
+        gray = 0.299 * image_68[:, 0:1] + 0.587 * image_68[:, 1:2] + 0.114 * image_68[:, 2:3]
+        sx = self.sobel_x.to(device=gray.device, dtype=gray.dtype)
+        sy = self.sobel_y.to(device=gray.device, dtype=gray.dtype)
+        dx = F.conv2d(gray, sx, padding=1)
+        dy = F.conv2d(gray, sy, padding=1)
+        edge = torch.sqrt(dx * dx + dy * dy + 1e-6)
+        return self._normalize_map_per_image(edge)
+
+    @staticmethod
+    def _normalize_map_per_image(tensor, eps=1e-6):
+        flat = tensor.flatten(1)
+        min_val = flat.min(dim=1).values.view(-1, 1, 1, 1)
+        max_val = flat.max(dim=1).values.view(-1, 1, 1, 1)
+        return torch.clamp((tensor - min_val) / (max_val - min_val + float(eps)), 0.0, 1.0)
+
+    @staticmethod
+    def _gather_neighbors(v, idx):
+        bsz, num_nodes, dim = v.shape
+        k = idx.shape[-1]
+        batch_offset = torch.arange(bsz, device=idx.device, dtype=idx.dtype).view(bsz, 1, 1) * num_nodes
+        flat_idx = (idx + batch_offset).reshape(-1)
+        return v.reshape(bsz * num_nodes, dim).index_select(0, flat_idx).reshape(bsz, num_nodes, k, dim)
+
+    def _topk_affinity(self, feat):
+        _, _, height, width = feat.shape
+        num_nodes = height * width
+        if num_nodes <= 1:
+            raise ValueError(f"CSD graph requires at least 2 spatial nodes, got H={height}, W={width}")
+        x = feat.flatten(2).transpose(1, 2).detach()
+        x_aff = F.normalize(x.float(), dim=-1)
+        sim = torch.bmm(x_aff, x_aff.transpose(1, 2))
+        diag = torch.eye(num_nodes, device=sim.device, dtype=torch.bool).unsqueeze(0)
+        sim = sim.masked_fill(diag, -float("inf"))
+        k = min(self.topk, num_nodes - 1)
+        topk_val, topk_idx = torch.topk(sim, k=k, dim=-1)
+        attn = torch.softmax(topk_val / self.tau, dim=-1)
+        return attn, topk_idx
+
+    def _semantic_graph(self, raw_feat, sem, gamma_eff):
+        if not self.use_dagp_semantic:
+            return torch.zeros_like(sem)
+        with torch.no_grad():
+            attn, topk_idx = self._topk_affinity(raw_feat)
+        bsz, _, height, width = sem.shape
+        z = sem.flatten(2).transpose(1, 2)
+        value = self.value(z)
+        neigh_value = self._gather_neighbors(value, topk_idx)
+        agg = (attn.to(dtype=value.dtype).unsqueeze(-1) * neigh_value).sum(dim=2)
+        z_prop = z + sem.new_tensor(float(gamma_eff)) * agg
+        z_prop = z_prop.transpose(1, 2).reshape(bsz, self.sem_dim, height, width)
+        return self.graph_proj(z_prop)
+
+    def _semantic_branch(self, feat, scale):
+        sem = self.sem_proj(feat)
+        semantic_feat = sem
+        if self.use_local_context:
+            semantic_feat = semantic_feat + self.sem_local(sem) + self.sem_mid(sem)
+        if self.use_global_context:
+            global_feat = F.adaptive_avg_pool2d(sem, output_size=1)
+            semantic_feat = semantic_feat + self.sem_global(global_feat).expand_as(sem)
+        alpha_eff = self.alpha_max * float(scale) if self.use_dagp_semantic else 0.0
+        gamma_eff = self.gamma_max * float(scale) if self.use_dagp_semantic else 0.0
+        graph_feat = self._semantic_graph(feat, sem, gamma_eff)
+        semantic_feat = semantic_feat + sem.new_tensor(float(alpha_eff)) * graph_feat
+        return semantic_feat, alpha_eff, gamma_eff
+
+    def forward(self, feat, image_68=None, return_aux=False, bg_reliable_68=None):
+        if feat.ndim != 4:
+            raise ValueError(f"CSD feature must be [B,C,H,W], got {list(feat.shape)}")
+        if image_68 is None:
+            raise ValueError("CSD-v1 requires image_68.")
+        target_size = (self.loss_size, self.loss_size)
+        if tuple(image_68.shape[-2:]) != target_size:
+            raise ValueError(f"CSD image_68 spatial size must be {target_size}, got {tuple(image_68.shape[-2:])}")
+        image_68 = image_68.to(dtype=feat.dtype)
+        csd_scale = float(self._ramp_scale())
+        beta_eff = self.beta_max * csd_scale
+
+        semantic_feat_37, alpha_eff, gamma_eff = self._semantic_branch(feat, csd_scale)
+        base_logits_37 = self.base_head(semantic_feat_37)
+        coarse_logits_37 = self.coarse_head(semantic_feat_37)
+        base_logits_68 = F.interpolate(base_logits_37, size=target_size, mode="bilinear", align_corners=False)
+        coarse_logits_68 = F.interpolate(coarse_logits_37, size=target_size, mode="bilinear", align_corners=False)
+        semantic_feat_68 = F.interpolate(semantic_feat_37, size=target_size, mode="bilinear", align_corners=False)
+
+        coarse_prob_68 = torch.sigmoid(coarse_logits_68.detach())
+        sobel_68 = self._compute_sobel(image_68)
+        detail_input = torch.cat([image_68, sobel_68, coarse_prob_68], dim=1)
+        detail_feat_68 = self.detail_block3(self.detail_block2(self.detail_block1(detail_input)))
+        uncertainty_68 = torch.clamp(1.0 - 2.0 * torch.abs(coarse_prob_68 - 0.5), 0.0, 1.0)
+        fusion_input = torch.cat([semantic_feat_68, detail_feat_68, coarse_prob_68, uncertainty_68, sobel_68], dim=1)
+        detail_gate_raw = torch.sigmoid(self.detail_gate(fusion_input))
+        if self.training and self.use_bg_detail_lock and bg_reliable_68 is not None:
+            bg_mask = bg_reliable_68.to(device=detail_gate_raw.device, dtype=detail_gate_raw.dtype).detach()
+            detail_gate = detail_gate_raw * (1.0 - detail_gate_raw.new_tensor(self.bg_suppress_strength) * bg_mask)
+            detail_gate = torch.clamp(detail_gate, 0.0, 1.0)
+        else:
+            bg_mask = torch.zeros_like(detail_gate_raw)
+            detail_gate = detail_gate_raw
+        detail_proj_68 = self.detail_proj(detail_feat_68)
+        detail_injected_68 = detail_gate * detail_proj_68
+        structure_feat_68 = semantic_feat_68 + semantic_feat_68.new_tensor(float(csd_scale)) * detail_injected_68
+        residual_logits_68 = torch.clamp(
+            self.residual_head(structure_feat_68),
+            -self.residual_clip,
+            self.residual_clip,
+        )
+        boundary_logits_68 = self.boundary_head(structure_feat_68)
+        final_logits_68 = coarse_logits_68 + coarse_logits_68.new_tensor(float(beta_eff)) * residual_logits_68
+
+        output = {
+            "logits": final_logits_68,
+            "final_logits": final_logits_68,
+            "coarse_logits": coarse_logits_68,
+            "coarse_logits_37": coarse_logits_37,
+            "coarse_logits_68": coarse_logits_68,
+            "base_logits": base_logits_68,
+            "base_logits_37": base_logits_37,
+            "boundary_logits": boundary_logits_68,
+            "boundary_logits_68": boundary_logits_68,
+        }
+        if return_aux:
+            gate_detached = detail_gate.detach()
+            residual_abs = residual_logits_68.detach().abs()
+            output.update(
+                {
+                    "semantic_feat_37": semantic_feat_37,
+                    "semantic_feat_68": semantic_feat_68,
+                    "detail_feat_68": detail_feat_68,
+                    "coarse_prob_68": coarse_prob_68,
+                    "sobel_68": sobel_68,
+                    "edge_norm_68": sobel_68,
+                    "uncertainty_68": uncertainty_68,
+                    "csd_detail_gate": detail_gate,
+                    "csd_detail_gate_raw": detail_gate_raw,
+                    "csd_bg_mask": bg_mask,
+                    "csd_detail_injected_68": detail_injected_68,
+                    "csd_residual_logits": residual_logits_68,
+                    "residual_logits_68": residual_logits_68,
+                    "csd_scale": coarse_logits_68.new_tensor(float(csd_scale)),
+                    "csd_alpha_eff": coarse_logits_68.new_tensor(float(alpha_eff)),
+                    "csd_gamma_eff": coarse_logits_68.new_tensor(float(gamma_eff)),
+                    "csd_beta_eff": coarse_logits_68.new_tensor(float(beta_eff)),
+                    "csd_detail_gate_mean": gate_detached.mean(),
+                    "csd_detail_gate_min": gate_detached.min(),
+                    "csd_detail_gate_max": gate_detached.max(),
+                    "csd_residual_abs_mean": residual_abs.mean(),
+                    "csd_residual_abs_max": residual_abs.max(),
+                }
+            )
+        return output
+
+
+class CSDV1RResidual(nn.Module):
+    def __init__(
+        self,
+        in_channels=384,
+        sem_dim=64,
+        detail_dim=32,
+        fusion_dim=64,
+        beta_max=0.05,
+        residual_clip=2.0,
+        warmup_epoch=6,
+        ramp_start_epoch=7,
+        ramp_end_epoch=15,
+        bg_suppress_strength=0.70,
+        use_bg_detail_lock=True,
+        use_res_zero_init=True,
+        use_gate_bias_init=True,
+        gate_bias_init=-2.0,
+    ):
+        super().__init__()
+        if int(in_channels) <= 0:
+            raise ValueError(f"CSD_V1R input channels must be positive, got {in_channels}")
+        if int(sem_dim) <= 0 or int(detail_dim) <= 0 or int(fusion_dim) <= 0:
+            raise ValueError("CSD_V1R dims must be positive.")
+        if float(residual_clip) <= 0.0:
+            raise ValueError(f"CSD_V1R_RESIDUAL_CLIP must be positive, got {residual_clip}")
+
+        self.sem_dim = int(sem_dim)
+        self.detail_dim = int(detail_dim)
+        self.fusion_dim = int(fusion_dim)
+        self.beta_max = float(beta_max)
+        self.residual_clip = float(residual_clip)
+        self.warmup_epoch = int(warmup_epoch)
+        self.ramp_start_epoch = int(ramp_start_epoch)
+        self.ramp_end_epoch = int(ramp_end_epoch)
+        self.bg_suppress_strength = float(bg_suppress_strength)
+        self.use_bg_detail_lock = bool(use_bg_detail_lock)
+
+        sem_groups = max(1, min(8, self.sem_dim))
+        while self.sem_dim % sem_groups != 0 and sem_groups > 1:
+            sem_groups -= 1
+        self.csd_feat_proj = nn.Sequential(
+            nn.Conv2d(int(in_channels), self.sem_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(sem_groups, self.sem_dim),
+            nn.GELU(),
+        )
+        self.detail_encoder = nn.Sequential(
+            _CSDConvBlock(5, self.detail_dim),
+            _CSDConvBlock(self.detail_dim, self.detail_dim),
+            _CSDDepthwiseSeparableBlock(self.detail_dim),
+        )
+        self.detail_proj = nn.Conv2d(self.detail_dim, self.sem_dim, kernel_size=1, bias=True)
+        fusion_in = self.sem_dim + self.detail_dim + 3
+        self.detail_gate = nn.Sequential(
+            _CSDConvBlock(fusion_in, self.fusion_dim),
+            nn.Conv2d(self.fusion_dim, 1, kernel_size=1, bias=True),
+        )
+        self.residual_head = nn.Sequential(
+            _CSDConvBlock(self.sem_dim, self.fusion_dim),
+            nn.Conv2d(self.fusion_dim, 1, kernel_size=1, bias=True),
+        )
+        if bool(use_res_zero_init):
+            nn.init.zeros_(self.residual_head[-1].weight)
+            nn.init.zeros_(self.residual_head[-1].bias)
+        if bool(use_gate_bias_init):
+            nn.init.constant_(self.detail_gate[-1].bias, float(gate_bias_init))
+
+        sobel_x = torch.tensor(
+            [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]],
+            dtype=torch.float32,
+        ).unsqueeze(0)
+        sobel_y = torch.tensor(
+            [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]],
+            dtype=torch.float32,
+        ).unsqueeze(0)
+        self.register_buffer("sobel_x", sobel_x)
+        self.register_buffer("sobel_y", sobel_y)
+        self.register_buffer("current_epoch_tensor", torch.zeros(1, dtype=torch.float32))
+
+    def set_epoch(self, epoch):
+        self.current_epoch_tensor.fill_(float(epoch))
+
+    def _ramp_scale(self):
+        epoch = int(self.current_epoch_tensor.item())
+        if epoch <= self.warmup_epoch:
+            return 0.0
+        if epoch < self.ramp_start_epoch:
+            return 0.0
+        if epoch >= self.ramp_end_epoch:
+            return 1.0
+        denom = max(1, self.ramp_end_epoch - self.ramp_start_epoch + 1)
+        return float(epoch - self.ramp_start_epoch + 1) / float(denom)
+
+    @staticmethod
+    def _normalize_map_per_image(tensor, eps=1e-6):
+        flat = tensor.detach().flatten(1)
+        min_val = flat.min(dim=1).values.view(-1, 1, 1, 1)
+        max_val = flat.max(dim=1).values.view(-1, 1, 1, 1)
+        return torch.clamp((tensor - min_val) / (max_val - min_val + float(eps)), 0.0, 1.0)
+
+    def _compute_sobel(self, image_68):
+        if image_68.ndim != 4 or image_68.shape[1] != 3:
+            raise ValueError(f"CSD-v1R image_68 must be [B,3,H,W], got {list(image_68.shape)}")
+        gray = 0.299 * image_68[:, 0:1] + 0.587 * image_68[:, 1:2] + 0.114 * image_68[:, 2:3]
+        sx = self.sobel_x.to(device=gray.device, dtype=gray.dtype)
+        sy = self.sobel_y.to(device=gray.device, dtype=gray.dtype)
+        dx = F.conv2d(gray, sx, padding=1)
+        dy = F.conv2d(gray, sy, padding=1)
+        edge = torch.sqrt(dx * dx + dy * dy + 1e-6)
+        return self._normalize_map_per_image(edge)
+
+    def forward(self, feature, image_68, coarse_logits_68, bg_reliable_68=None):
+        if feature.ndim != 4:
+            raise ValueError(f"CSD-v1R feature must be [B,C,H,W], got {list(feature.shape)}")
+        if image_68 is None:
+            raise ValueError("CSD-v1R requires image_68.")
+        if coarse_logits_68.ndim != 4 or coarse_logits_68.shape[1] != 1:
+            raise ValueError(f"CSD-v1R coarse_logits_68 must be [B,1,H,W], got {list(coarse_logits_68.shape)}")
+        if tuple(image_68.shape[-2:]) != tuple(coarse_logits_68.shape[-2:]):
+            raise ValueError(
+                "CSD-v1R image_68 and coarse_logits_68 spatial sizes must match, got "
+                f"{tuple(image_68.shape[-2:])} and {tuple(coarse_logits_68.shape[-2:])}"
+            )
+
+        image_68 = image_68.to(dtype=feature.dtype)
+        coarse_logits_68 = coarse_logits_68.to(dtype=feature.dtype)
+        csd_scale = float(self._ramp_scale())
+        beta_eff = self.beta_max * csd_scale
+
+        sem_feat_37 = self.csd_feat_proj(feature)
+        sem_feat_68 = F.interpolate(
+            sem_feat_37,
+            size=coarse_logits_68.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        coarse_prob_68 = torch.sigmoid(coarse_logits_68.detach())
+        sobel_68 = self._compute_sobel(image_68)
+        detail_input = torch.cat([image_68, sobel_68, coarse_prob_68], dim=1)
+        detail_feat_68 = self.detail_encoder(detail_input)
+        uncertainty_68 = torch.clamp(1.0 - 2.0 * torch.abs(coarse_prob_68 - 0.5), 0.0, 1.0)
+        fusion_input = torch.cat(
+            [sem_feat_68, detail_feat_68, coarse_prob_68, uncertainty_68, sobel_68.detach()],
+            dim=1,
+        )
+        detail_gate_raw = torch.sigmoid(self.detail_gate(fusion_input))
+        if self.training and self.use_bg_detail_lock and bg_reliable_68 is not None:
+            bg_mask = bg_reliable_68.to(device=detail_gate_raw.device, dtype=detail_gate_raw.dtype).detach()
+            detail_gate = detail_gate_raw * (1.0 - detail_gate_raw.new_tensor(self.bg_suppress_strength) * bg_mask)
+            detail_gate = torch.clamp(detail_gate, 0.0, 1.0)
+        else:
+            bg_mask = torch.zeros_like(detail_gate_raw)
+            detail_gate = detail_gate_raw
+
+        detail_proj_68 = self.detail_proj(detail_feat_68)
+        detail_injected_68 = detail_gate * detail_proj_68
+        res_feat_68 = sem_feat_68 + detail_injected_68
+        residual_logits_68 = torch.clamp(
+            self.residual_head(res_feat_68),
+            -self.residual_clip,
+            self.residual_clip,
+        )
+
+        gate_detached = detail_gate.detach()
+        residual_abs = residual_logits_68.detach().abs()
+        return {
+            "csd_residual_logits": residual_logits_68,
+            "residual_logits_68": residual_logits_68,
+            "csd_detail_gate": detail_gate,
+            "csd_detail_gate_raw": detail_gate_raw,
+            "csd_detail_feat": detail_feat_68,
+            "detail_feat_68": detail_feat_68,
+            "csd_sem_feat": sem_feat_68,
+            "semantic_feat_native": sem_feat_37,
+            "semantic_feat_37": sem_feat_37,
+            "semantic_feat_68": sem_feat_68,
+            "sobel_68": sobel_68,
+            "edge_norm_68": sobel_68,
+            "uncertainty_68": uncertainty_68,
+            "csd_bg_mask": bg_mask,
+            "csd_detail_injected_68": detail_injected_68,
+            "csd_scale": coarse_logits_68.new_tensor(float(csd_scale)),
+            "csd_beta_eff": coarse_logits_68.new_tensor(float(beta_eff)),
+            "beta_eff": coarse_logits_68.new_tensor(float(beta_eff)),
+            "csd_detail_gate_mean": gate_detached.mean(),
+            "csd_detail_gate_min": gate_detached.min(),
+            "csd_detail_gate_max": gate_detached.max(),
+            "csd_residual_abs_mean": residual_abs.mean(),
+            "csd_residual_abs_max": residual_abs.max(),
+        }
+
+
+class HRBFRV1Branch(nn.Module):
+    def __init__(
+        self,
+        in_channels=384,
+        sem_dim=32,
+        detail_dim=32,
+        hidden_dim=32,
+        residual_clip=2.0,
+        use_rgb=True,
+        use_sobel=True,
+        use_anchor_prob=True,
+        use_anchor_uncert=True,
+        use_dino_sem=True,
+        use_res_zero_init=True,
+    ):
+        super().__init__()
+        if int(sem_dim) <= 0 or int(detail_dim) <= 0 or int(hidden_dim) <= 0:
+            raise ValueError("HR-BFR dims must be positive.")
+        if float(residual_clip) <= 0.0:
+            raise ValueError(f"HR_BFR_RESIDUAL_CLIP must be positive, got {residual_clip}")
+        self.sem_dim = int(sem_dim)
+        self.detail_dim = int(detail_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.residual_clip = float(residual_clip)
+        self.use_rgb = bool(use_rgb)
+        self.use_sobel = bool(use_sobel)
+        self.use_anchor_prob = bool(use_anchor_prob)
+        self.use_anchor_uncert = bool(use_anchor_uncert)
+        self.use_dino_sem = bool(use_dino_sem)
+
+        sem_groups = max(1, min(8, self.sem_dim))
+        while self.sem_dim % sem_groups != 0 and sem_groups > 1:
+            sem_groups -= 1
+        self.dino_sem_proj = nn.Sequential(
+            nn.Conv2d(int(in_channels), self.sem_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(sem_groups, self.sem_dim),
+            nn.GELU(),
+        )
+
+        input_channels = 0
+        input_channels += 3 if self.use_rgb else 0
+        input_channels += 1 if self.use_sobel else 0
+        input_channels += 1 if self.use_anchor_prob else 0
+        input_channels += 1 if self.use_anchor_uncert else 0
+        input_channels += self.sem_dim if self.use_dino_sem else 0
+        input_channels += 1
+        self.net = nn.Sequential(
+            _CSDConvBlock(input_channels, self.detail_dim),
+            _CSDConvBlock(self.detail_dim, self.hidden_dim),
+            _CSDDepthwiseSeparableBlock(self.hidden_dim),
+            _CSDConvBlock(self.hidden_dim, self.hidden_dim),
+            nn.Conv2d(self.hidden_dim, 1, kernel_size=1, bias=True),
+        )
+        if bool(use_res_zero_init):
+            nn.init.zeros_(self.net[-1].weight)
+            nn.init.zeros_(self.net[-1].bias)
+
+        sobel_x = torch.tensor(
+            [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]],
+            dtype=torch.float32,
+        ).unsqueeze(0)
+        sobel_y = torch.tensor(
+            [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]],
+            dtype=torch.float32,
+        ).unsqueeze(0)
+        self.register_buffer("sobel_x", sobel_x)
+        self.register_buffer("sobel_y", sobel_y)
+
+    @staticmethod
+    def _normalize_map_per_image(tensor, eps=1e-6):
+        flat = tensor.detach().flatten(1)
+        min_val = flat.min(dim=1).values.view(-1, 1, 1, 1)
+        max_val = flat.max(dim=1).values.view(-1, 1, 1, 1)
+        return torch.clamp((tensor - min_val) / (max_val - min_val + float(eps)), 0.0, 1.0)
+
+    def compute_sobel(self, image):
+        if image.ndim != 4 or image.shape[1] != 3:
+            raise ValueError(f"HR-BFR image must be [B,3,H,W], got {list(image.shape)}")
+        gray = 0.299 * image[:, 0:1] + 0.587 * image[:, 1:2] + 0.114 * image[:, 2:3]
+        sx = self.sobel_x.to(device=gray.device, dtype=gray.dtype)
+        sy = self.sobel_y.to(device=gray.device, dtype=gray.dtype)
+        dx = F.conv2d(gray, sx, padding=1)
+        dy = F.conv2d(gray, sy, padding=1)
+        edge = torch.sqrt(dx * dx + dy * dy + 1e-6)
+        return self._normalize_map_per_image(edge)
+
+    def forward(self, feature, image_136, anchor_prob_136, anchor_uncert_136, band_gate_136):
+        if image_136 is None:
+            raise ValueError("HR-BFR requires image_136.")
+        image_136 = image_136.to(dtype=feature.dtype)
+        anchor_prob_136 = anchor_prob_136.to(dtype=feature.dtype)
+        anchor_uncert_136 = anchor_uncert_136.to(dtype=feature.dtype)
+        band_gate_136 = band_gate_136.to(dtype=feature.dtype)
+        sobel_136 = self.compute_sobel(image_136)
+        dino_sem_37 = self.dino_sem_proj(feature)
+        dino_sem_136 = F.interpolate(dino_sem_37, size=image_136.shape[-2:], mode="bilinear", align_corners=False)
+
+        inputs = []
+        if self.use_rgb:
+            inputs.append(image_136)
+        if self.use_sobel:
+            inputs.append(sobel_136)
+        if self.use_anchor_prob:
+            inputs.append(anchor_prob_136)
+        if self.use_anchor_uncert:
+            inputs.append(anchor_uncert_136)
+        if self.use_dino_sem:
+            inputs.append(dino_sem_136)
+        inputs.append(band_gate_136)
+        raw_residual = self.net(torch.cat(inputs, dim=1))
+        residual = torch.clamp(raw_residual, -self.residual_clip, self.residual_clip) * band_gate_136
+        return {
+            "hr_residual_logits": residual,
+            "hr_sobel_136": sobel_136,
+            "hr_dino_sem_37": dino_sem_37,
+            "hr_dino_sem_136": dino_sem_136,
+        }
+
+
+class DAGPSafeCSDV1RHead(nn.Module):
+    def __init__(
+        self,
+        coarse_path,
+        residual_branch,
+        loss_size=68,
+        hr_bfr_branch=None,
+        use_hr_bfr=False,
+        hr_size=136,
+        hr_beta_max=0.05,
+        hr_warmup_epoch=6,
+        hr_ramp_start_epoch=7,
+        hr_ramp_end_epoch=15,
+        hr_boundary_thresh=0.5,
+        hr_boundary_radius_68=2,
+        hr_boundary_dilate_136=2,
+        hr_max_band_ratio=0.35,
+        hr_detach_anchor=True,
+        hr_eval_res_scale=1.0,
+    ):
+        super().__init__()
+        self.coarse_path = coarse_path
+        self.csd_residual = residual_branch
+        self.loss_size = int(loss_size)
+        self.hr_bfr_branch = hr_bfr_branch
+        self.use_hr_bfr = bool(use_hr_bfr)
+        self.hr_size = int(hr_size)
+        self.hr_beta_max = float(hr_beta_max)
+        self.hr_warmup_epoch = int(hr_warmup_epoch)
+        self.hr_ramp_start_epoch = int(hr_ramp_start_epoch)
+        self.hr_ramp_end_epoch = int(hr_ramp_end_epoch)
+        self.hr_boundary_thresh = float(hr_boundary_thresh)
+        self.hr_boundary_radius_68 = int(hr_boundary_radius_68)
+        self.hr_boundary_dilate_136 = int(hr_boundary_dilate_136)
+        self.hr_max_band_ratio = float(hr_max_band_ratio)
+        self.hr_detach_anchor = bool(hr_detach_anchor)
+        self.set_hr_eval_res_scale(hr_eval_res_scale)
+        self.topk = getattr(coarse_path, "topk", 0)
+        self.tau = getattr(coarse_path, "tau", 0.0)
+        self.use_prob_gate = getattr(coarse_path, "use_prob_gate", False)
+        self.use_uncertainty_output_gate = getattr(coarse_path, "use_uncertainty_output_gate", False)
+        self.register_buffer("current_epoch_tensor", torch.zeros(1, dtype=torch.float32))
+
+    def set_hr_eval_res_scale(self, scale):
+        scale = float(scale)
+        if not math.isfinite(scale) or scale < 0.0:
+            raise ValueError(f"HR_BFR_EVAL_RES_SCALE must be finite and non-negative, got {scale}")
+        self.hr_eval_res_scale = scale
+
+    def set_epoch(self, epoch):
+        self.current_epoch_tensor.fill_(float(epoch))
+        if hasattr(self.coarse_path, "set_epoch"):
+            self.coarse_path.set_epoch(epoch)
+        if hasattr(self.csd_residual, "set_epoch"):
+            self.csd_residual.set_epoch(epoch)
+        if hasattr(self.hr_bfr_branch, "set_epoch"):
+            self.hr_bfr_branch.set_epoch(epoch)
+
+    def _hr_scale(self):
+        epoch = int(self.current_epoch_tensor.item())
+        if epoch <= self.hr_warmup_epoch:
+            return 0.0
+        if epoch < self.hr_ramp_start_epoch:
+            return 0.0
+        if epoch >= self.hr_ramp_end_epoch:
+            return 1.0
+        denom = max(1, self.hr_ramp_end_epoch - self.hr_ramp_start_epoch + 1)
+        return float(epoch - self.hr_ramp_start_epoch + 1) / float(denom)
+
+    @staticmethod
+    def _binary_band(mask, radius):
+        radius = int(radius)
+        if radius <= 0:
+            return torch.zeros_like(mask)
+        k = 2 * radius + 1
+        mask = mask.float()
+        dilated = F.max_pool2d(mask, kernel_size=k, stride=1, padding=radius) > 0.5
+        eroded = (1.0 - F.max_pool2d(1.0 - mask, kernel_size=k, stride=1, padding=radius)) > 0.5
+        return (dilated & ~eroded).float()
+
+    def _build_hr_band(self, anchor_prob_68):
+        anchor_bin_68 = (anchor_prob_68 >= self.hr_boundary_thresh).float()
+        band_68 = self._binary_band(anchor_bin_68, self.hr_boundary_radius_68)
+        band_136 = F.interpolate(band_68, size=(self.hr_size, self.hr_size), mode="nearest")
+        if self.hr_boundary_dilate_136 > 0:
+            k = 2 * self.hr_boundary_dilate_136 + 1
+            band_136 = F.max_pool2d(band_136, kernel_size=k, stride=1, padding=self.hr_boundary_dilate_136)
+        return band_68.detach(), (band_136 > 0.5).float().detach()
+
+    def forward(
+        self,
+        feat,
+        image_68=None,
+        image_136=None,
+        return_aux=False,
+        bg_reliable_68=None,
+        pa_compare_original=False,
+    ):
+        if image_68 is None:
+            raise ValueError("DAGPSafeCSDV1RHead requires image_68.")
+        coarse_out = self.coarse_path(
+            feat,
+            image_68=None,
+            return_aux=True,
+            pa_return_aux=return_aux,
+            pa_compare_original=pa_compare_original,
+        )
+        if not isinstance(coarse_out, dict):
+            old_coarse_logits_37 = coarse_out
+            old_base_logits_37 = None
+        else:
+            old_coarse_logits_37 = coarse_out["logits"]
+            old_base_logits_37 = coarse_out.get("base_logits")
+
+        target_size = (self.loss_size, self.loss_size)
+        old_coarse_logits_68 = F.interpolate(
+            old_coarse_logits_37,
+            size=target_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        old_base_logits_68 = (
+            F.interpolate(old_base_logits_37, size=target_size, mode="bilinear", align_corners=False)
+            if old_base_logits_37 is not None
+            else None
+        )
+        residual_out = self.csd_residual(
+            feat,
+            image_68,
+            old_coarse_logits_68,
+            bg_reliable_68=bg_reliable_68,
+        )
+        residual_logits_68 = residual_out["csd_residual_logits"]
+        beta_eff = residual_out["csd_beta_eff"].to(dtype=old_coarse_logits_68.dtype)
+        final_logits_68 = old_coarse_logits_68 + beta_eff * residual_logits_68
+        final_minus_coarse = (final_logits_68 - old_coarse_logits_68).detach().abs()
+
+        output = {
+            "logits": final_logits_68,
+            "final_logits": final_logits_68,
+            "coarse_logits": old_coarse_logits_68,
+            "coarse_logits_native": old_coarse_logits_37,
+            "coarse_logits_37": old_coarse_logits_37,
+            "coarse_logits_68": old_coarse_logits_68,
+            "old_coarse_logits_37": old_coarse_logits_37,
+            "old_coarse_logits_native": old_coarse_logits_37,
+            "old_coarse_logits_68": old_coarse_logits_68,
+            "csd_residual_logits": residual_logits_68,
+            "residual_logits_68": residual_logits_68,
+            "csd_final_minus_coarse_abs_mean": final_minus_coarse.mean(),
+            "final_minus_coarse_abs_mean": final_minus_coarse.mean(),
+        }
+        if old_base_logits_68 is not None:
+            output["base_logits"] = old_base_logits_68
+            output["base_logits_native"] = old_base_logits_37
+            output["base_logits_37"] = old_base_logits_37
+            output["old_base_logits_68"] = old_base_logits_68
+        if isinstance(coarse_out, dict):
+            for key in (
+                "graph_logits",
+                "dagp_scale",
+                "dagp_alpha_eff",
+                "dagp_gamma_eff",
+                "uncertainty_gate_mean",
+                "uncertainty_gate_min",
+                "uncertainty_gate_max",
+            ):
+                if key in coarse_out:
+                    output[key] = coarse_out[key]
+        if return_aux:
+            output.update(residual_out)
+            if isinstance(coarse_out, dict):
+                for key in (
+                    "pa_raw_polarity",
+                    "pa_signed_polarity",
+                    "pa_base_prob",
+                    "pa_anchor_valid",
+                    "pa_rho",
+                    "pa_diag",
+                ):
+                    if key in coarse_out:
+                        output[key] = coarse_out[key]
+        else:
+            # Keep essential diagnostics available for existing train/eval extractors.
+            for key in ("csd_scale", "csd_beta_eff", "beta_eff"):
+                output[key] = residual_out[key]
+        if pa_compare_original and isinstance(coarse_out, dict):
+            original_coarse_native = coarse_out.get("pa_original_coarse_logits_native")
+            if original_coarse_native is not None:
+                with torch.no_grad():
+                    original_coarse_68 = F.interpolate(
+                        original_coarse_native,
+                        size=target_size,
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    original_residual_out = self.csd_residual(
+                        feat.detach(),
+                        image_68.detach(),
+                        original_coarse_68,
+                        bg_reliable_68=(
+                            bg_reliable_68.detach() if bg_reliable_68 is not None else None
+                        ),
+                    )
+                    original_final_68 = (
+                        original_coarse_68
+                        + original_residual_out["csd_beta_eff"].to(dtype=original_coarse_68.dtype)
+                        * original_residual_out["csd_residual_logits"]
+                    )
+                output["pa_original_coarse_logits_native"] = original_coarse_native.detach()
+                output["pa_original_coarse_logits_68"] = original_coarse_68.detach()
+                output["pa_original_final_logits_68"] = original_final_68.detach()
+        if self.use_hr_bfr:
+            if self.hr_bfr_branch is None:
+                raise RuntimeError("USE_HR_BFR=True but hr_bfr_branch is missing.")
+            if image_136 is None:
+                raise ValueError("HR-BFR requires image_136 from original image resize.")
+            anchor_source = final_logits_68.detach() if self.hr_detach_anchor else final_logits_68
+            anchor_logits_136 = F.interpolate(
+                anchor_source,
+                size=(self.hr_size, self.hr_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+            anchor_prob_68 = torch.sigmoid(anchor_source.detach())
+            anchor_prob_136 = torch.sigmoid(anchor_logits_136)
+            anchor_uncert_136 = torch.clamp(1.0 - 2.0 * torch.abs(anchor_prob_136 - 0.5), 0.0, 1.0)
+            band_68, band_136 = self._build_hr_band(anchor_prob_68)
+            band_ratio_raw_136_per_image = band_136.flatten(1).mean(dim=1)
+            valid_img_mask = (band_ratio_raw_136_per_image <= self.hr_max_band_ratio).to(dtype=band_136.dtype)
+            valid_img_mask = valid_img_mask.view(-1, 1, 1, 1)
+            hr_scale = float(self._hr_scale())
+            beta_hr = self.hr_beta_max * hr_scale
+            if hr_scale > 0.0:
+                effective_band_136 = band_136 * valid_img_mask
+                effective_band_68 = band_68 * valid_img_mask
+            else:
+                effective_band_136 = torch.zeros_like(band_136)
+                effective_band_68 = torch.zeros_like(band_68)
+            hr_out = self.hr_bfr_branch(
+                feat,
+                image_136,
+                anchor_prob_136.detach(),
+                anchor_uncert_136.detach(),
+                effective_band_136,
+            )
+            hr_residual = hr_out["hr_residual_logits"]
+            # The probe multiplier is eval-only. Training numerics remain exactly the
+            # original HR-BFR formula regardless of the config value.
+            eval_res_scale = 1.0 if self.training else float(self.hr_eval_res_scale)
+            if eval_res_scale == 0.0:
+                hr_logits = anchor_logits_136
+            else:
+                hr_logits = (
+                    anchor_logits_136
+                    + anchor_logits_136.new_tensor(eval_res_scale * float(beta_hr))
+                    * effective_band_136
+                    * hr_residual
+                )
+            hr_minus_anchor = (hr_logits - anchor_logits_136).detach().abs()
+            hr_res_abs = hr_residual.detach().abs()
+            output.update(
+                {
+                    "hr_logits": hr_logits,
+                    "hr_anchor_logits": anchor_logits_136,
+                    "hr_anchor_prob": anchor_prob_136,
+                    "hr_anchor_uncert": anchor_uncert_136,
+                    "hr_residual_logits": hr_residual,
+                    "hr_band_gate": effective_band_136,
+                    "hr_band_gate_136": effective_band_136,
+                    "hr_band_gate_68": effective_band_68,
+                    "hr_band_gate_raw_136": band_136,
+                    "hr_band_gate_raw_68": band_68,
+                    "hr_valid_img_mask": valid_img_mask,
+                    "hr_valid_img_ratio": valid_img_mask.mean(),
+                    "hr_skip_img_ratio": 1.0 - valid_img_mask.mean(),
+                    "hr_beta_eff": hr_logits.new_tensor(float(beta_hr)),
+                    "hr_scale": hr_logits.new_tensor(float(hr_scale)),
+                    "hr_eval_res_scale": hr_logits.new_tensor(float(eval_res_scale)),
+                    "hr_minus_anchor_abs_mean": hr_minus_anchor.mean(),
+                    "hr_residual_abs_mean": hr_res_abs.mean(),
+                    "hr_residual_abs_max": hr_res_abs.max(),
+                    "hr_band_ratio_68": effective_band_68.detach().mean(),
+                    "hr_band_ratio_136": effective_band_136.detach().mean(),
+                    "hr_band_ratio_raw_136_mean": band_ratio_raw_136_per_image.detach().mean(),
+                    "hr_band_ratio_raw_136_max": band_ratio_raw_136_per_image.detach().max(),
+                    "hr_active_pixel_ratio": effective_band_136.detach().mean(),
+                }
+            )
+            if return_aux:
+                output.update(hr_out)
+        return output
 
 
 class AdaptiveDetailRouter(nn.Module):
@@ -267,6 +1210,298 @@ class AdaptiveDetailRouter(nn.Module):
                 f"TADR router input must be [B,{self.in_channels},H,W], got {list(x.shape)}"
             )
         return torch.sigmoid(self.out_conv(self.net(x)))
+
+
+class PolarityEdgeGateV1(nn.Module):
+    def __init__(
+        self,
+        in_channels=384,
+        pol_dim=32,
+        gn_groups=4,
+        act="gelu",
+        anchor_weight_power=2.0,
+        anchor_eps=1e-6,
+        detach_base_prob=True,
+        detach_anchors=True,
+        detach_rho=True,
+        min_anchor_norm=1e-6,
+        use_calib_head=True,
+        calib_hidden=32,
+        calib_zero_init=True,
+        polarity_tau=0.50,
+        edge_cut_max=0.50,
+        edge_gate_min=0.50,
+        use_same_polarity_boost=False,
+        renormalize_edge=True,
+        start_epoch=7,
+        ramp_end_epoch=15,
+        edge_stop_epoch=36,
+        diag_ambig_thresh=0.20,
+    ):
+        super().__init__()
+        self.pol_dim = int(pol_dim)
+        self.anchor_weight_power = float(anchor_weight_power)
+        self.anchor_eps = float(anchor_eps)
+        self.detach_base_prob = bool(detach_base_prob)
+        self.detach_anchors = bool(detach_anchors)
+        self.detach_rho = bool(detach_rho)
+        self.min_anchor_norm = float(min_anchor_norm)
+        self.use_calib_head = bool(use_calib_head)
+        self.polarity_tau = float(polarity_tau)
+        self.edge_cut_max = float(edge_cut_max)
+        self.edge_gate_min = float(edge_gate_min)
+        self.use_same_polarity_boost = bool(use_same_polarity_boost)
+        self.renormalize_edge = bool(renormalize_edge)
+        self.start_epoch = int(start_epoch)
+        self.ramp_end_epoch = int(ramp_end_epoch)
+        self.edge_stop_epoch = int(edge_stop_epoch)
+        self.diag_ambig_thresh = float(diag_ambig_thresh)
+
+        if self.pol_dim <= 0:
+            raise ValueError(f"PA_DAGP_POL_DIM must be positive, got {self.pol_dim}")
+        if int(gn_groups) <= 0 or self.pol_dim % int(gn_groups) != 0:
+            raise ValueError(
+                f"PA_DAGP_POL_GN_GROUPS must divide PA_DAGP_POL_DIM, got {gn_groups} and {self.pol_dim}"
+            )
+        if str(act).lower() != "gelu":
+            raise ValueError(f"PA-DAGP-v1 supports PA_DAGP_POL_ACT='gelu' only, got {act}")
+        if self.anchor_weight_power <= 0.0 or self.anchor_eps <= 0.0:
+            raise ValueError("PA-DAGP anchor power and epsilon must be positive.")
+        if self.min_anchor_norm < 0.0:
+            raise ValueError("PA_DAGP_MIN_ANCHOR_NORM must be non-negative.")
+        if self.polarity_tau <= 0.0:
+            raise ValueError("PA_DAGP_POLARITY_TAU must be positive.")
+        if not 0.0 <= self.edge_cut_max <= 1.0:
+            raise ValueError("PA_DAGP_EDGE_CUT_MAX must be in [0, 1].")
+        if not 0.0 <= self.edge_gate_min <= 1.0:
+            raise ValueError("PA_DAGP_EDGE_GATE_MIN must be in [0, 1].")
+        if self.use_same_polarity_boost:
+            raise ValueError("PA-DAGP-v1 forbids same-polarity edge boost.")
+        if not self.renormalize_edge:
+            raise ValueError("PA-DAGP-v1 requires PA_DAGP_RENORMALIZE_EDGE=True.")
+        if self.start_epoch <= 0 or self.ramp_end_epoch < self.start_epoch:
+            raise ValueError("Invalid PA-DAGP edge schedule.")
+        if self.edge_stop_epoch <= self.ramp_end_epoch:
+            raise ValueError("PA_DAGP_EDGE_STOP_EPOCH must be after the ramp end epoch.")
+        if not 0.0 <= self.diag_ambig_thresh < 1.0:
+            raise ValueError("PA_DAGP_DIAG_AMBIG_THRESH must be in [0, 1).")
+
+        self.pol_proj = nn.Sequential(
+            nn.Conv2d(int(in_channels), self.pol_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(int(gn_groups), self.pol_dim),
+            nn.GELU(),
+        )
+        if self.use_calib_head:
+            if int(calib_hidden) <= 0:
+                raise ValueError("PA_DAGP_CALIB_HIDDEN must be positive.")
+            self.calib_head = nn.Sequential(
+                nn.Linear(self.pol_dim + 3, int(calib_hidden)),
+                nn.GELU(),
+                nn.Linear(int(calib_hidden), 1),
+            )
+            if bool(calib_zero_init):
+                nn.init.zeros_(self.calib_head[-1].weight)
+                nn.init.zeros_(self.calib_head[-1].bias)
+        else:
+            self.calib_head = None
+
+    def edge_scale(self, epoch):
+        epoch = int(epoch)
+        if epoch < self.start_epoch or epoch >= self.edge_stop_epoch:
+            return 0.0
+        if epoch <= self.ramp_end_epoch:
+            denom = max(1, self.ramp_end_epoch - self.start_epoch + 1)
+            return float(epoch - self.start_epoch + 1) / float(denom)
+        return 1.0
+
+    @staticmethod
+    def _gather_scalar_neighbors(values, indices):
+        bsz, num_nodes = values.shape
+        if indices.shape[:2] != (bsz, num_nodes):
+            raise RuntimeError(
+                "PA-DAGP top-k index shape mismatch: "
+                f"values={list(values.shape)}, indices={list(indices.shape)}"
+            )
+        batch_offset = (
+            torch.arange(bsz, device=indices.device, dtype=indices.dtype).view(bsz, 1, 1)
+            * num_nodes
+        )
+        flat_indices = (indices + batch_offset).reshape(-1)
+        return values.reshape(-1).index_select(0, flat_indices).reshape_as(indices)
+
+    @staticmethod
+    def _stats(values, mask=None):
+        values = values.detach().float()
+        if mask is not None:
+            mask = mask.detach().bool()
+            values = values[mask]
+        if values.numel() == 0:
+            zero = values.new_tensor(0.0)
+            return zero, zero, zero
+        return values.mean(), values.min(), values.max()
+
+    def forward(self, feature, base_logits, topk_idx=None, edge_scale=0.0):
+        if feature.ndim != 4 or base_logits.ndim != 4:
+            raise RuntimeError(
+                f"PA-DAGP expects 4D feature/logits, got {list(feature.shape)} and {list(base_logits.shape)}"
+            )
+        bsz, _, height, width = feature.shape
+        if list(base_logits.shape) != [bsz, 1, height, width]:
+            raise RuntimeError(
+                "PA-DAGP base logits must match feature spatial shape, got "
+                f"feature={list(feature.shape)}, base_logits={list(base_logits.shape)}"
+            )
+        num_nodes = height * width
+        edge_scale = float(edge_scale)
+
+        base_prob = torch.sigmoid(base_logits)
+        base_prob_for_anchor = base_prob.detach() if self.detach_base_prob else base_prob
+        pol_feat = F.normalize(self.pol_proj(feature), dim=1)
+        tokens = pol_feat.flatten(2).transpose(1, 2)
+        prob_tokens = base_prob_for_anchor.flatten(2).transpose(1, 2)
+
+        weight_fg = (prob_tokens + self.anchor_eps).pow(self.anchor_weight_power)
+        weight_bg = (1.0 - prob_tokens + self.anchor_eps).pow(self.anchor_weight_power)
+        weight_fg = weight_fg / weight_fg.sum(dim=1, keepdim=True).clamp_min(self.anchor_eps)
+        weight_bg = weight_bg / weight_bg.sum(dim=1, keepdim=True).clamp_min(self.anchor_eps)
+        anchor_fg_raw = (weight_fg * tokens).sum(dim=1)
+        anchor_bg_raw = (weight_bg * tokens).sum(dim=1)
+        anchor_fg_norm = anchor_fg_raw.norm(dim=-1)
+        anchor_bg_norm = anchor_bg_raw.norm(dim=-1)
+        anchor_valid = (anchor_fg_norm > self.min_anchor_norm) & (anchor_bg_norm > self.min_anchor_norm)
+        anchor_fg = F.normalize(anchor_fg_raw, dim=-1)
+        anchor_bg = F.normalize(anchor_bg_raw, dim=-1)
+        anchor_fg_margin = anchor_fg.detach() if self.detach_anchors else anchor_fg
+        anchor_bg_margin = anchor_bg.detach() if self.detach_anchors else anchor_bg
+
+        sim_fg = (tokens * anchor_fg_margin[:, None, :]).sum(dim=-1)
+        sim_bg = (tokens * anchor_bg_margin[:, None, :]).sum(dim=-1)
+        anchor_margin = sim_fg - sim_bg
+        prob_scalar = prob_tokens.squeeze(-1)
+        base_uncert = (1.0 - 2.0 * torch.abs(prob_scalar - 0.5)).clamp(0.0, 1.0)
+        if self.calib_head is not None:
+            calib_input = torch.cat(
+                (
+                    tokens,
+                    anchor_margin.unsqueeze(-1),
+                    prob_scalar.unsqueeze(-1),
+                    base_uncert.unsqueeze(-1),
+                ),
+                dim=-1,
+            )
+            delta_margin = self.calib_head(calib_input).squeeze(-1)
+        else:
+            delta_margin = torch.zeros_like(anchor_margin)
+        raw_polarity = anchor_margin + delta_margin
+        raw_polarity = torch.where(anchor_valid[:, None], raw_polarity, torch.zeros_like(raw_polarity))
+        signed_polarity = torch.tanh(raw_polarity / self.polarity_tau)
+
+        anchor_cosine = (anchor_fg * anchor_bg).sum(dim=-1).clamp(-1.0, 1.0)
+        rho = ((1.0 - anchor_cosine) * 0.5).clamp(0.0, 1.0)
+        rho = torch.where(anchor_valid, rho, torch.zeros_like(rho))
+        rho_gate = rho.detach() if self.detach_rho else rho
+        edge_cut_eff = self.edge_cut_max * edge_scale
+
+        polarity_gate = None
+        cross_score = None
+        if topk_idx is not None and edge_scale > 0.0:
+            if topk_idx.ndim != 3 or topk_idx.shape[:2] != (bsz, num_nodes):
+                raise RuntimeError(
+                    f"PA-DAGP top-k indices must be [B,N,K], got {list(topk_idx.shape)}"
+                )
+            center_polarity = signed_polarity.unsqueeze(-1)
+            neighbor_polarity = self._gather_scalar_neighbors(signed_polarity, topk_idx)
+            cross_score = F.relu(-(center_polarity * neighbor_polarity))
+            polarity_gate = 1.0 - edge_cut_eff * rho_gate[:, None, None] * cross_score
+            polarity_gate = polarity_gate.clamp(min=self.edge_gate_min, max=1.0)
+            if not bool(torch.isfinite(polarity_gate).all().item()):
+                raise RuntimeError("PA-DAGP polarity gate contains NaN/Inf.")
+            gate_min = float(polarity_gate.detach().min().item())
+            gate_max = float(polarity_gate.detach().max().item())
+            if gate_min < self.edge_gate_min - 1e-5 or gate_max > 1.0 + 1e-5:
+                raise RuntimeError(
+                    f"PA-DAGP polarity gate out of range: min={gate_min}, max={gate_max}"
+                )
+
+        valid_token_mask = anchor_valid[:, None].expand(-1, num_nodes)
+        raw_mean, raw_min, raw_max = self._stats(raw_polarity, valid_token_mask)
+        signed_mean, signed_min, signed_max = self._stats(signed_polarity, valid_token_mask)
+        if bool(valid_token_mask.any().item()):
+            raw_std = raw_polarity.detach().float()[valid_token_mask].std(unbiased=False)
+            signed_std = signed_polarity.detach().float()[valid_token_mask].std(unbiased=False)
+            valid_signed = signed_polarity.detach()[valid_token_mask]
+            positive_ratio = (valid_signed > self.diag_ambig_thresh).float().mean()
+            negative_ratio = (valid_signed < -self.diag_ambig_thresh).float().mean()
+            ambiguous_ratio = 1.0 - positive_ratio - negative_ratio
+        else:
+            raw_std = raw_polarity.new_tensor(0.0)
+            signed_std = raw_polarity.new_tensor(0.0)
+            positive_ratio = raw_polarity.new_tensor(0.0)
+            negative_ratio = raw_polarity.new_tensor(0.0)
+            ambiguous_ratio = raw_polarity.new_tensor(1.0)
+
+        if polarity_gate is not None and cross_score is not None and bool(anchor_valid.any().item()):
+            valid_edge_mask = anchor_valid[:, None, None].expand_as(polarity_gate)
+            gate_values = polarity_gate.detach()[valid_edge_mask]
+            cross_values = cross_score.detach()[valid_edge_mask]
+            gate_mean = gate_values.mean()
+            gate_min_tensor = gate_values.min()
+            gate_max_tensor = gate_values.max()
+            cross_edge_ratio = (cross_values > 0.0).float().mean()
+            edge_suppressed_ratio = (gate_values < 0.95).float().mean()
+        else:
+            gate_mean = raw_polarity.new_tensor(1.0)
+            gate_min_tensor = raw_polarity.new_tensor(1.0)
+            gate_max_tensor = raw_polarity.new_tensor(1.0)
+            cross_edge_ratio = raw_polarity.new_tensor(0.0)
+            edge_suppressed_ratio = raw_polarity.new_tensor(0.0)
+
+        fg_norm_mean, fg_norm_min, fg_norm_max = self._stats(anchor_fg_norm)
+        bg_norm_mean, bg_norm_min, bg_norm_max = self._stats(anchor_bg_norm)
+        anchor_cos_mean, anchor_cos_min, anchor_cos_max = self._stats(anchor_cosine, anchor_valid)
+        rho_mean, rho_min, rho_max = self._stats(rho, anchor_valid)
+        diagnostics = {
+            "edge_scale": raw_polarity.new_tensor(edge_scale).detach(),
+            "edge_cut_eff": raw_polarity.new_tensor(edge_cut_eff).detach(),
+            "anchor_valid_ratio": anchor_valid.float().mean().detach(),
+            "anchor_fg_norm_mean": fg_norm_mean,
+            "anchor_fg_norm_min": fg_norm_min,
+            "anchor_fg_norm_max": fg_norm_max,
+            "anchor_bg_norm_mean": bg_norm_mean,
+            "anchor_bg_norm_min": bg_norm_min,
+            "anchor_bg_norm_max": bg_norm_max,
+            "anchor_cosine_mean": anchor_cos_mean,
+            "anchor_cosine_min": anchor_cos_min,
+            "anchor_cosine_max": anchor_cos_max,
+            "rho_mean": rho_mean,
+            "rho_min": rho_min,
+            "rho_max": rho_max,
+            "raw_pol_mean": raw_mean,
+            "raw_pol_std": raw_std.detach(),
+            "raw_pol_min": raw_min,
+            "raw_pol_max": raw_max,
+            "signed_pol_mean": signed_mean,
+            "signed_pol_std": signed_std.detach(),
+            "signed_pol_min": signed_min,
+            "signed_pol_max": signed_max,
+            "positive_ratio": positive_ratio.detach(),
+            "negative_ratio": negative_ratio.detach(),
+            "ambiguous_ratio": ambiguous_ratio.detach(),
+            "cross_edge_ratio": cross_edge_ratio.detach(),
+            "gate_mean": gate_mean.detach(),
+            "gate_min": gate_min_tensor.detach(),
+            "gate_max": gate_max_tensor.detach(),
+            "edge_suppressed_ratio": edge_suppressed_ratio.detach(),
+        }
+        return {
+            "polarity_gate": polarity_gate,
+            "raw_polarity": raw_polarity.reshape(bsz, 1, height, width),
+            "signed_polarity": signed_polarity.reshape(bsz, 1, height, width),
+            "base_prob": base_prob.detach(),
+            "anchor_valid": anchor_valid.detach(),
+            "rho": rho.detach(),
+            "diagnostics": diagnostics,
+        }
 
 
 class DAGPSafeHead(nn.Module):
@@ -344,6 +1579,11 @@ class DAGPSafeHead(nn.Module):
         proto_proj_hidden=64,
         proto_proj_dim=32,
         proto_proj_act="gelu",
+        pa_dagp=None,
+        use_esa_ber=False,
+        return_graph_aux_for_ber=False,
+        esa_ber_start_epoch=21,
+        esa_ber_stop_epoch=36,
     ):
         super().__init__()
         if int(hidden) <= 0:
@@ -415,6 +1655,12 @@ class DAGPSafeHead(nn.Module):
         self.proto_proj_hidden = int(proto_proj_hidden)
         self.proto_proj_dim = int(proto_proj_dim)
         self.proto_proj_act = str(proto_proj_act).lower()
+        self.pa_dagp = pa_dagp
+        self.use_pa_dagp = pa_dagp is not None
+        self.use_esa_ber = bool(use_esa_ber)
+        self.return_graph_aux_for_ber = bool(return_graph_aux_for_ber)
+        self.esa_ber_start_epoch = int(esa_ber_start_epoch)
+        self.esa_ber_stop_epoch = int(esa_ber_stop_epoch)
 
         self.base_head = nn.Conv2d(in_channels, 1, kernel_size=1)
         self.proj = nn.Conv2d(in_channels, self.hidden, kernel_size=1)
@@ -647,6 +1893,54 @@ class DAGPSafeHead(nn.Module):
             output["coarse_prob"] = output["prob"]
         return output
 
+    @staticmethod
+    def _attach_pa_aux(output, pa_state):
+        if pa_state is None:
+            return output
+        output.update(
+            {
+                "pa_raw_polarity": pa_state["raw_polarity"],
+                "pa_signed_polarity": pa_state["signed_polarity"],
+                "pa_base_prob": pa_state["base_prob"],
+                "pa_anchor_valid": pa_state["anchor_valid"],
+                "pa_rho": pa_state["rho"],
+                "pa_diag": pa_state["diagnostics"],
+            }
+        )
+        return output
+
+    def _ber_graph_aux_enabled(self, return_aux):
+        if not bool(return_aux) or not self.use_esa_ber or not self.return_graph_aux_for_ber:
+            return False
+        epoch = int(self.current_epoch_tensor.item())
+        return self.esa_ber_start_epoch <= epoch < self.esa_ber_stop_epoch
+
+    @staticmethod
+    def _attach_ber_graph_aux(output, topk_idx, semantic_weight):
+        if topk_idx is None or semantic_weight is None:
+            return output
+        topk_idx = topk_idx.detach()
+        semantic_weight = semantic_weight.detach()
+        if topk_idx.ndim != 3 or semantic_weight.shape != topk_idx.shape:
+            raise RuntimeError(
+                "ESA-BER graph auxiliary shape mismatch: "
+                f"idx={list(topk_idx.shape)}, weight={list(semantic_weight.shape)}"
+            )
+        if topk_idx.requires_grad or semantic_weight.requires_grad:
+            raise RuntimeError("ESA-BER graph auxiliary tensors must be detached.")
+        if not bool(torch.isfinite(semantic_weight).all().item()):
+            raise RuntimeError("ESA-BER semantic top-k weights contain NaN/Inf.")
+        sum_error = (semantic_weight.float().sum(dim=-1) - 1.0).abs().max()
+        if float(sum_error.item()) > 1e-5:
+            raise RuntimeError(
+                "ESA-BER semantic top-k weights are not normalized: "
+                f"max_error={float(sum_error.item()):.8g}"
+            )
+        output["dagp_topk_idx"] = topk_idx
+        output["dagp_topk_sem_weight"] = semantic_weight
+        output["dagp_topk_sem_weight_sum_error"] = sum_error.detach()
+        return output
+
     def _aux_output(
         self,
         logits,
@@ -657,6 +1951,8 @@ class DAGPSafeHead(nn.Module):
         gamma_eff,
         uncertainty_gate=None,
         semantic_feat=None,
+        pa_state=None,
+        pa_original_logits=None,
     ):
         scalar = base_logits.new_tensor(float(scale))
         unc_mean, unc_min, unc_max = self._uncertainty_stats(base_logits, uncertainty_gate)
@@ -671,6 +1967,9 @@ class DAGPSafeHead(nn.Module):
             "uncertainty_gate_min": unc_min,
             "uncertainty_gate_max": unc_max,
         }
+        if pa_original_logits is not None:
+            output["pa_original_coarse_logits_native"] = pa_original_logits.detach()
+        output = self._attach_pa_aux(output, pa_state)
         return self._attach_proto_aux(output, semantic_feat)
 
     @staticmethod
@@ -765,6 +2064,7 @@ class DAGPSafeHead(nn.Module):
         gamma_eff,
         uncertainty_gate,
         return_aux,
+        return_probe_aux=False,
         semantic_feat=None,
     ):
         if image_68 is None:
@@ -783,7 +2083,16 @@ class DAGPSafeHead(nn.Module):
             align_corners=False,
         )
         coarse_prob_68 = torch.sigmoid(coarse_logits_68.detach())
-        residual_logits_68, sobel_68 = self.ndr_branch(image_68.to(dtype=coarse_logits_68.dtype), coarse_prob_68)
+        ndr_result = self.ndr_branch(
+            image_68.to(dtype=coarse_logits_68.dtype),
+            coarse_prob_68,
+            return_probe_aux=bool(return_probe_aux),
+        )
+        if bool(return_probe_aux):
+            residual_logits_68, sobel_68, probe_ndr_detail_feat = ndr_result
+        else:
+            residual_logits_68, sobel_68 = ndr_result
+            probe_ndr_detail_feat = None
 
         uncertainty_68 = 1.0 - 2.0 * torch.abs(coarse_prob_68 - 0.5)
         uncertainty_68 = torch.clamp(uncertainty_68, 0.0, 1.0)
@@ -823,7 +2132,7 @@ class DAGPSafeHead(nn.Module):
         ndr_delta_logits_68 = coarse_logits_68.new_tensor(float(beta_eff)) * detail_gate * residual_logits_68
         logits = coarse_logits_68 + ndr_delta_logits_68
 
-        if not return_aux:
+        if not return_aux and not return_probe_aux:
             return logits
 
         output = self._aux_output(
@@ -856,6 +2165,8 @@ class DAGPSafeHead(nn.Module):
                 "ndr_residual_abs_max": residual_abs.max(),
             }
         )
+        if return_probe_aux:
+            output["probe_ndr_detail_feat"] = probe_ndr_detail_feat
         if self.use_ndr_v2:
             output.update(ndr_v2_aux)
             gate_v1_mean, gate_v1_min, gate_v1_max = self._tensor_stats(ndr_v2_aux["detail_gate_v1"])
@@ -909,18 +2220,35 @@ class DAGPSafeHead(nn.Module):
             )
         return self._attach_proto_aux(output, semantic_feat)
 
-    def forward(self, feat, image_68=None, return_aux=False):
+    def forward(
+        self,
+        feat,
+        image_68=None,
+        return_aux=False,
+        return_probe_aux=False,
+        pa_return_aux=None,
+        pa_compare_original=False,
+    ):
         bsz, _, height, width = feat.shape
         base_logits = self.base_head(feat)
         scale = self._ramp_scale()
         alpha_eff = self.alpha_max * scale
         gamma_eff = self.gamma_max * scale
+        pa_return_aux = bool(return_aux) if pa_return_aux is None else bool(pa_return_aux)
+        current_epoch = int(self.current_epoch_tensor.item())
+        pa_edge_scale = self.pa_dagp.edge_scale(current_epoch) if self.pa_dagp is not None else 0.0
+        return_ber_graph_aux = self._ber_graph_aux_enabled(return_aux)
 
         if alpha_eff == 0.0 or gamma_eff == 0.0:
             graph_logits = torch.zeros_like(base_logits)
             semantic_feat = self.proj(feat) if return_aux and self.use_proto_contrast else None
+            pa_state = (
+                self.pa_dagp(feat, base_logits, topk_idx=None, edge_scale=pa_edge_scale)
+                if self.pa_dagp is not None and pa_return_aux
+                else None
+            )
             if self.use_ndr_branch:
-                return self._apply_ndr(
+                output = self._apply_ndr(
                     base_logits,
                     image_68,
                     base_logits,
@@ -930,11 +2258,21 @@ class DAGPSafeHead(nn.Module):
                     gamma_eff,
                     self._uncertainty_output_gate(base_logits),
                     return_aux,
+                    return_probe_aux=return_probe_aux,
                     semantic_feat=semantic_feat,
                 )
+                if return_aux and isinstance(output, dict):
+                    output = self._attach_pa_aux(output, pa_state)
+                    if pa_compare_original:
+                        output["pa_original_coarse_logits_native"] = base_logits.detach()
+                if return_aux and isinstance(output, dict) and return_ber_graph_aux:
+                    with torch.no_grad():
+                        semantic_weight, ber_topk_idx = self._topk_affinity(feat)
+                    output = self._attach_ber_graph_aux(output, ber_topk_idx, semantic_weight)
+                return output
             if return_aux:
                 uncertainty_gate = self._uncertainty_output_gate(base_logits)
-                return self._aux_output(
+                output = self._aux_output(
                     base_logits,
                     base_logits,
                     graph_logits,
@@ -943,7 +2281,14 @@ class DAGPSafeHead(nn.Module):
                     gamma_eff,
                     uncertainty_gate,
                     semantic_feat=semantic_feat,
+                    pa_state=pa_state,
+                    pa_original_logits=base_logits if pa_compare_original else None,
                 )
+                if return_ber_graph_aux:
+                    with torch.no_grad():
+                        semantic_weight, ber_topk_idx = self._topk_affinity(feat)
+                    output = self._attach_ber_graph_aux(output, ber_topk_idx, semantic_weight)
+                return output
             return base_logits
 
         if self.affinity_detach:
@@ -951,8 +2296,38 @@ class DAGPSafeHead(nn.Module):
                 attn, topk_idx = self._topk_affinity(feat)
         else:
             attn, topk_idx = self._topk_affinity(feat)
+        semantic_topk_weight = attn.detach() if return_ber_graph_aux else None
         if self.use_prob_gate:
             attn = self._apply_prob_gate(attn, topk_idx, base_logits)
+        attn_original = attn
+        pa_state = None
+        if self.pa_dagp is not None:
+            pa_state = self.pa_dagp(
+                feat,
+                base_logits,
+                topk_idx=topk_idx if pa_edge_scale > 0.0 else None,
+                edge_scale=pa_edge_scale,
+            )
+            if pa_edge_scale > 0.0:
+                polarity_gate = pa_state["polarity_gate"]
+                if polarity_gate is None or polarity_gate.shape != attn.shape:
+                    raise RuntimeError(
+                        "PA-DAGP polarity gate shape mismatch: "
+                        f"gate={None if polarity_gate is None else list(polarity_gate.shape)}, "
+                        f"edge={list(attn.shape)}"
+                    )
+                attn = attn * polarity_gate.to(dtype=attn.dtype)
+                attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(self.prob_gate_eps)
+                if not bool(torch.isfinite(attn).all().item()):
+                    raise RuntimeError("PA-DAGP normalized edge contains NaN/Inf.")
+                edge_sum_error = (attn.float().sum(dim=-1) - 1.0).abs().max()
+                if float(edge_sum_error.detach().item()) > 1e-5:
+                    raise RuntimeError(
+                        f"PA-DAGP normalized edge sum error is too large: {float(edge_sum_error.item()):.8g}"
+                    )
+                pa_state["diagnostics"]["edge_normalization_max_error"] = edge_sum_error.detach()
+            else:
+                pa_state["diagnostics"]["edge_normalization_max_error"] = base_logits.new_tensor(0.0)
 
         z_map = self.proj(feat)
         z = z_map.flatten(2).transpose(1, 2)
@@ -965,8 +2340,32 @@ class DAGPSafeHead(nn.Module):
         uncertainty_gate = self._uncertainty_output_gate(base_logits)
         graph_residual = graph_logits if uncertainty_gate is None else uncertainty_gate * graph_logits
         logits = base_logits + graph_logits.new_tensor(float(alpha_eff)) * graph_residual
+        pa_original_logits = None
+        if pa_compare_original:
+            if self.pa_dagp is not None and pa_edge_scale > 0.0:
+                with torch.no_grad():
+                    original_agg = (
+                        attn_original.to(dtype=value.dtype).unsqueeze(-1) * neigh_value.detach()
+                    ).sum(dim=2)
+                    original_z_prop = z.detach() + value.new_tensor(float(gamma_eff)) * original_agg
+                    original_z_prop_map = original_z_prop.transpose(1, 2).reshape(
+                        bsz, self.hidden, height, width
+                    )
+                    original_graph_logits = self.graph_pred(original_z_prop_map)
+                    original_uncertainty = self._uncertainty_output_gate(base_logits.detach())
+                    original_residual = (
+                        original_graph_logits
+                        if original_uncertainty is None
+                        else original_uncertainty * original_graph_logits
+                    )
+                    pa_original_logits = (
+                        base_logits.detach()
+                        + original_graph_logits.new_tensor(float(alpha_eff)) * original_residual
+                    )
+            else:
+                pa_original_logits = logits.detach()
         if self.use_ndr_branch:
-            return self._apply_ndr(
+            output = self._apply_ndr(
                 logits,
                 image_68,
                 base_logits,
@@ -976,10 +2375,22 @@ class DAGPSafeHead(nn.Module):
                 gamma_eff,
                 uncertainty_gate,
                 return_aux,
+                return_probe_aux=return_probe_aux,
                 semantic_feat=z_prop_map if return_aux and self.use_proto_contrast else None,
             )
+            if return_aux and isinstance(output, dict):
+                output = self._attach_pa_aux(output, pa_state if pa_return_aux else None)
+                if pa_original_logits is not None:
+                    output["pa_original_coarse_logits_native"] = pa_original_logits.detach()
+                if return_ber_graph_aux:
+                    output = self._attach_ber_graph_aux(
+                        output,
+                        topk_idx,
+                        semantic_topk_weight,
+                    )
+            return output
         if return_aux:
-            return self._aux_output(
+            output = self._aux_output(
                 logits,
                 base_logits,
                 graph_logits,
@@ -988,7 +2399,16 @@ class DAGPSafeHead(nn.Module):
                 gamma_eff,
                 uncertainty_gate,
                 semantic_feat=z_prop_map if self.use_proto_contrast else None,
+                pa_state=pa_state if pa_return_aux else None,
+                pa_original_logits=pa_original_logits,
             )
+            if return_ber_graph_aux:
+                output = self._attach_ber_graph_aux(
+                    output,
+                    topk_idx,
+                    semantic_topk_weight,
+                )
+            return output
         return logits
 
 
@@ -1472,8 +2892,42 @@ class GatedContextSegHead(nn.Module):
         return base_logits + self.gamma * ctx_logits
 
 
+def _build_pa_dagp(in_channels, cfg):
+    if not bool(getattr(cfg, "USE_PA_DAGP", False)):
+        return None
+    # PA is an optional ablation branch. Preserve the caller's RNG state so
+    # enabling it cannot change initialization of the existing DAGP/CSD path.
+    with torch.random.fork_rng(devices=[]):
+        return PolarityEdgeGateV1(
+            in_channels=in_channels,
+            pol_dim=int(getattr(cfg, "PA_DAGP_POL_DIM", 32)),
+            gn_groups=int(getattr(cfg, "PA_DAGP_POL_GN_GROUPS", 4)),
+            act=str(getattr(cfg, "PA_DAGP_POL_ACT", "gelu")),
+            anchor_weight_power=float(getattr(cfg, "PA_DAGP_ANCHOR_WEIGHT_POWER", 2.0)),
+            anchor_eps=float(getattr(cfg, "PA_DAGP_ANCHOR_EPS", 1e-6)),
+            detach_base_prob=bool(getattr(cfg, "PA_DAGP_DETACH_BASE_PROB", True)),
+            detach_anchors=bool(getattr(cfg, "PA_DAGP_DETACH_ANCHORS", True)),
+            detach_rho=bool(getattr(cfg, "PA_DAGP_DETACH_RHO", True)),
+            min_anchor_norm=float(getattr(cfg, "PA_DAGP_MIN_ANCHOR_NORM", 1e-6)),
+            use_calib_head=bool(getattr(cfg, "PA_DAGP_USE_CALIB_HEAD", True)),
+            calib_hidden=int(getattr(cfg, "PA_DAGP_CALIB_HIDDEN", 32)),
+            calib_zero_init=bool(getattr(cfg, "PA_DAGP_CALIB_ZERO_INIT", True)),
+            polarity_tau=float(getattr(cfg, "PA_DAGP_POLARITY_TAU", 0.50)),
+            edge_cut_max=float(getattr(cfg, "PA_DAGP_EDGE_CUT_MAX", 0.50)),
+            edge_gate_min=float(getattr(cfg, "PA_DAGP_EDGE_GATE_MIN", 0.50)),
+            use_same_polarity_boost=bool(getattr(cfg, "PA_DAGP_USE_SAME_POLARITY_BOOST", False)),
+            renormalize_edge=bool(getattr(cfg, "PA_DAGP_RENORMALIZE_EDGE", True)),
+            start_epoch=int(getattr(cfg, "PA_DAGP_START_EPOCH", 7)),
+            ramp_end_epoch=int(getattr(cfg, "PA_DAGP_RAMP_END_EPOCH", 15)),
+            edge_stop_epoch=int(getattr(cfg, "PA_DAGP_EDGE_STOP_EPOCH", 36)),
+            diag_ambig_thresh=float(getattr(cfg, "PA_DAGP_DIAG_AMBIG_THRESH", 0.20)),
+        )
+
+
 def build_seg_head(in_channels, cfg):
     head_type = str(getattr(cfg, "HEAD_TYPE", "simple")).lower()
+    if head_type == "cacd_v1_base":
+        return CACDV1BaseHead(in_channels=in_channels, cfg=cfg)
     if head_type == "simple":
         return SimpleConvSegHead(in_channels)
     if head_type == "dagp":
@@ -1567,6 +3021,119 @@ def build_seg_head(in_channels, cfg):
             proto_proj_hidden=int(getattr(cfg, "PROTO_PROJ_HIDDEN", 64)),
             proto_proj_dim=int(getattr(cfg, "PROTO_PROJ_DIM", 32)),
             proto_proj_act=str(getattr(cfg, "PROTO_PROJ_ACT", "gelu")),
+            pa_dagp=_build_pa_dagp(in_channels, cfg),
+            use_esa_ber=bool(getattr(cfg, "USE_ESA_BER", False)),
+            return_graph_aux_for_ber=bool(
+                getattr(cfg, "DAGP_SAFE_RETURN_GRAPH_AUX_FOR_BER", False)
+            ),
+            esa_ber_start_epoch=int(getattr(cfg, "ESA_BER_START_EPOCH", 21)),
+            esa_ber_stop_epoch=int(getattr(cfg, "ESA_BER_STOP_EPOCH", 36)),
+        )
+    if head_type == "dagp_safe_csd_v1r":
+        coarse_path = DAGPSafeHead(
+            in_channels=in_channels,
+            hidden=int(getattr(cfg, "DAGP_SAFE_HIDDEN", 64)),
+            topk=int(getattr(cfg, "DAGP_SAFE_TOPK", 12)),
+            tau=float(getattr(cfg, "DAGP_SAFE_TAU", 0.07)),
+            alpha_max=float(getattr(cfg, "DAGP_SAFE_ALPHA_MAX", 0.05)),
+            gamma_max=float(getattr(cfg, "DAGP_SAFE_GAMMA_MAX", 0.03)),
+            warmup_epoch=int(getattr(cfg, "DAGP_SAFE_WARMUP_EPOCH", 6)),
+            ramp_start_epoch=int(getattr(cfg, "DAGP_SAFE_RAMP_START_EPOCH", 7)),
+            ramp_end_epoch=int(getattr(cfg, "DAGP_SAFE_RAMP_END_EPOCH", 15)),
+            affinity_detach=bool(getattr(cfg, "DAGP_SAFE_AFFINITY_DETACH", True)),
+            exclude_self=bool(getattr(cfg, "DAGP_SAFE_EXCLUDE_SELF", True)),
+            use_prob_gate=bool(getattr(cfg, "DAGP_SAFE_USE_PROB_GATE", True)),
+            prob_gate_sigma=float(getattr(cfg, "DAGP_SAFE_PROB_GATE_SIGMA", 0.25)),
+            prob_gate_eps=float(getattr(cfg, "DAGP_SAFE_PROB_GATE_EPS", 1e-6)),
+            zero_init_graph_pred=bool(getattr(cfg, "DAGP_SAFE_ZERO_INIT_GRAPH_PRED", True)),
+            zero_init_value=bool(getattr(cfg, "DAGP_SAFE_ZERO_INIT_VALUE", False)),
+            use_uncertainty_output_gate=bool(
+                getattr(cfg, "DAGP_SAFE_USE_UNCERTAINTY_OUTPUT_GATE", False)
+            ),
+            uncertainty_power=float(getattr(cfg, "DAGP_SAFE_UNCERTAINTY_POWER", 1.0)),
+            uncertainty_min=float(getattr(cfg, "DAGP_SAFE_UNCERTAINTY_MIN", 0.0)),
+            uncertainty_max=float(getattr(cfg, "DAGP_SAFE_UNCERTAINTY_MAX", 1.0)),
+            uncertainty_detach=bool(getattr(cfg, "DAGP_SAFE_UNCERTAINTY_DETACH", True)),
+            use_ndr_branch=False,
+            use_ndr_v2=False,
+            use_tadr_router=False,
+            use_proto_contrast=False,
+            pa_dagp=_build_pa_dagp(in_channels, cfg),
+        )
+        residual_branch = CSDV1RResidual(
+            in_channels=in_channels,
+            sem_dim=int(getattr(cfg, "CSD_V1R_SEM_DIM", 64)),
+            detail_dim=int(getattr(cfg, "CSD_V1R_DETAIL_DIM", 32)),
+            fusion_dim=int(getattr(cfg, "CSD_V1R_FUSION_DIM", 64)),
+            beta_max=float(getattr(cfg, "CSD_V1R_BETA_MAX", 0.05)),
+            residual_clip=float(getattr(cfg, "CSD_V1R_RESIDUAL_CLIP", 2.0)),
+            warmup_epoch=int(getattr(cfg, "CSD_V1R_WARMUP_EPOCH", 6)),
+            ramp_start_epoch=int(getattr(cfg, "CSD_V1R_RAMP_START_EPOCH", 7)),
+            ramp_end_epoch=int(getattr(cfg, "CSD_V1R_RAMP_END_EPOCH", 15)),
+            bg_suppress_strength=float(getattr(cfg, "CSD_V1R_BG_SUPPRESS_STRENGTH", 0.70)),
+            use_bg_detail_lock=bool(getattr(cfg, "CSD_V1R_USE_BG_DETAIL_LOCK", True)),
+            use_res_zero_init=bool(getattr(cfg, "CSD_V1R_ZERO_INIT_RESIDUAL", True)),
+            use_gate_bias_init=bool(getattr(cfg, "CSD_V1R_USE_GATE_BIAS_INIT", True)),
+            gate_bias_init=float(getattr(cfg, "CSD_V1R_GATE_BIAS_INIT", -2.0)),
+        )
+        use_hr_bfr = bool(getattr(cfg, "USE_HR_BFR", False))
+        hr_bfr_branch = (
+            HRBFRV1Branch(
+                in_channels=in_channels,
+                sem_dim=int(getattr(cfg, "HR_BFR_SEM_DIM", 32)),
+                detail_dim=int(getattr(cfg, "HR_BFR_DETAIL_DIM", 32)),
+                hidden_dim=int(getattr(cfg, "HR_BFR_HIDDEN_DIM", 32)),
+                residual_clip=float(getattr(cfg, "HR_BFR_RESIDUAL_CLIP", 2.0)),
+                use_rgb=bool(getattr(cfg, "HR_BFR_USE_RGB", True)),
+                use_sobel=bool(getattr(cfg, "HR_BFR_USE_SOBEL", True)),
+                use_anchor_prob=bool(getattr(cfg, "HR_BFR_USE_ANCHOR_PROB", True)),
+                use_anchor_uncert=bool(getattr(cfg, "HR_BFR_USE_ANCHOR_UNCERT", True)),
+                use_dino_sem=bool(getattr(cfg, "HR_BFR_USE_DINO_SEM", True)),
+                use_res_zero_init=bool(getattr(cfg, "HR_BFR_USE_RES_ZERO_INIT", True)),
+            )
+            if use_hr_bfr
+            else None
+        )
+        return DAGPSafeCSDV1RHead(
+            coarse_path=coarse_path,
+            residual_branch=residual_branch,
+            loss_size=int(getattr(cfg, "LOSS_SIZE", 68)),
+            hr_bfr_branch=hr_bfr_branch,
+            use_hr_bfr=use_hr_bfr,
+            hr_size=int(getattr(cfg, "HR_BFR_SIZE", 136)),
+            hr_beta_max=float(getattr(cfg, "HR_BFR_BETA_MAX", 0.05)),
+            hr_warmup_epoch=int(getattr(cfg, "HR_BFR_WARMUP_EPOCH", 6)),
+            hr_ramp_start_epoch=int(getattr(cfg, "HR_BFR_RAMP_START_EPOCH", 7)),
+            hr_ramp_end_epoch=int(getattr(cfg, "HR_BFR_RAMP_END_EPOCH", 15)),
+            hr_boundary_thresh=float(getattr(cfg, "HR_BFR_BOUNDARY_THRESH", 0.5)),
+            hr_boundary_radius_68=int(getattr(cfg, "HR_BFR_BOUNDARY_RADIUS_68", 2)),
+            hr_boundary_dilate_136=int(getattr(cfg, "HR_BFR_BOUNDARY_DILATE_136", 2)),
+            hr_max_band_ratio=float(getattr(cfg, "HR_BFR_MAX_BAND_RATIO", 0.35)),
+            hr_detach_anchor=bool(getattr(cfg, "HR_BFR_DETACH_ANCHOR", True)),
+            hr_eval_res_scale=float(getattr(cfg, "HR_BFR_EVAL_RES_SCALE", 1.0)),
+        )
+    if head_type == "csd_v1":
+        return CSDV1Head(
+            in_channels=in_channels,
+            loss_size=int(getattr(cfg, "LOSS_SIZE", 68)),
+            sem_dim=int(getattr(cfg, "CSD_SEM_DIM", 64)),
+            detail_dim=int(getattr(cfg, "CSD_DETAIL_DIM", 32)),
+            fusion_dim=int(getattr(cfg, "CSD_FUSION_DIM", 64)),
+            use_dagp_semantic=bool(getattr(cfg, "CSD_USE_DAGP_SEMANTIC", True)),
+            use_local_context=bool(getattr(cfg, "CSD_USE_LOCAL_CONTEXT", True)),
+            use_global_context=bool(getattr(cfg, "CSD_USE_GLOBAL_CONTEXT", True)),
+            dagp_topk=int(getattr(cfg, "CSD_DAGP_TOPK", getattr(cfg, "DAGP_SAFE_TOPK", 12))),
+            dagp_tau=float(getattr(cfg, "CSD_DAGP_TAU", getattr(cfg, "DAGP_SAFE_TAU", 0.07))),
+            dagp_alpha_max=float(getattr(cfg, "CSD_DAGP_ALPHA_MAX", getattr(cfg, "DAGP_SAFE_ALPHA_MAX", 0.05))),
+            dagp_gamma_max=float(getattr(cfg, "CSD_DAGP_GAMMA_MAX", getattr(cfg, "DAGP_SAFE_GAMMA_MAX", 0.03))),
+            warmup_epoch=int(getattr(cfg, "CSD_WARMUP_EPOCH", 6)),
+            ramp_start_epoch=int(getattr(cfg, "CSD_RAMP_START_EPOCH", 7)),
+            ramp_end_epoch=int(getattr(cfg, "CSD_RAMP_END_EPOCH", 15)),
+            beta_max=float(getattr(cfg, "CSD_BETA_MAX", 0.10)),
+            residual_clip=float(getattr(cfg, "CSD_RESIDUAL_CLIP", 2.0)),
+            bg_suppress_strength=float(getattr(cfg, "CSD_BG_SUPPRESS_STRENGTH", 0.70)),
+            use_bg_detail_lock=bool(getattr(cfg, "CSD_USE_BG_DETAIL_LOCK", True)),
+            use_boundary_aux=bool(getattr(cfg, "CSD_USE_BOUNDARY_AUX", True)),
         )
     if head_type == "context_residual":
         hidden = int(getattr(cfg, "CONTEXT_HEAD_HIDDEN", 64))

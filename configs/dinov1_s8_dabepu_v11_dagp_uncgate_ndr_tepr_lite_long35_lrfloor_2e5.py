@@ -1,0 +1,57 @@
+from configs.dinov1_s8_dabepu_v11_dagp_uncgate_ndr_rast_v12_esa_asym_long35_lrfloor_2e5 import *  # noqa: F401,F403
+
+
+EXP_NAME = "dinov1_s8_dabepu_v11_dagp_uncgate_ndr_tepr_lite_long35_lrfloor_2e5"
+
+# TEPR-Lite replaces the RAST/ESA teacher map; it is not stacked with them.
+USE_RAST = False
+USE_ESA_ASYM = False
+ESA_POST_RESET_ENABLE = False
+USE_ESA_BER = False
+
+USE_TEPR_LITE = True
+TEPR_VERSION = "lite_v1_temporal_reliability"
+
+TEPR_START_EPOCH = 7
+TEPR_RAMP_END_EPOCH = 15
+TEPR_STOP_EPOCH = 21
+
+TEPR_MEMORY_UPDATE_START_EPOCH = 1
+TEPR_MEMORY_UPDATE_END_EPOCH = 20
+TEPR_TEMPORAL_RHO = 0.90
+TEPR_MIN_HISTORY = 3
+TEPR_MEMORY_DTYPE = "float16"
+TEPR_USE_PREUPDATE_STATS = True
+
+TEPR_VARIANCE_TAU = 0.02
+TEPR_CONF_GAMMA = 1.0
+
+TEPR_CORE_LAMBDA = 1.609438
+TEPR_EXTENT_LAMBDA = 1.386294
+TEPR_MARGIN_TAU = 0.05
+
+TEPR_UNKNOWN_WEIGHT_MIN = 0.50
+TEPR_UNKNOWN_WEIGHT_MAX = 0.80
+TEPR_EXTENT_TEMPORAL_MIN = 0.60
+
+TEPR_WEIGHT_MIN = 0.20
+TEPR_WEIGHT_MAX = 1.00
+
+TEPR_APPLY_TO_FINAL = True
+TEPR_APPLY_TO_COARSE_AUX = True
+TEPR_APPLY_TO_BASE_AUX = True
+
+TEPR_RESET_MEMORY_AT_FINETUNE_RESET = True
+TEPR_LOG_INTERVAL_EPOCH = 1
+TEPR_DEBUG_FIRST_BATCH = True
+
+# Keep unrelated experimental branches disabled.
+USE_HBNS_LITE = False
+HBNS_LAMBDA_MAX = 0.0
+USE_EPR_POS = False
+EPR_LAMBDA_MAX = 0.0
+
+MAX_EPOCH = 35
+max_epoch = 35
+SAVE_EVERY_EPOCH = True
+SAVE_INTERVAL = 1

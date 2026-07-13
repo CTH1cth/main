@@ -9,8 +9,10 @@ from torch.utils.data import Dataset
 from common.dre_safe_prior import build_dre_safe_prior
 from common.utils import (
     build_image_items,
+    cacd_feature_manifest_path,
     ccr_manifest_path,
     check_exact_keys,
+    cssd_hr_feature_manifest_path,
     dabe_pu_manifest_path,
     dabe_pseudo_manifest_path,
     despl_light_cache_manifest_path,
@@ -81,6 +83,25 @@ DABE_PU_REQUIRED_37_FIELDS = [
     "unknown_37",
 ]
 
+DABE_PU_DESPL_SCHED_MODES = {
+    "dabe_pu_v11_desplsched",
+    "dabe_pu_v11_desplsched_exactreset",
+    "dabe_pu_v11_desplsched_A1_keepteacher_lowlr",
+    "dabe_pu_v11_desplsched_A2_resetteacher_highlr",
+    "dabe_pu_v11_desplsched_softteacher",
+    "dabe_pu_v11_desplsched_dabehard",
+    "dabe_pu_v11_dagp_csd_v1r_desplsched",
+    "dabe_pu_v12_shape_desplsched",
+}
+
+DABE_PU_ALLOWED_MODES = {
+    "dabe_pu_v11",
+    "dabe_pu_v11_oem",
+    *DABE_PU_DESPL_SCHED_MODES,
+}
+
+DABE_PU_ALLOWED_VERSIONS = {"pu_v11", "pu_v12_shape_complete"}
+
 
 def _feature_manifest_path(cfg, split):
     # feature cache manifest 按 split 管理，train/val/test 不混用。
@@ -124,6 +145,107 @@ def _load_feature(row, expected_dataset, expected_stem):
     if tensor.ndim != 3:
         raise RuntimeError(f"Feature tensor must be [C,H,W], got {list(tensor.shape)}")
     return tensor, payload
+
+
+def _load_cacd_features(row, expected_dataset, expected_stem, cfg):
+    payload = torch_load(row["cache_path"], map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(f"CACD feature payload must be dict: {row['cache_path']}")
+    for field, expected in (
+        ("dataset", expected_dataset),
+        ("stem", expected_stem),
+        ("backbone", cfg.BACKBONE_KEY),
+        ("backbone_key", cfg.BACKBONE_KEY),
+        ("model_key", cfg.DINO["model_name"]),
+        ("version", "cacd_last3_extra_v1"),
+        ("feature_type", "attention_key_projection"),
+        ("dtype", "float32"),
+        ("input_size", int(cfg.DINO["feature_input_size"])),
+        ("patch_size", int(cfg.DINO["patch_size"])),
+        ("layer_indices_0based", [9, 10]),
+        ("layer_indices_1based", [10, 11]),
+    ):
+        if payload.get(field) != expected:
+            raise RuntimeError(
+                f"CACD feature metadata mismatch for {expected_dataset}/{expected_stem}: "
+                f"{field}={payload.get(field)!r} != {expected!r} | {row['cache_path']}"
+            )
+    if payload.get("stored_layer_indices") != [9, 10]:
+        raise RuntimeError(
+            f"CACD stored layers mismatch for {expected_dataset}/{expected_stem}: "
+            f"{payload.get('stored_layer_indices')!r} != [9, 10]"
+        )
+    if any(field in payload for field in ("feature_l12", "tensor", "feature")):
+        raise RuntimeError(
+            f"CACD extra cache must not duplicate F12: {row['cache_path']}"
+        )
+    expected_shape = [
+        int(getattr(cfg, "CACD_IN_CHANNELS", 384)),
+        int(getattr(cfg, "CACD_FEATURE_SIZE", 37)),
+        int(getattr(cfg, "CACD_FEATURE_SIZE", 37)),
+    ]
+    result = {}
+    for field in ("feature_l10", "feature_l11"):
+        tensor = payload.get(field)
+        if not torch.is_tensor(tensor):
+            raise TypeError(f"CACD feature payload missing {field}: {row['cache_path']}")
+        if tensor.dtype != torch.float32 or list(tensor.shape) != expected_shape:
+            raise RuntimeError(
+                f"CACD {field} shape/dtype mismatch for {expected_dataset}/{expected_stem}: "
+                f"shape={list(tensor.shape)}, dtype={tensor.dtype}, expected={expected_shape}/float32"
+            )
+        if not bool(torch.isfinite(tensor).all().item()):
+            raise RuntimeError(f"CACD {field} contains NaN/Inf: {row['cache_path']}")
+        result[field] = tensor.float()
+    result["payload"] = payload
+    return result
+
+
+def _load_cssd_hr_feature(row, expected_dataset, expected_stem, cfg):
+    payload = torch_load(row["cache_path"], map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(f"CSSD HR feature cache must be dict: {row['cache_path']}")
+    for field, expected in (
+        ("dataset", expected_dataset),
+        ("stem", expected_stem),
+        ("backbone_key", cfg.BACKBONE_KEY),
+        ("model_key", cfg.DINO["model_name"]),
+        ("feature_layer", "final_attention_key"),
+        ("input_size", int(getattr(cfg, "CSSD_HR_INPUT_SIZE", 384))),
+        ("version", "cssd_hr_feature_v1"),
+        ("dtype", "float32"),
+    ):
+        if payload.get(field) != expected:
+            raise RuntimeError(
+                f"CSSD HR feature metadata mismatch for {expected_dataset}/{expected_stem}: "
+                f"{field}={payload.get(field)!r} != {expected!r} | {row['cache_path']}"
+            )
+    if not isinstance(payload.get("key_projection_path"), str) or not payload["key_projection_path"]:
+        raise RuntimeError(
+            f"CSSD HR feature missing key_projection_path for {expected_dataset}/{expected_stem}: "
+            f"{row['cache_path']}"
+        )
+    field = str(getattr(cfg, "CSSD_HR_CACHE_KEY", "feature"))
+    feature = payload.get(field)
+    expected_shape = [
+        int(getattr(cfg, "CSSD_HR_FEATURE_CHANNELS", 384)),
+        int(getattr(cfg, "CSSD_HR_FEATURE_SIZE", 48)),
+        int(getattr(cfg, "CSSD_HR_FEATURE_SIZE", 48)),
+    ]
+    if not torch.is_tensor(feature) or list(feature.shape) != expected_shape:
+        shape = list(feature.shape) if torch.is_tensor(feature) else None
+        raise RuntimeError(
+            f"CSSD HR feature shape mismatch for {expected_dataset}/{expected_stem}: "
+            f"{shape} != {expected_shape} | {row['cache_path']}"
+        )
+    if feature.dtype != torch.float32:
+        raise RuntimeError(
+            f"CSSD HR feature dtype mismatch for {expected_dataset}/{expected_stem}: "
+            f"{feature.dtype} != torch.float32 | {row['cache_path']}"
+        )
+    if not bool(torch.isfinite(feature).all().item()):
+        raise RuntimeError(f"CSSD HR feature contains NaN/Inf: {row['cache_path']}")
+    return feature, payload
 
 
 def _expected_feature_channels(cfg):
@@ -565,6 +687,26 @@ def _load_dabe_pu_v11(row, expected_dataset, expected_stem, cfg):
             f"dataset={expected_dataset} | stem={expected_stem} | "
             f"cache_path={row['cache_path']} | missing_key={missing[0]} | missing_keys={missing}"
         )
+    target_base = payload.get("target_soft_base_68", payload.get("target_soft_base"))
+    weight_base = payload.get("weight_map_base_68", payload.get("weight_map_base"))
+    if torch.is_tensor(target_base):
+        target_base = target_base.float()
+    else:
+        target_base = out["target_soft_68"]
+    if torch.is_tensor(weight_base):
+        weight_base = weight_base.float()
+    else:
+        weight_base = out["weight_map_68"]
+    sc_bg_lock = payload.get("sc_bg_lock_68", payload.get("sc_bg_lock"))
+    sc_extent_agree_fg = payload.get("sc_extent_agree_fg_68", payload.get("sc_extent_agree_fg"))
+    sc_lost_extent = payload.get("sc_lost_extent_68", payload.get("sc_lost_extent"))
+    sc_new_boundary = payload.get("sc_new_boundary_68", payload.get("sc_new_boundary"))
+    zero_diag = torch.zeros_like(out["target_soft_68"])
+    sc_bg_lock = sc_bg_lock.float() if torch.is_tensor(sc_bg_lock) else zero_diag
+    sc_extent_agree_fg = sc_extent_agree_fg.float() if torch.is_tensor(sc_extent_agree_fg) else zero_diag
+    sc_lost_extent = sc_lost_extent.float() if torch.is_tensor(sc_lost_extent) else zero_diag
+    sc_new_boundary = sc_new_boundary.float() if torch.is_tensor(sc_new_boundary) else zero_diag
+
     return {
         "pu_target_soft": out["target_soft_68"],
         "pu_weight_map": out["weight_map_68"],
@@ -585,6 +727,19 @@ def _load_dabe_pu_v11(row, expected_dataset, expected_stem, cfg):
         "pu_bg_core_area": float(payload.get("bg_core_pu_area", out["bg_core_pu_68"].mean().item())),
         "pu_extent_area": float(payload.get("extent_area", out["extent_candidate_68"].mean().item())),
         "pu_unknown_area": float(payload.get("unknown_area", out["unknown_68"].mean().item())),
+        "pu_target_base": target_base,
+        "pu_weight_base": weight_base,
+        "pu_sc_bg_lock": sc_bg_lock,
+        "pu_sc_extent_agree_fg": sc_extent_agree_fg,
+        "pu_sc_lost_extent": sc_lost_extent,
+        "pu_sc_new_boundary": sc_new_boundary,
+        "pu_target_base_mean": float(payload.get("target_base_mean", target_base.mean().item())),
+        "pu_weight_base_mean": float(payload.get("weight_base_mean", weight_base.mean().item())),
+        "pu_target_delta_mean": float(payload.get("target_delta_mean", out["target_soft_68"].mean().item() - target_base.mean().item())),
+        "pu_sc_bg_lock_ratio": float(payload.get("sc_bg_lock_ratio", sc_bg_lock.mean().item())),
+        "pu_sc_extent_agree_fg_ratio": float(payload.get("sc_extent_agree_fg_ratio", sc_extent_agree_fg.mean().item())),
+        "pu_sc_lost_extent_ratio": float(payload.get("sc_lost_extent_ratio", sc_lost_extent.mean().item())),
+        "pu_sc_new_boundary_ratio": float(payload.get("sc_new_boundary_ratio", sc_new_boundary.mean().item())),
     }
 
 
@@ -908,11 +1063,40 @@ def _load_gt(gt_path):
     return torch.from_numpy(array).unsqueeze(0)
 
 
-def _load_image_68(image_path, loss_size):
+def _load_image_resize(image_path, size):
     image = Image.open(image_path).convert("RGB")
-    image = image.resize((int(loss_size), int(loss_size)), resample=Image.BILINEAR)
+    image = image.resize((int(size), int(size)), resample=Image.BILINEAR)
     array = np.asarray(image, dtype=np.float32) / 255.0
     return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+
+
+def _load_image_68(image_path, loss_size):
+    return _load_image_resize(image_path, loss_size)
+
+
+def _load_image_136(image_path, size):
+    return _load_image_resize(image_path, size)
+
+
+def _normalized_sobel_from_image(image):
+    if image.ndim != 3 or image.shape[0] != 3:
+        raise RuntimeError(f"Sobel image must be [3,H,W], got {list(image.shape)}")
+    gray = (
+        0.299 * image[0:1]
+        + 0.587 * image[1:2]
+        + 0.114 * image[2:3]
+    ).unsqueeze(0)
+    sobel_x = image.new_tensor(
+        [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]]
+    ).unsqueeze(0)
+    sobel_y = image.new_tensor(
+        [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]]
+    ).unsqueeze(0)
+    dx = F.conv2d(gray, sobel_x, padding=1)
+    dy = F.conv2d(gray, sobel_y, padding=1)
+    magnitude = torch.sqrt(dx * dx + dy * dy + 1e-6)
+    maximum = magnitude.flatten(1).max(dim=1).values.view(1, 1, 1, 1)
+    return (magnitude / (maximum + 1e-6)).clamp(0.0, 1.0).squeeze(0)
 
 
 class CachedTrainDataset(Dataset):
@@ -930,31 +1114,24 @@ class CachedTrainDataset(Dataset):
         self.use_dabe_oem = self.use_dabe_pu and (
             bool(getattr(cfg, "USE_DABE_OEM", False)) or self.p_init_mode == "dabe_pu_v11_oem"
         )
-        self.use_dabe_pu_despl_sched = self.use_dabe_pu and self.p_init_mode in {
-            "dabe_pu_v11_desplsched",
-            "dabe_pu_v11_desplsched_exactreset",
-            "dabe_pu_v11_desplsched_A1_keepteacher_lowlr",
-            "dabe_pu_v11_desplsched_A2_resetteacher_highlr",
-            "dabe_pu_v11_desplsched_softteacher",
-            "dabe_pu_v11_desplsched_dabehard",
-        }
+        self.use_dabe_pu_despl_sched = self.use_dabe_pu and self.p_init_mode in DABE_PU_DESPL_SCHED_MODES
         self.use_dabe_only = self.use_dabe_pseudo and self.p_init_mode in {"dabe_only", "dabe_gc_only"}
-        self.use_dabe_pu_v11 = self.use_dabe_pu and self.p_init_mode in {
-            "dabe_pu_v11",
-            "dabe_pu_v11_oem",
-            "dabe_pu_v11_desplsched",
-            "dabe_pu_v11_desplsched_exactreset",
-            "dabe_pu_v11_desplsched_A1_keepteacher_lowlr",
-            "dabe_pu_v11_desplsched_A2_resetteacher_highlr",
-            "dabe_pu_v11_desplsched_softteacher",
-            "dabe_pu_v11_desplsched_dabehard",
-        }
+        self.use_dabe_pu_v11 = self.use_dabe_pu and self.p_init_mode in DABE_PU_ALLOWED_MODES
         self.use_despl_only = self.use_despl_pseudo and self.p_init_mode == "despl_only"
         self.use_despl_paper = self.use_despl_pseudo and self.p_init_mode == "despl_paper_only"
         self.use_dre_safe_prior = self.use_despl_pseudo and bool(getattr(cfg, "USE_DRE_SAFE_PRIOR", False))
         self.use_despl_light_cache = self.use_despl_pseudo and bool(getattr(cfg, "USE_DESPL_LIGHT_CACHE", False))
         self.use_multi_level_feature = bool(getattr(cfg, "USE_MULTI_LEVEL_FEATURE", False))
         self.use_ndr_branch = bool(getattr(cfg, "USE_NDR_BRANCH", False))
+        self.use_csd_decoder = bool(getattr(cfg, "USE_CSD_DECODER", False))
+        self.use_csd_v1r = bool(getattr(cfg, "USE_CSD_V1R", False)) or str(
+            getattr(cfg, "HEAD_TYPE", "")
+        ).lower() == "dagp_safe_csd_v1r"
+        self.use_hr_bfr = bool(getattr(cfg, "USE_HR_BFR", False))
+        self.use_cssd = bool(getattr(cfg, "USE_CSSD", False))
+        self.use_cacd = bool(getattr(cfg, "USE_CACD", False)) or str(
+            getattr(cfg, "HEAD_TYPE", "")
+        ).lower() == "cacd_v1_base"
         self.use_multi_view_feature = bool(getattr(cfg, "USE_MULTI_VIEW_FEATURE", False))
         self.multi_view_types = [str(view).lower() for view in getattr(cfg, "MULTI_VIEW_TYPES", [])]
         self.use_hflip_view = self.use_multi_view_feature and "hflip" in self.multi_view_types
@@ -986,10 +1163,14 @@ class CachedTrainDataset(Dataset):
                     "'dabe_pu_v11_desplsched_A1_keepteacher_lowlr', "
                     "'dabe_pu_v11_desplsched_A2_resetteacher_highlr', "
                     "'dabe_pu_v11_desplsched_softteacher', "
-                    "'dabe_pu_v11_desplsched_dabehard'}."
+                    "'dabe_pu_v11_desplsched_dabehard', "
+                    "'dabe_pu_v12_shape_desplsched'}."
                 )
-            if str(getattr(cfg, "DABE_PU_VERSION", "")).lower() != "pu_v11":
-                raise RuntimeError("USE_DABE_PU=True currently requires DABE_PU_VERSION='pu_v11'.")
+            if str(getattr(cfg, "DABE_PU_VERSION", "")).lower() not in DABE_PU_ALLOWED_VERSIONS:
+                raise RuntimeError(
+                    "USE_DABE_PU=True currently requires DABE_PU_VERSION in "
+                    "{'pu_v11', 'pu_v12_shape_complete'}."
+                )
             if (
                 not self.use_dabe_oem
                 and not self.use_dabe_pu_despl_sched
@@ -1021,6 +1202,43 @@ class CachedTrainDataset(Dataset):
                 raise RuntimeError(
                     f"feature train cache missing first 10: {missing_features[:10]}"
                 )
+
+        self.cacd_feature_map = None
+        self.cacd_first_cache_path = None
+        if self.use_cacd:
+            cacd_manifest = cacd_feature_manifest_path(cfg, "train")
+            cacd_rows = read_jsonl(cacd_manifest)
+            self.cacd_feature_map = manifest_to_map(cacd_rows, cacd_manifest)
+            if max_samples < 0:
+                check_exact_keys("CACD feature train cache", self.cacd_feature_map.keys(), self.keys)
+            else:
+                missing_cacd = sorted(set(self.keys) - set(self.cacd_feature_map))
+                if missing_cacd:
+                    raise RuntimeError(f"CACD feature train cache missing first 10: {missing_cacd[:10]}")
+            self.cacd_first_cache_path = self.cacd_feature_map[self.keys[0]]["cache_path"]
+
+        self.cssd_hr_feature_map = None
+        self.cssd_hr_first_cache_path = None
+        self.cssd_hr_feature_shape = None
+        if self.use_cssd:
+            cssd_manifest = cssd_hr_feature_manifest_path(cfg)
+            cssd_rows = read_jsonl(cssd_manifest)
+            self.cssd_hr_feature_map = manifest_to_map(cssd_rows, cssd_manifest)
+            if max_samples < 0:
+                check_exact_keys("CSSD HR feature train cache", self.cssd_hr_feature_map.keys(), self.keys)
+            else:
+                missing_cssd = sorted(set(self.keys) - set(self.cssd_hr_feature_map))
+                if missing_cssd:
+                    raise RuntimeError(f"CSSD HR feature cache missing first 10: {missing_cssd[:10]}")
+            first_dataset, first_stem = self.keys[0]
+            first_cssd_feature, _ = _load_cssd_hr_feature(
+                self.cssd_hr_feature_map[(first_dataset, first_stem)],
+                first_dataset,
+                first_stem,
+                cfg,
+            )
+            self.cssd_hr_feature_shape = list(first_cssd_feature.shape)
+            self.cssd_hr_first_cache_path = self.cssd_hr_feature_map[(first_dataset, first_stem)]["cache_path"]
 
         self.hflip_feature_map = None
         self.hflip_feature_root = None
@@ -1347,7 +1565,11 @@ class CachedTrainDataset(Dataset):
                 cfg,
             )
             self.pseudo_shape = list(dabe_pu_payload["pu_target_soft"].shape)
-            self.pseudo_source = "dabe_pu_v11_cache"
+            self.pseudo_source = (
+                "dabe_pu_v12_shape_cache"
+                if str(getattr(cfg, "DABE_PU_VERSION", "")).lower() == "pu_v12_shape_complete"
+                else "dabe_pu_v11_cache"
+            )
             teacher_target_desc = (
                 "soft_prob"
                 if (
@@ -1491,6 +1713,16 @@ class CachedTrainDataset(Dataset):
             feature_payload = ml_feature_payload["payload"]
         else:
             feature, feature_payload = _load_feature(self.feature_map[key], dataset, stem)
+        cacd_features = None
+        if self.use_cacd:
+            cacd_features = _load_cacd_features(
+                self.cacd_feature_map[key], dataset, stem, self.cfg
+            )
+        cssd_hr_feature = None
+        if self.use_cssd:
+            cssd_hr_feature, _ = _load_cssd_hr_feature(
+                self.cssd_hr_feature_map[key], dataset, stem, self.cfg
+            )
         hflip_feature = None
         if self.use_hflip_view:
             hflip_feature, hflip_payload = _load_feature(self.hflip_feature_map[key], dataset, stem)
@@ -1658,12 +1890,25 @@ class CachedTrainDataset(Dataset):
             "dataset": dataset,
             "stem": stem,
             "image_path": item["image_path"],
+            "sample_index": int(index),
         }
-        if self.use_ndr_branch:
+        if self.use_cacd:
+            sample["feature_l10"] = cacd_features["feature_l10"]
+            sample["feature_l11"] = cacd_features["feature_l11"]
+        if self.use_cssd:
+            sample[str(getattr(self.cfg, "CSSD_HR_FEATURE_FIELD", "feature_cssd_hr"))] = cssd_hr_feature.float()
+        if self.use_ndr_branch or self.use_csd_decoder or self.use_csd_v1r or self.use_cacd:
             image_68 = _load_image_68(item["image_path"], int(self.cfg.LOSS_SIZE))
             sample["image_68"] = image_68
+            if self.use_cacd:
+                sample["sobel_68"] = _normalized_sobel_from_image(image_68)
             if self.use_hflip_view:
                 sample["image_hflip_68"] = torch.flip(image_68, dims=[-1])
+        if self.use_hr_bfr:
+            sample["image_136"] = _load_image_136(
+                item["image_path"],
+                int(getattr(self.cfg, "HR_BFR_SIZE", 136)),
+            )
         if self.use_hflip_view:
             sample["feature_hflip"] = hflip_feature.float()
         if self.use_multi_level_feature:
@@ -1776,6 +2021,19 @@ class CachedTrainDataset(Dataset):
                     "pu_bg_core_area": float(dabe_pu_payload["pu_bg_core_area"]),
                     "pu_extent_area": float(dabe_pu_payload["pu_extent_area"]),
                     "pu_unknown_area": float(dabe_pu_payload["pu_unknown_area"]),
+                    "pu_target_base": dabe_pu_payload["pu_target_base"].float(),
+                    "pu_weight_base": dabe_pu_payload["pu_weight_base"].float(),
+                    "pu_sc_bg_lock": dabe_pu_payload["pu_sc_bg_lock"].float(),
+                    "pu_sc_extent_agree_fg": dabe_pu_payload["pu_sc_extent_agree_fg"].float(),
+                    "pu_sc_lost_extent": dabe_pu_payload["pu_sc_lost_extent"].float(),
+                    "pu_sc_new_boundary": dabe_pu_payload["pu_sc_new_boundary"].float(),
+                    "pu_target_base_mean": float(dabe_pu_payload["pu_target_base_mean"]),
+                    "pu_weight_base_mean": float(dabe_pu_payload["pu_weight_base_mean"]),
+                    "pu_target_delta_mean": float(dabe_pu_payload["pu_target_delta_mean"]),
+                    "pu_sc_bg_lock_ratio": float(dabe_pu_payload["pu_sc_bg_lock_ratio"]),
+                    "pu_sc_extent_agree_fg_ratio": float(dabe_pu_payload["pu_sc_extent_agree_fg_ratio"]),
+                    "pu_sc_lost_extent_ratio": float(dabe_pu_payload["pu_sc_lost_extent_ratio"]),
+                    "pu_sc_new_boundary_ratio": float(dabe_pu_payload["pu_sc_new_boundary_ratio"]),
                     "use_fixed_in_pseudo": False,
                     "fixed_used_for_training": False,
                 }
@@ -1880,6 +2138,14 @@ class CachedEvalDataset(Dataset):
         self.keys = [(item["dataset"], item["stem"]) for item in self.items]
         self.use_multi_level_feature = bool(getattr(cfg, "USE_MULTI_LEVEL_FEATURE", False))
         self.use_ndr_branch = bool(getattr(cfg, "USE_NDR_BRANCH", False))
+        self.use_csd_decoder = bool(getattr(cfg, "USE_CSD_DECODER", False))
+        self.use_csd_v1r = bool(getattr(cfg, "USE_CSD_V1R", False)) or str(
+            getattr(cfg, "HEAD_TYPE", "")
+        ).lower() == "dagp_safe_csd_v1r"
+        self.use_hr_bfr = bool(getattr(cfg, "USE_HR_BFR", False))
+        self.use_cacd = bool(getattr(cfg, "USE_CACD", False)) or str(
+            getattr(cfg, "HEAD_TYPE", "")
+        ).lower() == "cacd_v1_base"
         self.multi_level_layers = [int(layer) for layer in getattr(cfg, "MULTI_LEVEL_LAYERS", [4, 8, 12])]
 
         feature_manifest = (
@@ -1892,6 +2158,17 @@ class CachedEvalDataset(Dataset):
         missing = sorted(set(self.keys) - set(self.feature_map.keys()))
         if missing:
             raise RuntimeError(f"feature {split} cache missing first 10: {missing[:10]}")
+
+        self.cacd_feature_map = None
+        self.cacd_first_cache_path = None
+        if self.use_cacd:
+            cacd_manifest = cacd_feature_manifest_path(cfg, split)
+            cacd_rows = read_jsonl(cacd_manifest)
+            self.cacd_feature_map = manifest_to_map(cacd_rows, cacd_manifest)
+            missing_cacd = sorted(set(self.keys) - set(self.cacd_feature_map))
+            if missing_cacd:
+                raise RuntimeError(f"CACD feature {split} cache missing first 10: {missing_cacd[:10]}")
+            self.cacd_first_cache_path = self.cacd_feature_map[self.keys[0]]["cache_path"]
 
         first_dataset, first_stem = self.keys[0]
         if self.use_multi_level_feature:
@@ -1921,6 +2198,11 @@ class CachedEvalDataset(Dataset):
             payload = ml_feature_payload["payload"]
         else:
             feature, payload = _load_feature(self.feature_map[key], dataset, stem)
+        cacd_features = None
+        if self.use_cacd:
+            cacd_features = _load_cacd_features(
+                self.cacd_feature_map[key], dataset, stem, self.cfg
+            )
         gt = _load_gt(item["gt_path"])
         original_size = tuple(payload.get("original_size", gt.shape[-2:]))
         sample = {
@@ -1932,8 +2214,19 @@ class CachedEvalDataset(Dataset):
             "gt_path": item["gt_path"],
             "original_size": original_size,
         }
-        if self.use_ndr_branch:
-            sample["image_68"] = _load_image_68(item["image_path"], int(self.cfg.LOSS_SIZE))
+        if self.use_cacd:
+            sample["feature_l10"] = cacd_features["feature_l10"]
+            sample["feature_l11"] = cacd_features["feature_l11"]
+        if self.use_ndr_branch or self.use_csd_decoder or self.use_csd_v1r or self.use_cacd:
+            image_68 = _load_image_68(item["image_path"], int(self.cfg.LOSS_SIZE))
+            sample["image_68"] = image_68
+            if self.use_cacd:
+                sample["sobel_68"] = _normalized_sobel_from_image(image_68)
+        if self.use_hr_bfr:
+            sample["image_136"] = _load_image_136(
+                item["image_path"],
+                int(getattr(self.cfg, "HR_BFR_SIZE", 136)),
+            )
         if self.use_multi_level_feature:
             sample.update(
                 {

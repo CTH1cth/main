@@ -239,6 +239,198 @@ def feature_manifest_path(cfg, split):
     return Path(cfg.CACHE_ROOT) / "features_cache" / cfg.BACKBONE_KEY / f"manifest_{split}.jsonl"
 
 
+def cacd_feature_manifest_path(cfg, split):
+    if split not in {"train", "val", "test"}:
+        raise ValueError(f"CACD feature split must be train/val/test, got {split!r}.")
+    root = getattr(cfg, "CACD_EXTRA_FEATURE_CACHE_ROOT", None)
+    if root is None:
+        root = getattr(cfg, "CACD_FEATURE_CACHE_ROOT")
+    return Path(root) / f"manifest_{split}.jsonl"
+
+
+def check_cacd_feature_cache(cfg, split, max_samples=None):
+    """Strictly validate the extra F10/F11 cache used by CACD-v1-Base."""
+    if not bool(getattr(cfg, "USE_CACD", False)):
+        return True, "disabled"
+    manifest_path = cacd_feature_manifest_path(cfg, split)
+    if not manifest_path.exists():
+        raise RuntimeError(f"CACD feature manifest missing: {manifest_path}")
+    rows = read_jsonl(manifest_path)
+    row_map = manifest_to_map(rows, manifest_path)
+    dataset_names = {
+        "train": cfg.TRAIN_DATASETS,
+        "val": cfg.VAL_DATASETS,
+        "test": cfg.TEST_DATASETS,
+    }[split]
+    items = build_image_items(cfg.DATA_ROOT, dataset_names, require_gt=False)
+    if max_samples is not None and int(max_samples) >= 0:
+        items = items[: int(max_samples)]
+    expected_keys = [(item["dataset"], item["stem"]) for item in items]
+    expected_item_map = {(item["dataset"], item["stem"]): item for item in items}
+    expected_set = set(expected_keys)
+    actual_set = set(row_map)
+    missing = sorted(expected_set - actual_set)
+    extra = sorted(actual_set - expected_set) if max_samples is None or int(max_samples) < 0 else []
+    if missing or extra:
+        raise RuntimeError(
+            f"CACD {split} cache key mismatch: missing first 10={missing[:10]}, "
+            f"extra first 10={extra[:10]}"
+        )
+
+    expected_shape = [
+        int(getattr(cfg, "CACD_IN_CHANNELS", 384)),
+        int(getattr(cfg, "CACD_FEATURE_SIZE", 37)),
+        int(getattr(cfg, "CACD_FEATURE_SIZE", 37)),
+    ]
+    for dataset, stem in expected_keys:
+        row = row_map[(dataset, stem)]
+        payload = torch_load(row["cache_path"], map_location="cpu")
+        if not isinstance(payload, dict):
+            raise TypeError(f"CACD feature payload must be dict: {row['cache_path']}")
+        metadata = (
+            ("dataset", dataset),
+            ("stem", stem),
+            ("backbone", cfg.BACKBONE_KEY),
+            ("backbone_key", cfg.BACKBONE_KEY),
+            ("model_key", cfg.DINO["model_name"]),
+            ("version", "cacd_last3_extra_v1"),
+            ("feature_type", "attention_key_projection"),
+            ("dtype", "float32"),
+            ("input_size", int(cfg.DINO["feature_input_size"])),
+            ("patch_size", int(cfg.DINO["patch_size"])),
+            ("layer_indices_0based", [9, 10]),
+            ("layer_indices_1based", [10, 11]),
+            ("feature_shape", expected_shape),
+        )
+        for field, expected in metadata:
+            if payload.get(field) != expected:
+                raise RuntimeError(
+                    f"CACD metadata mismatch for {dataset}/{stem}: "
+                    f"{field}={payload.get(field)!r} != {expected!r} | {row['cache_path']}"
+                )
+        if payload.get("stored_layer_indices") != [9, 10]:
+            raise RuntimeError(
+                f"CACD stored layers mismatch for {dataset}/{stem}: "
+                f"{payload.get('stored_layer_indices')!r} != [9, 10]"
+            )
+        if Path(payload.get("image_path", "")).resolve() != Path(
+            expected_item_map[(dataset, stem)]["image_path"]
+        ).resolve():
+            raise RuntimeError(
+                f"CACD image_path mismatch for {dataset}/{stem}: {payload.get('image_path')!r}"
+            )
+        key_paths = payload.get("key_projection_paths")
+        expected_paths = {
+            "9": "encoder.layer[9].attention.attention.key",
+            "10": "encoder.layer[10].attention.attention.key",
+            "11": "encoder.layer[11].attention.attention.key",
+        }
+        if key_paths != expected_paths:
+            raise RuntimeError(
+                f"CACD key projection paths mismatch for {dataset}/{stem}: {key_paths!r}"
+            )
+        if any(field in payload for field in ("feature_l12", "tensor", "feature")):
+            raise RuntimeError(
+                f"CACD extra cache must not duplicate F12 for {dataset}/{stem}: {row['cache_path']}"
+            )
+        for field in ("feature_l10", "feature_l11"):
+            tensor = payload.get(field)
+            if not torch.is_tensor(tensor):
+                raise TypeError(f"CACD payload missing tensor {field}: {row['cache_path']}")
+            if tensor.dtype != torch.float32 or list(tensor.shape) != expected_shape:
+                raise RuntimeError(
+                    f"CACD {field} mismatch for {dataset}/{stem}: "
+                    f"shape={list(tensor.shape)}, dtype={tensor.dtype}, expected={expected_shape}/float32"
+                )
+            if not bool(torch.isfinite(tensor).all().item()):
+                raise RuntimeError(f"CACD {field} contains NaN/Inf: {row['cache_path']}")
+    return True, f"complete: {manifest_path} | rows_checked={len(expected_keys)}"
+
+
+def cssd_hr_feature_manifest_path(cfg):
+    return Path(cfg.CSSD_HR_CACHE_ROOT) / "manifest_train.jsonl"
+
+
+def check_cssd_hr_feature_cache(cfg, max_samples=None):
+    if not bool(getattr(cfg, "USE_CSSD", False)):
+        return True, "disabled"
+    manifest_path = cssd_hr_feature_manifest_path(cfg)
+    if not manifest_path.exists():
+        raise RuntimeError(f"CSSD HR feature manifest missing: {manifest_path}")
+    rows = read_jsonl(manifest_path)
+    row_map = manifest_to_map(rows, manifest_path)
+    expected_items = build_image_items(cfg.DATA_ROOT, cfg.TRAIN_DATASETS, require_gt=False)
+    if max_samples is not None and int(max_samples) >= 0:
+        expected_items = expected_items[: int(max_samples)]
+    expected_keys = [(item["dataset"], item["stem"]) for item in expected_items]
+    expected_item_map = {(item["dataset"], item["stem"]): item for item in expected_items}
+    expected_set = set(expected_keys)
+    actual_set = set(row_map)
+    missing = sorted(expected_set - actual_set)
+    extra = sorted(actual_set - expected_set)
+    full_check = max_samples is None or int(max_samples) < 0
+    if missing or (full_check and extra):
+        raise RuntimeError(
+            "CSSD HR feature manifest coverage mismatch | "
+            f"missing first 10={missing[:10]} | extra first 10={extra[:10]}"
+        )
+    if full_check:
+        counts = {}
+        for dataset, _stem in expected_keys:
+            counts[dataset] = counts.get(dataset, 0) + 1
+        expected_counts = {"TR-CAMO": 1000, "TR-COD10K": 3040}
+        if len(expected_keys) != 4040 or counts != expected_counts:
+            raise RuntimeError(
+                f"CSSD expected train split 4040 with {expected_counts}, got total={len(expected_keys)}, counts={counts}"
+            )
+
+    expected_shape = [
+        int(getattr(cfg, "CSSD_HR_FEATURE_CHANNELS", 384)),
+        int(getattr(cfg, "CSSD_HR_FEATURE_SIZE", 48)),
+        int(getattr(cfg, "CSSD_HR_FEATURE_SIZE", 48)),
+    ]
+    expected_key = str(getattr(cfg, "CSSD_HR_CACHE_KEY", "feature"))
+    for key in expected_keys:
+        row = row_map[key]
+        if row.get("shape") != expected_shape:
+            raise RuntimeError(f"CSSD HR manifest shape mismatch for {key}: {row.get('shape')} != {expected_shape}")
+        payload = torch_load(row["cache_path"], map_location="cpu")
+        if not isinstance(payload, dict):
+            raise TypeError(f"CSSD HR cache must be dict for {key}: {row['cache_path']}")
+        checks = {
+            "dataset": key[0],
+            "stem": key[1],
+            "backbone_key": cfg.BACKBONE_KEY,
+            "model_key": cfg.DINO["model_name"],
+            "feature_layer": "final_attention_key",
+            "input_size": int(getattr(cfg, "CSSD_HR_INPUT_SIZE", 384)),
+            "patch_size": 8,
+            "feature_shape": expected_shape,
+            "version": "cssd_hr_feature_v1",
+        }
+        for field, expected in checks.items():
+            if payload.get(field) != expected:
+                raise RuntimeError(
+                    f"CSSD HR cache metadata mismatch for {key}: {field}={payload.get(field)!r} != {expected!r}"
+                )
+        if payload.get("dtype") != "float32":
+            raise RuntimeError(f"CSSD HR cache dtype metadata mismatch for {key}: {payload.get('dtype')!r}")
+        if not isinstance(payload.get("key_projection_path"), str) or not payload["key_projection_path"]:
+            raise RuntimeError(f"CSSD HR cache missing truthful key_projection_path for {key}")
+        if Path(payload.get("image_path", "")).resolve() != Path(expected_item_map[key]["image_path"]).resolve():
+            raise RuntimeError(f"CSSD HR cache image_path mismatch for {key}: {payload.get('image_path')!r}")
+        feature = payload.get(expected_key)
+        if not torch.is_tensor(feature):
+            raise RuntimeError(f"CSSD HR cache missing tensor field {expected_key!r} for {key}")
+        if list(feature.shape) != expected_shape or feature.dtype != torch.float32:
+            raise RuntimeError(
+                f"CSSD HR feature tensor mismatch for {key}: shape={list(feature.shape)}, dtype={feature.dtype}"
+            )
+        if not bool(torch.isfinite(feature).all().item()):
+            raise RuntimeError(f"CSSD HR feature contains NaN/Inf for {key}: {row['cache_path']}")
+    return True, f"complete: {manifest_path} | num_samples={len(expected_keys)}"
+
+
 def pseudo_manifest_path(cfg):
     # fixed pseudo 只用于训练集，因此只有 train manifest。
     return Path(cfg.CACHE_ROOT) / "pseudo_label_cache" / cfg.BACKBONE_KEY / "manifest_train.jsonl"
@@ -1352,6 +1544,8 @@ def check_dabe_pu_cache(cfg, max_samples=None):
     expected_shape = [1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE)]
     expected_shape_37 = [1, 37, 37]
     expected_version = str(getattr(cfg, "DABE_PU_VERSION", "pu_v11")).lower()
+    if expected_version not in {"pu_v11", "pu_v12_shape_complete"}:
+        raise RuntimeError(_dabe_pu_error(f"unsupported DABE_PU_VERSION={expected_version}"))
     use_oem = bool(getattr(cfg, "USE_DABE_OEM", False)) or str(
         getattr(cfg, "P_INIT_MODE", "")
     ) == "dabe_pu_v11_oem"
