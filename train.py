@@ -9,6 +9,12 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from common.dataset import CachedEvalDataset, CachedTrainDataset
+from common.ecst import (
+    TemporalTeacherMemory as ECSTTemporalTeacherMemory,
+    build_ecst_region_masks,
+    build_ecst_teacher_weight_map,
+    get_ecst_scale,
+)
 from common.gkd_lite import (
     apply_gkd_strength,
     compute_gkd_branch_loss,
@@ -20,16 +26,6 @@ from common.gkd_lite import (
     is_gkd_v3_enabled,
 )
 from common.metrics import CODMetrics
-from common.tepr import (
-    TemporalTeacherMemory,
-    build_teacher_region_masks,
-    build_tepr_lite_teacher_weight_map,
-    build_tepr_lite_v11_teacher_weight_map,
-    compute_dino_core_margin_68 as compute_dino_core_margin_68_shared,
-    get_tepr_scale,
-    histogram_quantile_from_hist,
-    temporal_variance_p90_from_hist,
-)
 from common.utils import (
     Logger,
     cache_status,
@@ -59,6 +55,13 @@ from common.utils import (
     write_yaml,
 )
 from model import build_seg_head, update_ema
+
+
+def _legacy_tepr_module():
+    """Load the historical TEPR implementation only for legacy configs."""
+    from common import tepr
+
+    return tepr
 
 
 def get_teacher_weight(epoch):
@@ -396,8 +399,137 @@ def teacher_routing_apply_flag(cfg, branch):
     branch = str(branch).lower()
     if branch not in suffixes:
         raise ValueError(f"Unsupported teacher routing branch: {branch}")
-    prefix = "TEPR" if bool(getattr(cfg, "USE_TEPR_LITE", False)) else "RAST"
+    if bool(getattr(cfg, "USE_ECST", False)):
+        prefix = "ECST"
+    elif bool(getattr(cfg, "USE_TEPR_LITE", False)):
+        prefix = "TEPR"
+    else:
+        prefix = "RAST"
     return bool(getattr(cfg, f"{prefix}_APPLY_TO_{suffixes[branch]}", True))
+
+
+def validate_ecst_config(cfg):
+    if not bool(getattr(cfg, "USE_ECST", False)):
+        return
+    required_flags = {
+        "USE_DABE_PU": True,
+        "USE_DABE_PU_DESPL_SCHEDULE": True,
+        "USE_DABE_PU_STATIC_LOSS": True,
+        "USE_TEACHER_BINARY_FULL_LOSS": True,
+        "ECST_USE_PREUPDATE_STATS": True,
+        "ECST_RESET_MEMORY_AT_FINETUNE_RESET": True,
+        "USE_DAGP_SAFE_HEAD": True,
+        "USE_NDR_BRANCH": True,
+        "USE_NDR_COARSE_AUX": True,
+    }
+    mismatched_flags = {
+        name: bool(getattr(cfg, name, False))
+        for name, expected in required_flags.items()
+        if bool(getattr(cfg, name, False)) != expected
+    }
+    if mismatched_flags:
+        raise RuntimeError(f"ECST required flags mismatch: {mismatched_flags}.")
+
+    forbidden_flags = (
+        "USE_TEPR_LITE",
+        "USE_RAST",
+        "USE_ESA_ASYM",
+        "ESA_POST_RESET_ENABLE",
+        "USE_ESA_BER",
+        "USE_HBNS_LITE",
+        "USE_EPR_POS",
+        "USE_TCE",
+        "USE_LCEG",
+        "USE_CSSD",
+        "USE_HR_BFR",
+        "USE_PA_DAGP",
+        "USE_CSD_DECODER",
+        "USE_CSD_V1R",
+        "USE_CACD",
+        "USE_NDR_V2",
+        "USE_TADR_ROUTER",
+        "USE_PROTO_CONTRAST",
+        "USE_MULTI_VIEW_FEATURE",
+    )
+    enabled_forbidden = [
+        name for name in forbidden_flags if bool(getattr(cfg, name, False))
+    ]
+    if enabled_forbidden:
+        raise RuntimeError(f"ECST clean path cannot be combined with: {enabled_forbidden}.")
+
+    expected_strings = {
+        "ECST_VERSION": "v1_state_conditional_asymneg",
+        "ECST_TEMPORAL_SCOPE": "extent_teacher_bg_only",
+        "ECST_INSUFFICIENT_HISTORY_MODE": "dino_only",
+        "DABE_PU_VERSION": "pu_v11",
+        "P_INIT_MODE": "dabe_pu_v11_desplsched",
+        "TEACHER_FUSION_MODE": "dabe_pu_despl_sched",
+        "TEACHER_TARGET_MODE": "binary",
+        "DABE_PU_STATIC_TARGET_MODE": "soft",
+        "HEAD_TYPE": "dagp_safe",
+    }
+    mismatched_strings = {
+        name: getattr(cfg, name, None)
+        for name, expected in expected_strings.items()
+        if str(getattr(cfg, name, "")).lower() != expected
+    }
+    if mismatched_strings:
+        raise RuntimeError(
+            f"ECST string configuration mismatch: {mismatched_strings}; "
+            f"expected={expected_strings}."
+        )
+
+    expected_values = {
+        "ECST_CORE_CONFLICT_WEIGHT": 0.20,
+        "ECST_EXTENT_FG_WEIGHT": 1.00,
+        "ECST_EXTENT_BG_WEIGHT_FLOOR": 0.25,
+        "ECST_EXTENT_DINO_LAMBDA": 1.386294,
+        "ECST_MARGIN_TAU": 0.05,
+        "ECST_UNKNOWN_WEIGHT": 0.50,
+        "ECST_WEIGHT_MIN": 0.20,
+        "ECST_WEIGHT_MAX": 1.00,
+        "ECST_TEMPORAL_RHO": 0.90,
+        "ECST_VARIANCE_TAU": 0.02,
+        "ECST_CONF_GAMMA": 1.00,
+        "LR_FLOOR": 2e-5,
+        "FINETUNE_RESET_LR": 2e-5,
+    }
+    mismatched_values = {}
+    for name, expected in expected_values.items():
+        actual = float(getattr(cfg, name, float("nan")))
+        if not math.isfinite(actual) or abs(actual - expected) > 1e-8:
+            mismatched_values[name] = actual
+    if mismatched_values:
+        raise RuntimeError(
+            f"ECST numeric configuration mismatch: {mismatched_values}; "
+            f"expected={expected_values}."
+        )
+
+    schedule = (
+        int(getattr(cfg, "ECST_START_EPOCH", -1)),
+        int(getattr(cfg, "ECST_RAMP_END_EPOCH", -1)),
+        int(getattr(cfg, "ECST_STOP_EPOCH", -1)),
+        int(getattr(cfg, "ECST_MEMORY_UPDATE_START_EPOCH", -1)),
+        int(getattr(cfg, "ECST_MEMORY_UPDATE_END_EPOCH", -1)),
+    )
+    if schedule != (7, 15, 21, 1, 20):
+        raise RuntimeError(f"ECST schedule must be (7,15,21,1,20), got {schedule}.")
+    if int(getattr(cfg, "ECST_MIN_HISTORY", -1)) != 3:
+        raise RuntimeError("ECST_MIN_HISTORY must be 3.")
+    if str(getattr(cfg, "ECST_MEMORY_DTYPE", "")).lower() != "float16":
+        raise RuntimeError("ECST_MEMORY_DTYPE must be float16.")
+    if int(getattr(cfg, "LOSS_SIZE", -1)) != 68 or int(getattr(cfg, "MAX_EPOCH", -1)) != 45:
+        raise RuntimeError("ECST clean path requires LOSS_SIZE=68 and MAX_EPOCH=45.")
+    if get_reset_epoch(cfg) != 20 or finetune_reset_timing(cfg) != "after_epoch":
+        raise RuntimeError("ECST clean path requires epoch20 after-epoch reset.")
+    if not bool(getattr(cfg, "FINETUNE_RESET_TEACHER", False)):
+        raise RuntimeError("ECST clean path requires FINETUNE_RESET_TEACHER=True.")
+    if get_dabe_pu_despl_teacher_target_mode(cfg) != "binary":
+        raise RuntimeError("ECST clean path requires binary teacher target.")
+    if get_dabe_pu_despl_static_target_mode(cfg) != "soft":
+        raise RuntimeError("ECST clean path requires soft DABE-PU static target.")
+    if not all(teacher_routing_apply_flag(cfg, branch) for branch in ("final", "coarse", "base")):
+        raise RuntimeError("ECST requires final/coarse/base teacher routing enabled.")
 
 
 def validate_tepr_lite_config(cfg):
@@ -572,7 +704,7 @@ def build_configured_tepr_teacher_weight_map(
 ):
     routing_mode = str(getattr(cfg, "TEPR_ROUTING_MODE", "legacy_v1")).lower()
     if routing_mode == "state_conditional_asymneg":
-        return build_tepr_lite_v11_teacher_weight_map(
+        return _legacy_tepr_module().build_tepr_lite_v11_teacher_weight_map(
             cfg,
             batch,
             teacher_prob,
@@ -583,7 +715,7 @@ def build_configured_tepr_teacher_weight_map(
             device,
         )
     if routing_mode == "legacy_v1":
-        return build_tepr_lite_teacher_weight_map(
+        return _legacy_tepr_module().build_tepr_lite_teacher_weight_map(
             cfg,
             batch,
             teacher_prob,
@@ -2766,7 +2898,7 @@ def _batch_pu_tensor(batch, key, device):
 
 
 def build_rast_region_masks(batch, device):
-    return build_teacher_region_masks(batch, device)
+    return build_ecst_region_masks(batch, device)
 
 
 def _rast_mask_mean(value, mask, empty_value=0.0):
@@ -2778,7 +2910,7 @@ def _rast_mask_mean(value, mask, empty_value=0.0):
 
 
 def compute_dino_core_margin_68(cfg, batch, fg_core, bg_core, output_size, device, prefix="ESA"):
-    return compute_dino_core_margin_68_shared(
+    return _legacy_tepr_module().compute_dino_core_margin_68(
         cfg,
         batch,
         fg_core,
@@ -3807,6 +3939,247 @@ def rast_teacher_bce_with_logits(
     return (loss * teacher_map_eff.to(device=logits.device, dtype=logits.dtype)).mean()
 
 
+def teacher_route_bce_with_logits(
+    logits,
+    target,
+    teacher_map,
+    cfg,
+    routing_scale,
+    apply_to_loss=True,
+    eps=1e-6,
+):
+    """Apply the active teacher router without coupling ECST to legacy routing."""
+    if bool(getattr(cfg, "USE_ECST", False)):
+        return teacher_weighted_bce_with_logits(
+            logits,
+            target,
+            teacher_map,
+            enabled=float(routing_scale) > 0.0,
+            apply_to_loss=apply_to_loss,
+            eps=eps,
+        )
+    return rast_teacher_bce_with_logits(
+        logits,
+        target,
+        teacher_map,
+        cfg,
+        routing_scale,
+        apply_to_loss=apply_to_loss,
+        eps=eps,
+    )
+
+
+ECST_STATE_KEYS = (
+    "core_conflict_map",
+    "core_no_conflict_map",
+    "extent_teacher_fg_map",
+    "extent_teacher_bg_map",
+    "extent_bg_reliability",
+    "extent_bg_dino_ceiling",
+    "extent_bg_raw_weight",
+    "extent_bg_fg_like_map",
+    "extent_bg_ambiguous_map",
+    "extent_bg_bg_like_map",
+    "unknown_map",
+    "other_map",
+    "teacher_fg_fg_core",
+    "teacher_fg_extent",
+)
+
+
+def make_ecst_inactive_stats(batch, teacher_prob, device):
+    masks = build_ecst_region_masks(batch, device)
+    teacher_fg = teacher_prob >= 0.5
+    teacher_bg = ~teacher_fg
+    fg_conflict = masks["fg_core"] & teacher_bg
+    bg_conflict = masks["bg_core"] & teacher_fg
+    core_conflict = fg_conflict | bg_conflict
+    core_no_conflict = (masks["fg_core"] | masks["bg_core"]) & (~core_conflict)
+    extent_teacher_fg = masks["extent"] & teacher_fg
+    extent_teacher_bg = masks["extent"] & teacher_bg
+    state_masks = {
+        "core_conflict_map": core_conflict,
+        "core_no_conflict_map": core_no_conflict,
+        "extent_teacher_fg_map": extent_teacher_fg,
+        "extent_teacher_bg_map": extent_teacher_bg,
+        "extent_bg_reliability": extent_teacher_bg,
+        "extent_bg_dino_ceiling": extent_teacher_bg,
+        "extent_bg_raw_weight": extent_teacher_bg,
+        "extent_bg_fg_like_map": torch.zeros_like(extent_teacher_bg),
+        "extent_bg_ambiguous_map": torch.zeros_like(extent_teacher_bg),
+        "extent_bg_bg_like_map": torch.zeros_like(extent_teacher_bg),
+        "unknown_map": masks["unknown"],
+        "other_map": masks["other"],
+        "teacher_fg_fg_core": masks["fg_core"],
+        "teacher_fg_extent": masks["extent"],
+    }
+    state_sums = {}
+    state_counts = {}
+    state_means = {}
+    for name in ECST_STATE_KEYS:
+        mask = state_masks[name]
+        count = float(mask.float().sum().detach().item())
+        if name == "teacher_fg_fg_core":
+            value_sum = float((teacher_fg.float() * mask.float()).sum().detach().item())
+        elif name == "teacher_fg_extent":
+            value_sum = float((teacher_fg.float() * mask.float()).sum().detach().item())
+        else:
+            value_sum = count
+        state_counts[name] = count
+        state_sums[name] = value_sum
+        state_means[name] = value_sum / count if count > 0.0 else 0.0
+    region_sums = {
+        name: float(mask.float().sum().detach().item()) for name, mask in masks.items()
+    }
+    return {
+        "ecst_scale": 0.0,
+        "memory_active": False,
+        "history_count_min": 0,
+        "history_count_mean": 0.0,
+        "history_count_max": 0,
+        "history_valid_ratio": 0.0,
+        "temporal_mean_min": 0.0,
+        "temporal_mean_mean": 0.0,
+        "temporal_mean_max": 0.0,
+        "temporal_var_min": 0.0,
+        "temporal_var_mean": 0.0,
+        "temporal_var_max": 0.0,
+        "temporal_reliability_mean": 0.0,
+        "fg_core_conflict_count": int(fg_conflict.sum().detach().item()),
+        "fg_core_count": int(masks["fg_core"].sum().detach().item()),
+        "bg_core_conflict_count": int(bg_conflict.sum().detach().item()),
+        "bg_core_count": int(masks["bg_core"].sum().detach().item()),
+        "extent_teacher_fg_count": int(extent_teacher_fg.sum().detach().item()),
+        "extent_teacher_bg_count": int(extent_teacher_bg.sum().detach().item()),
+        "extent_count": int(masks["extent"].sum().detach().item()),
+        "dino_margin_min": 0.0,
+        "dino_margin_mean": 0.0,
+        "dino_margin_max": 0.0,
+        "teacher_map_raw_min": 1.0,
+        "teacher_map_raw_mean": 1.0,
+        "teacher_map_raw_max": 1.0,
+        "teacher_map_min": 1.0,
+        "teacher_map_mean": 1.0,
+        "teacher_map_max": 1.0,
+        "map_sum": float(teacher_prob.numel()),
+        "map_pixel_count": int(teacher_prob.numel()),
+        "region_sums": region_sums,
+        "region_counts": dict(region_sums),
+        "region_means": {name: 1.0 for name in masks},
+        "state_sums": state_sums,
+        "state_counts": state_counts,
+        "state_means": state_means,
+        "ecst_skipped_no_fg_proto": 0,
+        "ecst_skipped_no_bg_proto": 0,
+    }
+
+
+def new_ecst_epoch_accumulator():
+    return {
+        "batches": 0,
+        "memory_active_batches": 0,
+        "history_count_mean_sum": 0.0,
+        "history_valid_ratio_sum": 0.0,
+        "temporal_var_mean_sum": 0.0,
+        "temporal_reliability_mean_sum": 0.0,
+        "map_sum": 0.0,
+        "map_pixels": 0,
+        "map_min": None,
+        "map_max": None,
+        "fg_core_conflict_count": 0,
+        "fg_core_count": 0,
+        "bg_core_conflict_count": 0,
+        "bg_core_count": 0,
+        "extent_teacher_fg_count": 0,
+        "extent_teacher_bg_count": 0,
+        "extent_count": 0,
+        "state_sums": {name: 0.0 for name in ECST_STATE_KEYS},
+        "state_counts": {name: 0.0 for name in ECST_STATE_KEYS},
+        "student_pred_fg_count": 0,
+        "teacher_pred_fg_count": 0,
+        "prediction_pixels": 0,
+    }
+
+
+def accumulate_ecst_epoch(accumulator, stats, student_prob, teacher_prob):
+    accumulator["batches"] += 1
+    accumulator["memory_active_batches"] += int(bool(stats.get("memory_active", False)))
+    accumulator["history_count_mean_sum"] += float(stats["history_count_mean"])
+    accumulator["history_valid_ratio_sum"] += float(stats["history_valid_ratio"])
+    accumulator["temporal_var_mean_sum"] += float(stats["temporal_var_mean"])
+    accumulator["temporal_reliability_mean_sum"] += float(
+        stats["temporal_reliability_mean"]
+    )
+    accumulator["map_sum"] += float(stats["map_sum"])
+    accumulator["map_pixels"] += int(stats["map_pixel_count"])
+    map_min = float(stats["teacher_map_min"])
+    map_max = float(stats["teacher_map_max"])
+    accumulator["map_min"] = map_min if accumulator["map_min"] is None else min(
+        accumulator["map_min"], map_min
+    )
+    accumulator["map_max"] = map_max if accumulator["map_max"] is None else max(
+        accumulator["map_max"], map_max
+    )
+    for name in (
+        "fg_core_conflict_count",
+        "fg_core_count",
+        "bg_core_conflict_count",
+        "bg_core_count",
+        "extent_teacher_fg_count",
+        "extent_teacher_bg_count",
+        "extent_count",
+    ):
+        accumulator[name] += int(stats[name])
+    for name in ECST_STATE_KEYS:
+        accumulator["state_sums"][name] += float(stats["state_sums"][name])
+        accumulator["state_counts"][name] += float(stats["state_counts"][name])
+    accumulator["student_pred_fg_count"] += int((student_prob >= 0.5).sum().detach().item())
+    accumulator["teacher_pred_fg_count"] += int((teacher_prob >= 0.5).sum().detach().item())
+    accumulator["prediction_pixels"] += int(student_prob.numel())
+
+
+def log_ecst_first_batch(logger, cfg, epoch, sample_indices, stats, student_prob, teacher_prob):
+    state_means = stats["state_means"]
+    logger.log(
+        f"[ECST FirstBatch] epoch={int(epoch):03d} | version={getattr(cfg, 'ECST_VERSION', '')} | "
+        f"sample_index_shape/min/max={list(sample_indices.shape)}/"
+        f"{int(sample_indices.min().item())}/{int(sample_indices.max().item())} | "
+        f"scale={float(stats['ecst_scale']):.8f} | memory_active={bool(stats['memory_active'])}"
+    )
+    logger.log(
+        "[ECST FirstBatch] history min/mean/max/valid="
+        f"{int(stats['history_count_min'])}/{float(stats['history_count_mean']):.4f}/"
+        f"{int(stats['history_count_max'])}/{float(stats['history_valid_ratio']):.6f} | "
+        f"variance_mean={float(stats['temporal_var_mean']):.8f} | "
+        f"reliability_mean={float(stats['temporal_reliability_mean']):.6f}"
+    )
+    logger.log(
+        "[ECST FirstBatch] fg/bg conflict="
+        f"{int(stats['fg_core_conflict_count'])}/{int(stats['fg_core_count'])}/"
+        f"{int(stats['bg_core_conflict_count'])}/{int(stats['bg_core_count'])} | "
+        "extent teacher-fg/bg="
+        f"{int(stats['extent_teacher_fg_count'])}/{int(stats['extent_teacher_bg_count'])}/"
+        f"{int(stats['extent_count'])}"
+    )
+    logger.log(
+        "[ECST FirstBatch] map raw min/mean/max="
+        f"{float(stats['teacher_map_raw_min']):.6f}/"
+        f"{float(stats['teacher_map_raw_mean']):.6f}/"
+        f"{float(stats['teacher_map_raw_max']):.6f} | effective="
+        f"{float(stats['teacher_map_min']):.6f}/"
+        f"{float(stats['teacher_map_mean']):.6f}/"
+        f"{float(stats['teacher_map_max']):.6f} | core_conflict/extent_bg/unknown="
+        f"{float(state_means['core_conflict_map']):.6f}/"
+        f"{float(state_means['extent_teacher_bg_map']):.6f}/"
+        f"{float(state_means['unknown_map']):.6f}"
+    )
+    logger.log(
+        "[ECST FirstBatch] student/teacher area="
+        f"{float((student_prob >= 0.5).float().mean().detach().item()):.6f}/"
+        f"{float((teacher_prob >= 0.5).float().mean().detach().item()):.6f}"
+    )
+
+
 TEPR_V11_CONDITIONAL_KEYS = (
     "core_conflict_map",
     "core_no_conflict_map",
@@ -4107,9 +4480,9 @@ def log_tepr_first_batch(logger, cfg, epoch, sample_indices, stats):
         )
         logger.log(
             "[TEPR-Lite-v1.1 FirstBatch] extent-bg reliability p10/p50/p90="
-            f"{histogram_quantile_from_hist(reliability_hist, 0.10):.6f}/"
-            f"{histogram_quantile_from_hist(reliability_hist, 0.50):.6f}/"
-            f"{histogram_quantile_from_hist(reliability_hist, 0.90):.6f} | "
+            f"{_legacy_tepr_module().histogram_quantile_from_hist(reliability_hist, 0.10):.6f}/"
+            f"{_legacy_tepr_module().histogram_quantile_from_hist(reliability_hist, 0.50):.6f}/"
+            f"{_legacy_tepr_module().histogram_quantile_from_hist(reliability_hist, 0.90):.6f} | "
             f"dino_ceiling={conditional.get('extent_bg_dino_ceiling', 0.0):.6f} | "
             f"raw_final_weight={conditional.get('extent_bg_final_weight', 0.0):.6f}"
         )
@@ -4246,7 +4619,7 @@ def compute_cssd_original_group_loss(
         result["loss_static_final"] = weighted_bce_with_logits(
             final_logits, static_target, static_weight_map, eps=eps
         )
-        result["loss_teacher_final"] = rast_teacher_bce_with_logits(
+        result["loss_teacher_final"] = teacher_route_bce_with_logits(
             final_logits,
             teacher_target,
             teacher_map_eff,
@@ -4267,7 +4640,7 @@ def compute_cssd_original_group_loss(
         result["loss_static_coarse"] = weighted_bce_with_logits(
             coarse_logits, static_target, static_weight_map, eps=eps
         )
-        result["loss_teacher_coarse"] = rast_teacher_bce_with_logits(
+        result["loss_teacher_coarse"] = teacher_route_bce_with_logits(
             coarse_logits,
             teacher_target,
             teacher_map_eff,
@@ -4292,7 +4665,7 @@ def compute_cssd_original_group_loss(
         result["loss_static_base"] = weighted_bce_with_logits(
             base_logits, static_target, static_weight_map, eps=eps
         )
-        result["loss_teacher_base"] = rast_teacher_bce_with_logits(
+        result["loss_teacher_base"] = teacher_route_bce_with_logits(
             base_logits,
             teacher_target,
             teacher_map_eff,
@@ -5364,13 +5737,26 @@ def build_pu_static_group_loss(logits, batch, cfg):
     fg_mask = (_batch_pu_tensor(batch, "pu_fg_core", device) > 0.5).float()
     fg_fallback_mask = (_batch_pu_tensor(batch, "pu_fg_fallback", device) > 0.5).float()
     bg_mask = (_batch_pu_tensor(batch, "pu_bg_core", device) > 0.5).float()
-    extent_mask = (_batch_pu_tensor(batch, "pu_extent", device) > 1e-6).float()
+    # Static PU support keeps its historical soft-positive threshold. ECST uses
+    # a separate hard extent state (>0.5), and pu_fg_fallback is never ECST core.
+    static_extent_support = (_batch_pu_tensor(batch, "pu_extent", device) > 1e-6).float()
     unknown_mask = (_batch_pu_tensor(batch, "pu_unknown", device) > 0.5).float()
 
     fg_fallback_mask = fg_fallback_mask * (1.0 - fg_mask)
     bg_mask = bg_mask * (1.0 - fg_mask) * (1.0 - fg_fallback_mask)
-    extent_mask = extent_mask * (1.0 - fg_mask) * (1.0 - fg_fallback_mask) * (1.0 - bg_mask)
-    unknown_mask = unknown_mask * (1.0 - fg_mask) * (1.0 - fg_fallback_mask) * (1.0 - bg_mask) * (1.0 - extent_mask)
+    static_extent_support = (
+        static_extent_support
+        * (1.0 - fg_mask)
+        * (1.0 - fg_fallback_mask)
+        * (1.0 - bg_mask)
+    )
+    unknown_mask = (
+        unknown_mask
+        * (1.0 - fg_mask)
+        * (1.0 - fg_fallback_mask)
+        * (1.0 - bg_mask)
+        * (1.0 - static_extent_support)
+    )
 
     loss_fg = masked_bce_with_logits(
         logits,
@@ -5393,7 +5779,7 @@ def build_pu_static_group_loss(logits, batch, cfg):
     loss_extent = masked_bce_with_logits(
         logits,
         torch.full_like(logits, 0.5),
-        extent_mask,
+        static_extent_support,
         eps=float(getattr(cfg, "PU_STATIC_GROUP_EPS", 1e-6)),
     )
     loss_static = combine_group_losses(
@@ -5401,7 +5787,11 @@ def build_pu_static_group_loss(logits, batch, cfg):
             (float(getattr(cfg, "PU_STATIC_LAMBDA_FG", 1.0)), loss_fg, fg_mask.sum() > 0),
             (float(getattr(cfg, "PU_STATIC_LAMBDA_FG_FALLBACK", 0.35)), loss_fg_fallback, fg_fallback_mask.sum() > 0),
             (float(getattr(cfg, "PU_STATIC_LAMBDA_BG", 0.50)), loss_bg, bg_mask.sum() > 0),
-            (float(getattr(cfg, "PU_STATIC_LAMBDA_EXTENT", 0.10)), loss_extent, extent_mask.sum() > 0),
+            (
+                float(getattr(cfg, "PU_STATIC_LAMBDA_EXTENT", 0.10)),
+                loss_extent,
+                static_extent_support.sum() > 0,
+            ),
             (float(getattr(cfg, "PU_STATIC_LAMBDA_UNKNOWN", 0.0)), logits.sum() * 0.0, unknown_mask.sum() > 0),
         ],
         eps=float(getattr(cfg, "PU_STATIC_GROUP_EPS", 1e-6)),
@@ -5414,7 +5804,7 @@ def build_pu_static_group_loss(logits, batch, cfg):
         "fg_core_area": float(fg_mask.mean().detach().item()),
         "fg_fallback_area": float(fg_fallback_mask.mean().detach().item()),
         "bg_core_area": float(bg_mask.mean().detach().item()),
-        "extent_area": float(extent_mask.mean().detach().item()),
+        "extent_area": float(static_extent_support.mean().detach().item()),
         "unknown_area": float(unknown_mask.mean().detach().item()),
     }
     return loss_static, stats
@@ -8143,6 +8533,7 @@ def main():
     cfg = load_config(args.config)
     validate_esa_ber_config(cfg)
     validate_tepr_lite_config(cfg)
+    validate_ecst_config(cfg)
     if bool(getattr(cfg, "USE_QRA", False)) and bool(getattr(cfg, "USE_CCR", False)):
         raise RuntimeError("USE_QRA=True and USE_CCR=True cannot be combined.")
     if bool(getattr(cfg, "USE_DREPP", False)) and (
@@ -8201,7 +8592,10 @@ def main():
         if bool(getattr(cfg, "USE_TEACHER_SOFT_FULL_LOSS", False)):
             if str(getattr(cfg, "TEACHER_FUSION_MODE", "")).lower() != "dabe_pu_despl_sched":
                 raise RuntimeError("USE_TEACHER_SOFT_FULL_LOSS=True requires TEACHER_FUSION_MODE='dabe_pu_despl_sched'.")
-        if str(getattr(cfg, "TEACHER_FUSION_MODE", "")).lower() == "dabe_pu_despl_sched":
+        if (
+            str(getattr(cfg, "TEACHER_FUSION_MODE", "")).lower() == "dabe_pu_despl_sched"
+            and not bool(getattr(cfg, "USE_ECST", False))
+        ):
             teacher_target_mode = get_dabe_pu_despl_teacher_target_mode(cfg)
             static_target_mode = get_dabe_pu_despl_static_target_mode(cfg)
             if teacher_target_mode == "soft_prob" and bool(getattr(cfg, "USE_TEACHER_BINARY_FULL_LOSS", False)):
@@ -8890,7 +9284,56 @@ def main():
             logger.log(f"DABE_PU_WEIGHTED_BCE_EPS = {float(getattr(cfg, 'DABE_PU_WEIGHTED_BCE_EPS', 1e-6)):.8f}")
             logger.log(f"LAMBDA_DABE_PU_STATIC = {float(getattr(cfg, 'LAMBDA_DABE_PU_STATIC', 1.0)):.6f}")
             logger.log(f"LAMBDA_TEACHER_CONF = {float(getattr(cfg, 'LAMBDA_TEACHER_CONF', 1.0)):.6f}")
-        if str(getattr(cfg, "TEACHER_FUSION_MODE", "")).lower() == "dabe_pu_despl_sched":
+        if (
+            str(getattr(cfg, "TEACHER_FUSION_MODE", "")).lower() == "dabe_pu_despl_sched"
+            and bool(getattr(cfg, "USE_ECST", False))
+        ):
+            logger.log(f"USE_DABE_PU = {bool(getattr(cfg, 'USE_DABE_PU', False))}")
+            logger.log(f"DABE_PU_VERSION = {getattr(cfg, 'DABE_PU_VERSION', '')}")
+            logger.log(f"DABE_PU_ROOT = {getattr(cfg, 'DABE_PU_ROOT', '')}")
+            logger.log(f"P_INIT_MODE = {getattr(cfg, 'P_INIT_MODE', '')}")
+            logger.log(
+                "DABE_PU schedule = "
+                f"static {float(getattr(cfg, 'DABE_PU_DESPL_STATIC_START', 1.0)):.2f}->"
+                f"{float(getattr(cfg, 'DABE_PU_DESPL_STATIC_END', 0.05)):.2f}, "
+                f"teacher {float(getattr(cfg, 'DABE_PU_DESPL_TEACHER_START', 0.0)):.2f}->"
+                f"{float(getattr(cfg, 'DABE_PU_DESPL_TEACHER_END', 0.95)):.2f}, "
+                f"teacher_only_start={int(getattr(cfg, 'DABE_PU_DESPL_TEACHER_ONLY_START', 21))}"
+            )
+            logger.log("fixed_used_for_training = False")
+            logger.log(f"USE_ECST = {bool(getattr(cfg, 'USE_ECST', False))}")
+            for field in (
+                "ECST_VERSION",
+                "ECST_START_EPOCH",
+                "ECST_RAMP_END_EPOCH",
+                "ECST_STOP_EPOCH",
+                "ECST_MEMORY_UPDATE_START_EPOCH",
+                "ECST_MEMORY_UPDATE_END_EPOCH",
+                "ECST_TEMPORAL_RHO",
+                "ECST_MIN_HISTORY",
+                "ECST_MEMORY_DTYPE",
+                "ECST_USE_PREUPDATE_STATS",
+                "ECST_VARIANCE_TAU",
+                "ECST_CONF_GAMMA",
+                "ECST_MARGIN_TAU",
+                "ECST_CORE_CONFLICT_WEIGHT",
+                "ECST_EXTENT_FG_WEIGHT",
+                "ECST_EXTENT_BG_WEIGHT_FLOOR",
+                "ECST_EXTENT_DINO_LAMBDA",
+                "ECST_UNKNOWN_WEIGHT",
+                "ECST_WEIGHT_MIN",
+                "ECST_WEIGHT_MAX",
+                "ECST_APPLY_TO_FINAL",
+                "ECST_APPLY_TO_COARSE_AUX",
+                "ECST_APPLY_TO_BASE_AUX",
+                "ECST_RESET_MEMORY_AT_FINETUNE_RESET",
+            ):
+                logger.log(f"{field} = {getattr(cfg, field)}")
+            logger.log("teacher_router = ECST only; legacy RAST/ESA/TEPR inactive")
+        if (
+            str(getattr(cfg, "TEACHER_FUSION_MODE", "")).lower() == "dabe_pu_despl_sched"
+            and not bool(getattr(cfg, "USE_ECST", False))
+        ):
             logger.log(f"USE_DABE_PU = {bool(getattr(cfg, 'USE_DABE_PU', False))}")
             logger.log(f"DABE_PU_VERSION = {getattr(cfg, 'DABE_PU_VERSION', 'pu_v11')}")
             logger.log(f"DABE_PU_ROOT = {getattr(cfg, 'DABE_PU_ROOT', '')}")
@@ -9856,6 +10299,7 @@ def main():
         )
         use_dabe_pu_balanced_v2 = use_dabe_pu and teacher_fusion_mode == "dabe_pu_balanced_v2"
         use_dabe_pu_despl_sched = use_dabe_pu and teacher_fusion_mode == "dabe_pu_despl_sched"
+        use_ecst = bool(getattr(cfg, "USE_ECST", False)) and use_dabe_pu_despl_sched
         use_tepr_lite = bool(getattr(cfg, "USE_TEPR_LITE", False)) and use_dabe_pu_despl_sched
         use_rast = bool(getattr(cfg, "USE_RAST", False)) and use_dabe_pu_despl_sched
         use_hbns_lite = bool(getattr(cfg, "USE_HBNS_LITE", False)) and use_dabe_pu_despl_sched
@@ -10217,6 +10661,41 @@ def main():
                 "optimizer_restored=True | scheduler_restored=True"
             )
 
+        ecst_memory = None
+        if use_ecst:
+            memory_update_end = int(getattr(cfg, "ECST_MEMORY_UPDATE_END_EPOCH", 20))
+            if args.resume and start_epoch <= memory_update_end:
+                raise RuntimeError(
+                    "Cannot resume ECST inside its temporal-memory update window: "
+                    f"start_epoch={start_epoch}, update_end={memory_update_end}. "
+                    "Existing checkpoints do not contain ECST temporal memory."
+                )
+            if start_epoch <= memory_update_end:
+                ecst_memory = ECSTTemporalTeacherMemory(
+                    num_samples=len(train_dataset),
+                    height=int(cfg.LOSS_SIZE),
+                    width=int(cfg.LOSS_SIZE),
+                    dtype=str(getattr(cfg, "ECST_MEMORY_DTYPE", "float16")),
+                )
+                memory_bytes = (
+                    ecst_memory.mean.numel() * ecst_memory.mean.element_size()
+                    + ecst_memory.second.numel() * ecst_memory.second.element_size()
+                    + ecst_memory.count.numel() * ecst_memory.count.element_size()
+                )
+                logger.log(
+                    "[ECST] temporal memory initialized | "
+                    f"num_samples={len(train_dataset)} | "
+                    f"shape=[1,{int(cfg.LOSS_SIZE)},{int(cfg.LOSS_SIZE)}] | "
+                    f"dtype={getattr(cfg, 'ECST_MEMORY_DTYPE', 'float16')} | "
+                    f"bytes={memory_bytes}"
+                )
+            else:
+                logger.log(
+                    "[ECST] temporal memory inactive | "
+                    f"start_epoch={start_epoch} | update_end={memory_update_end} | "
+                    "memory_active=False"
+                )
+
         tepr_memory = None
         if use_tepr_lite:
             memory_update_end = int(
@@ -10229,7 +10708,7 @@ def main():
                     "Legacy checkpoints do not contain TEPR temporal memory."
                 )
             if start_epoch <= memory_update_end:
-                tepr_memory = TemporalTeacherMemory(
+                tepr_memory = _legacy_tepr_module().TemporalTeacherMemory(
                     num_samples=len(train_dataset),
                     height=int(cfg.LOSS_SIZE),
                     width=int(cfg.LOSS_SIZE),
@@ -10270,6 +10749,7 @@ def main():
         mvflip_first_batch_logged = False
         mvproto_first_batch_logged = False
         rast_first_batch_logged = False
+        ecst_first_batch_logged_epoch = None
         tepr_first_batch_logged_epoch = None
         hbns_first_batch_logged = False
         epr_first_batch_logged = False
@@ -10394,6 +10874,7 @@ def main():
             dabe_pu_v12_sc_extent_agree_sum = 0.0
             dabe_pu_v12_sc_lost_extent_sum = 0.0
             dabe_pu_v12_sc_new_boundary_sum = 0.0
+            ecst_epoch_accumulator = new_ecst_epoch_accumulator() if use_ecst else None
             tepr_epoch_accumulator = new_tepr_epoch_accumulator() if use_tepr_lite else None
             dabe_pu_bal_static_fg_loss_sum = 0.0
             dabe_pu_bal_static_fg_fallback_loss_sum = 0.0
@@ -11140,7 +11621,10 @@ def main():
                     else:
                         teacher_full_target = teacher_binary
 
-                rast_teacher_map_eff = None
+                teacher_route_map = None
+                teacher_routing_scale = 0.0
+                ecst_sample_indices = None
+                ecst_stats = None
                 tepr_sample_indices = None
                 tepr_stats = None
                 rast_stats = {
@@ -11169,7 +11653,66 @@ def main():
                     "esa_post_reset_active": False,
                     "esa_post_reset_scale": 0.0,
                 }
-                if use_tepr_lite:
+                if use_ecst:
+                    if "sample_index" not in batch:
+                        raise RuntimeError("ECST batch is missing stable sample_index.")
+                    ecst_sample_indices = batch["sample_index"].long()
+                    if ecst_sample_indices.ndim != 1 or int(ecst_sample_indices.shape[0]) != int(
+                        teacher_prob.shape[0]
+                    ):
+                        raise RuntimeError(
+                            f"ECST sample_index must be [B], got {list(ecst_sample_indices.shape)}."
+                        )
+                    index_min = int(ecst_sample_indices.min().item())
+                    index_max = int(ecst_sample_indices.max().item())
+                    if index_min < 0 or index_max >= len(train_dataset):
+                        raise RuntimeError(
+                            f"ECST sample_index out of range: {index_min}/{index_max}, "
+                            f"dataset_size={len(train_dataset)}."
+                        )
+                    update_end = int(getattr(cfg, "ECST_MEMORY_UPDATE_END_EPOCH", 20))
+                    if int(epoch) <= update_end:
+                        if ecst_memory is None:
+                            raise RuntimeError(
+                                "ECST temporal memory was released before its update window ended."
+                            )
+                        temporal_mean, temporal_second, history_count = ecst_memory.fetch(
+                            ecst_sample_indices,
+                            device,
+                        )
+                        teacher_route_map, ecst_stats = build_ecst_teacher_weight_map(
+                            cfg=cfg,
+                            batch=batch,
+                            teacher_prob=teacher_prob.detach(),
+                            temporal_mean=temporal_mean,
+                            temporal_second=temporal_second,
+                            history_count=history_count,
+                            epoch=epoch,
+                            device=device,
+                        )
+                        ecst_stats["memory_active"] = True
+                    else:
+                        teacher_route_map = torch.ones_like(teacher_prob, dtype=torch.float32)
+                        ecst_stats = make_ecst_inactive_stats(batch, teacher_prob, device)
+                    teacher_routing_scale = float(ecst_stats["ecst_scale"])
+                    if (
+                        bool(getattr(cfg, "ECST_DEBUG_FIRST_BATCH", True))
+                        and ecst_first_batch_logged_epoch != int(epoch)
+                        and int(epoch)
+                        % max(1, int(getattr(cfg, "ECST_LOG_INTERVAL_EPOCH", 1)))
+                        == 0
+                    ):
+                        log_ecst_first_batch(
+                            logger,
+                            cfg,
+                            epoch,
+                            ecst_sample_indices,
+                            ecst_stats,
+                            student_logits.sigmoid().detach(),
+                            teacher_prob.detach(),
+                        )
+                        ecst_first_batch_logged_epoch = int(epoch)
+                elif use_tepr_lite:
                     if "sample_index" not in batch:
                         raise RuntimeError("TEPR-Lite batch is missing stable sample_index.")
                     tepr_sample_indices = batch["sample_index"].long()
@@ -11194,7 +11737,7 @@ def main():
                             tepr_sample_indices,
                             device,
                         )
-                        rast_teacher_map_eff, tepr_stats = build_configured_tepr_teacher_weight_map(
+                        teacher_route_map, tepr_stats = build_configured_tepr_teacher_weight_map(
                             cfg=cfg,
                             batch=batch,
                             teacher_prob=teacher_prob.detach(),
@@ -11206,9 +11749,10 @@ def main():
                         )
                         tepr_stats["memory_active"] = True
                     else:
-                        rast_teacher_map_eff = torch.ones_like(teacher_prob, dtype=torch.float32)
+                        teacher_route_map = torch.ones_like(teacher_prob, dtype=torch.float32)
                         tepr_stats = make_tepr_inactive_stats(batch, teacher_prob, device)
-                    rast_stats["teacher_routing_scale"] = float(tepr_stats["tepr_scale"])
+                    teacher_routing_scale = float(tepr_stats["tepr_scale"])
+                    rast_stats["teacher_routing_scale"] = teacher_routing_scale
                     if (
                         bool(getattr(cfg, "TEPR_DEBUG_FIRST_BATCH", True))
                         and tepr_first_batch_logged_epoch != int(epoch)
@@ -11223,13 +11767,14 @@ def main():
                         )
                         tepr_first_batch_logged_epoch = int(epoch)
                 elif use_rast:
-                    rast_teacher_map_eff, rast_stats = build_rast_teacher_weight_map(
+                    teacher_route_map, rast_stats = build_rast_teacher_weight_map(
                         cfg,
                         batch,
                         teacher_binary,
                         epoch,
                         device,
                     )
+                    teacher_routing_scale = float(rast_stats["teacher_routing_scale"])
                     if (
                         not rast_first_batch_logged
                         and int(epoch) % max(1, int(getattr(cfg, "RAST_LOG_INTERVAL_EPOCH", 1))) == 0
@@ -11253,7 +11798,7 @@ def main():
                             "[RAST FirstBatch] teacher_routing_scale = "
                             f"{float(rast_stats['teacher_routing_scale']):.8f}"
                         )
-                        logger.log(f"[RAST FirstBatch] teacher_map_eff shape = {list(rast_teacher_map_eff.shape)}")
+                        logger.log(f"[RAST FirstBatch] teacher_map_eff shape = {list(teacher_route_map.shape)}")
                         logger.log(
                             "[RAST FirstBatch] teacher_map_eff min/mean/max = "
                             f"{float(rast_stats['teacher_map_min']):.6f}/"
@@ -11344,7 +11889,7 @@ def main():
                         student_logits,
                         teacher_prob,
                         teacher_binary,
-                        rast_teacher_map_eff,
+                        teacher_route_map,
                         epoch,
                         device,
                         image_68=image_68,
@@ -11431,7 +11976,7 @@ def main():
                         student_logits,
                         teacher_prob,
                         teacher_binary,
-                        rast_teacher_map_eff,
+                        teacher_route_map,
                         epoch,
                         device,
                         image_68=image_68,
@@ -11809,12 +12354,12 @@ def main():
                                 eps=eps,
                             )
                         else:
-                            loss_pu_teacher_final = rast_teacher_bce_with_logits(
+                            loss_pu_teacher_final = teacher_route_bce_with_logits(
                                 student_logits,
                                 teacher_full_target,
-                                rast_teacher_map_eff,
+                                teacher_route_map,
                                 cfg,
-                                rast_stats["teacher_routing_scale"],
+                                teacher_routing_scale,
                                 apply_to_loss=teacher_routing_apply_flag(cfg, "final"),
                                 eps=eps,
                             )
@@ -12147,8 +12692,8 @@ def main():
                                 pu_static_target,
                                 pu_static_weight_map,
                                 teacher_full_target,
-                                rast_teacher_map_eff,
-                                rast_stats["teacher_routing_scale"],
+                                teacher_route_map,
+                                teacher_routing_scale,
                                 epoch,
                                 cfg,
                                 apply_final=True,
@@ -12204,12 +12749,12 @@ def main():
                                         cfg,
                                     )
                                 else:
-                                    loss_pu_teacher_coarse = rast_teacher_bce_with_logits(
+                                    loss_pu_teacher_coarse = teacher_route_bce_with_logits(
                                         coarse_logits,
                                         teacher_full_target,
-                                        rast_teacher_map_eff,
+                                        teacher_route_map,
                                         cfg,
-                                        rast_stats["teacher_routing_scale"],
+                                        teacher_routing_scale,
                                         apply_to_loss=teacher_routing_apply_flag(cfg, "coarse"),
                                         eps=eps,
                                     )
@@ -12232,12 +12777,12 @@ def main():
                                     pu_static_weight_map,
                                     eps=eps,
                                 )
-                                loss_pu_teacher_base = rast_teacher_bce_with_logits(
+                                loss_pu_teacher_base = teacher_route_bce_with_logits(
                                     base_logits,
                                     teacher_full_target,
-                                    rast_teacher_map_eff,
+                                    teacher_route_map,
                                     cfg,
-                                    rast_stats["teacher_routing_scale"],
+                                    teacher_routing_scale,
                                     apply_to_loss=teacher_routing_apply_flag(cfg, "base"),
                                     eps=eps,
                                 )
@@ -12510,8 +13055,8 @@ def main():
                             pu_static_target,
                             pu_static_weight_map,
                             teacher_full_target,
-                            rast_teacher_map_eff,
-                            rast_stats["teacher_routing_scale"],
+                            teacher_route_map,
+                            teacher_routing_scale,
                             epoch,
                             cfg,
                             apply_final=bool(getattr(cfg, "CSSD_HR_SUP_APPLY_TO_FINAL", True)),
@@ -12764,12 +13309,12 @@ def main():
                             pu_static_weight_map,
                             eps=eps,
                         )
-                        loss_pu_teacher_base = rast_teacher_bce_with_logits(
+                        loss_pu_teacher_base = teacher_route_bce_with_logits(
                             base_logits,
                             teacher_full_target,
-                            rast_teacher_map_eff,
+                            teacher_route_map,
                             cfg,
-                            rast_stats["teacher_routing_scale"],
+                            teacher_routing_scale,
                             apply_to_loss=teacher_routing_apply_flag(cfg, "base"),
                             eps=eps,
                         )
@@ -13205,7 +13750,7 @@ def main():
                         batch,
                         teacher_prob,
                         teacher_binary,
-                        rast_teacher_map_eff,
+                        teacher_route_map,
                         rast_stats,
                         device,
                     )
@@ -13288,6 +13833,21 @@ def main():
                         f"Training loss is NaN/Inf at epoch={epoch}, iter={iter_idx}; "
                         f"cssd_scale={cssd_scale_epoch:.8f}."
                     )
+
+                if use_ecst:
+                    update_start = int(getattr(cfg, "ECST_MEMORY_UPDATE_START_EPOCH", 1))
+                    update_end = int(getattr(cfg, "ECST_MEMORY_UPDATE_END_EPOCH", 20))
+                    if update_start <= int(epoch) <= update_end:
+                        if ecst_memory is None or ecst_sample_indices is None:
+                            raise RuntimeError(
+                                "ECST memory/index is unavailable during its update window."
+                            )
+                        with torch.no_grad():
+                            ecst_memory.update(
+                                indices=ecst_sample_indices,
+                                teacher_prob=teacher_prob.detach(),
+                                rho=float(getattr(cfg, "ECST_TEMPORAL_RHO", 0.90)),
+                            )
 
                 if use_tepr_lite:
                     update_start = int(getattr(cfg, "TEPR_MEMORY_UPDATE_START_EPOCH", 1))
@@ -13452,6 +14012,15 @@ def main():
                         dabe_pu_v12_sc_lost_extent_sum += float(batch["pu_sc_lost_extent"].float().mean().item())
                         dabe_pu_v12_sc_new_boundary_sum += float(batch["pu_sc_new_boundary"].float().mean().item())
                     dabe_pu_stat_batches += 1
+                    if use_ecst:
+                        if ecst_stats is None or ecst_epoch_accumulator is None:
+                            raise RuntimeError("ECST stats are missing for an enabled batch.")
+                        accumulate_ecst_epoch(
+                            ecst_epoch_accumulator,
+                            ecst_stats,
+                            student_logits.sigmoid().detach(),
+                            teacher_prob.detach(),
+                        )
                     if use_tepr_lite:
                         if tepr_stats is None or tepr_epoch_accumulator is None:
                             raise RuntimeError("TEPR-Lite stats are missing for an enabled batch.")
@@ -14310,6 +14879,55 @@ def main():
                         f"loss_teacher_group={dabe_pu_teacher_group_loss_sum / stat_batches:.6f} | "
                         f"loss_total={total_loss / max(num_batches, 1):.6f}"
                     )
+                if use_ecst:
+                    ecst_batches = max(int(ecst_epoch_accumulator["batches"]), 1)
+                    ecst_pixels = max(int(ecst_epoch_accumulator["map_pixels"]), 1)
+                    prediction_pixels = max(
+                        int(ecst_epoch_accumulator["prediction_pixels"]), 1
+                    )
+                    ecst_state_means = {}
+                    ecst_state_valid = {}
+                    for name in ECST_STATE_KEYS:
+                        count = float(ecst_epoch_accumulator["state_counts"][name])
+                        ecst_state_valid[name] = count > 0.0
+                        ecst_state_means[name] = (
+                            float(ecst_epoch_accumulator["state_sums"][name]) / count
+                            if count > 0.0
+                            else 0.0
+                        )
+                    logger.log(
+                        f"[ECST] epoch={epoch:03d} | "
+                        f"scale={float(get_ecst_scale(cfg, epoch)):.8f} | "
+                        f"memory_active_ratio={ecst_epoch_accumulator['memory_active_batches'] / ecst_batches:.6f} | "
+                        f"history_count_mean={ecst_epoch_accumulator['history_count_mean_sum'] / ecst_batches:.6f} | "
+                        f"history_valid_ratio={ecst_epoch_accumulator['history_valid_ratio_sum'] / ecst_batches:.6f} | "
+                        f"temporal_var_mean={ecst_epoch_accumulator['temporal_var_mean_sum'] / ecst_batches:.8f} | "
+                        f"reliability_mean={ecst_epoch_accumulator['temporal_reliability_mean_sum'] / ecst_batches:.6f} | "
+                        f"fg_core_conflict_ratio={ecst_epoch_accumulator['fg_core_conflict_count'] / max(ecst_epoch_accumulator['fg_core_count'], 1):.6f} | "
+                        f"bg_core_conflict_ratio={ecst_epoch_accumulator['bg_core_conflict_count'] / max(ecst_epoch_accumulator['bg_core_count'], 1):.6f} | "
+                        f"extent_teacher_fg/bg_ratio="
+                        f"{ecst_epoch_accumulator['extent_teacher_fg_count'] / max(ecst_epoch_accumulator['extent_count'], 1):.6f}/"
+                        f"{ecst_epoch_accumulator['extent_teacher_bg_count'] / max(ecst_epoch_accumulator['extent_count'], 1):.6f} | "
+                        f"map_min/mean/max="
+                        f"{(ecst_epoch_accumulator['map_min'] if ecst_epoch_accumulator['map_min'] is not None else 1.0):.6f}/"
+                        f"{ecst_epoch_accumulator['map_sum'] / ecst_pixels:.6f}/"
+                        f"{(ecst_epoch_accumulator['map_max'] if ecst_epoch_accumulator['map_max'] is not None else 1.0):.6f} | "
+                        f"map_core_conflict/extent_bg/unknown="
+                        f"{ecst_state_means['core_conflict_map']:.6f}/"
+                        f"{ecst_state_means['extent_teacher_bg_map']:.6f}/"
+                        f"{ecst_state_means['unknown_map']:.6f} | "
+                        f"student/teacher_area="
+                        f"{ecst_epoch_accumulator['student_pred_fg_count'] / prediction_pixels:.6f}/"
+                        f"{ecst_epoch_accumulator['teacher_pred_fg_count'] / prediction_pixels:.6f} | "
+                        f"teacher_loss_final/coarse/base="
+                        f"{dabe_pu_teacher_final_loss_sum / stat_batches:.6f}/"
+                        f"{dabe_pu_teacher_coarse_loss_sum / stat_batches:.6f}/"
+                        f"{dabe_pu_teacher_base_loss_sum / stat_batches:.6f} | "
+                        f"valid_core_conflict/extent_bg/unknown="
+                        f"{int(ecst_state_valid['core_conflict_map'])}/"
+                        f"{int(ecst_state_valid['extent_teacher_bg_map'])}/"
+                        f"{int(ecst_state_valid['unknown_map'])}"
+                    )
                 if use_tepr_lite:
                     tepr_batches = max(int(tepr_epoch_accumulator["batches"]), 1)
                     tepr_pixels = max(int(tepr_epoch_accumulator["map_pixels"]), 1)
@@ -14323,11 +14941,11 @@ def main():
                         )
                     logger.log(
                         f"[TEPR-Lite] epoch={epoch:03d} | "
-                        f"tepr_scale={float(get_tepr_scale(cfg, epoch)):.8f} | "
+                        f"tepr_scale={float(_legacy_tepr_module().get_tepr_scale(cfg, epoch)):.8f} | "
                         f"memory_active_ratio={tepr_epoch_accumulator['memory_active_batches'] / tepr_batches:.6f} | "
                         f"history_count_mean={tepr_epoch_accumulator['history_count_mean_sum'] / tepr_batches:.6f} | "
                         f"temporal_var_mean={tepr_epoch_accumulator['temporal_var_sum'] / tepr_batches:.8f} | "
-                        f"temporal_var_p90={temporal_variance_p90_from_hist(tepr_epoch_accumulator['variance_hist']):.8f} | "
+                        f"temporal_var_p90={_legacy_tepr_module().temporal_variance_p90_from_hist(tepr_epoch_accumulator['variance_hist']):.8f} | "
                         f"temporal_reliability_mean={tepr_epoch_accumulator['temporal_reliability_sum'] / tepr_batches:.6f} | "
                         f"core_conflict_mean={tepr_epoch_accumulator['core_conflict_sum'] / tepr_batches:.6f} | "
                         f"extent_conflict_mean={tepr_epoch_accumulator['extent_conflict_sum'] / tepr_batches:.6f} | "
@@ -14376,9 +14994,9 @@ def main():
                             f"extent_teacher_bg_map_mean={conditional_means['extent_teacher_bg_map']:.6f} | "
                             f"extent_bg_temporal_reliability_mean={conditional_means['extent_bg_temporal_reliability']:.6f} | "
                             "extent_bg_temporal_reliability_p10/p50/p90="
-                            f"{histogram_quantile_from_hist(reliability_hist, 0.10):.6f}/"
-                            f"{histogram_quantile_from_hist(reliability_hist, 0.50):.6f}/"
-                            f"{histogram_quantile_from_hist(reliability_hist, 0.90):.6f} | "
+                            f"{_legacy_tepr_module().histogram_quantile_from_hist(reliability_hist, 0.10):.6f}/"
+                            f"{_legacy_tepr_module().histogram_quantile_from_hist(reliability_hist, 0.50):.6f}/"
+                            f"{_legacy_tepr_module().histogram_quantile_from_hist(reliability_hist, 0.90):.6f} | "
                             f"extent_bg_dino_ceiling_mean={conditional_means['extent_bg_dino_ceiling']:.6f} | "
                             f"extent_bg_final_weight_mean={conditional_means['extent_bg_final_weight']:.6f} | "
                             "extent_bg_fg_like/ambiguous/bg_like_weight_mean="
@@ -15394,6 +16012,16 @@ def main():
                     global_step,
                     lr_floor_activated_logged,
                 )
+                if use_ecst and bool(
+                    getattr(cfg, "ECST_RESET_MEMORY_AT_FINETUNE_RESET", True)
+                ):
+                    if ecst_memory is not None:
+                        ecst_memory.clear()
+                    ecst_memory = None
+                    logger.log(
+                        "[ECST] temporal memory cleared and released at finetune reset | "
+                        f"epoch={epoch:03d}"
+                    )
                 if use_tepr_lite and bool(
                     getattr(cfg, "TEPR_RESET_MEMORY_AT_FINETUNE_RESET", True)
                 ):

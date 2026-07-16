@@ -401,6 +401,11 @@ def main():
         logger.log("main_metric_input = binary_prediction")
         logger.log(f"prediction_dir = {out_dir / 'pred'}")
         logger.log(f"max_samples = {int(args.max_samples)}")
+        if bool(getattr(cfg, "USE_ECST", False)):
+            logger.log("[Eval ECST] training_only=True")
+            logger.log("[Eval ECST] temporal_memory_used=False")
+            logger.log("[Eval ECST] teacher_weight_map_used=False")
+            logger.log("[Eval ECST] logits_source=student_final_logits")
         if bool(getattr(cfg, "USE_TEPR_LITE", False)):
             logger.log("[Eval TEPR-Lite] temporal_memory_used=False")
             logger.log("[Eval TEPR-Lite] teacher_weight_map_used=False")
