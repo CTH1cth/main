@@ -1134,7 +1134,13 @@ class CachedTrainDataset(Dataset):
         ).lower() == "cacd_v1_base"
         self.use_multi_view_feature = bool(getattr(cfg, "USE_MULTI_VIEW_FEATURE", False))
         self.multi_view_types = [str(view).lower() for view in getattr(cfg, "MULTI_VIEW_TYPES", [])]
-        self.use_hflip_view = self.use_multi_view_feature and "hflip" in self.multi_view_types
+        self.use_source_arbiter = bool(getattr(cfg, "USE_SOURCE_ARBITER", False))
+        self.use_arbiter_hflip = self.use_source_arbiter and bool(
+            getattr(cfg, "SOURCE_ARBITER_UTILITY_USE_HFLIP", True)
+        )
+        self.use_hflip_view = (
+            self.use_multi_view_feature and "hflip" in self.multi_view_types
+        ) or self.use_arbiter_hflip
         self.multi_level_layers = [int(layer) for layer in getattr(cfg, "MULTI_LEVEL_LAYERS", [4, 8, 12])]
         if self.use_hflip_view and self.use_multi_level_feature:
             raise RuntimeError("HFlip multi-view feature currently supports single-level cached DINO features only.")

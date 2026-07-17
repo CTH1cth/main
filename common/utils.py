@@ -576,7 +576,7 @@ def _hflip_feature_error(reason):
     return (
         f"HFlip feature cache train missing or incomplete: {reason}\n"
         "Please run:\n"
-        "python common/cache_features_hflip.py --config <your_mvflip_config.py> "
+        "python common/cache_features_hflip.py --config <your_config.py> "
         "--split train"
     )
 
@@ -778,6 +778,13 @@ def check_hflip_feature_cache(cfg, max_samples=None):
     manifest_path = hflip_feature_cache_manifest_path(cfg)
     if not manifest_path.exists():
         raise RuntimeError(_hflip_feature_error(f"missing manifest: {manifest_path}"))
+    normal_manifest_path = feature_manifest_path(cfg, "train")
+    if not normal_manifest_path.exists():
+        raise RuntimeError(
+            _hflip_feature_error(
+                f"normal feature manifest is missing: {normal_manifest_path}"
+            )
+        )
 
     expected_items = build_image_items(cfg.DATA_ROOT, cfg.TRAIN_DATASETS, require_gt=False)
     if max_samples is not None and int(max_samples) >= 0:
@@ -804,7 +811,41 @@ def check_hflip_feature_cache(cfg, max_samples=None):
     if missing:
         raise RuntimeError(_hflip_feature_error(f"missing manifest rows first 10: {missing[:10]}"))
 
-    payload_keys = _sample_ordered_keys(expected_keys, int(getattr(cfg, "HFLIP_FEATURE_PREFLIGHT_SAMPLES", 16)))
+    normal_rows = read_jsonl(normal_manifest_path)
+    normal_row_map = {}
+    for row in normal_rows:
+        key = (row.get("dataset"), row.get("stem"))
+        if None in key:
+            raise RuntimeError(
+                _hflip_feature_error(
+                    f"bad normal feature manifest row in {normal_manifest_path}"
+                )
+            )
+        if key in normal_row_map:
+            raise RuntimeError(
+                _hflip_feature_error(
+                    f"duplicate normal feature manifest key: {key}"
+                )
+            )
+        normal_row_map[key] = row
+    missing_normal = sorted(expected_key_set - set(normal_row_map))
+    if missing_normal:
+        raise RuntimeError(
+            _hflip_feature_error(
+                "normal feature manifest is missing matching rows first 10: "
+                f"{missing_normal[:10]}"
+            )
+        )
+
+    full_payload_audit = bool(getattr(cfg, "USE_SOURCE_ARBITER", False))
+    payload_keys = (
+        expected_keys
+        if full_payload_audit
+        else _sample_ordered_keys(
+            expected_keys,
+            int(getattr(cfg, "HFLIP_FEATURE_PREFLIGHT_SAMPLES", 16)),
+        )
+    )
     if max_samples is not None and int(max_samples) >= 0:
         payload_keys = expected_keys
     for key in expected_keys:
@@ -817,6 +858,14 @@ def check_hflip_feature_cache(cfg, max_samples=None):
         shape = row.get("shape")
         if not _feature_shape3_ok(shape):
             raise RuntimeError(_hflip_feature_error(f"invalid manifest shape for {key}: {shape}"))
+        normal_shape = normal_row_map[key].get("shape")
+        if list(shape) != list(normal_shape or []):
+            raise RuntimeError(
+                _hflip_feature_error(
+                    f"normal/hflip manifest shape mismatch for {key}: "
+                    f"{normal_shape} != {shape}"
+                )
+            )
     for key in payload_keys:
         row = row_map[key]
         cache_path = row["cache_path"]
@@ -838,8 +887,25 @@ def check_hflip_feature_cache(cfg, max_samples=None):
                     f"shape mismatch for {key}: manifest {row.get('shape')} != payload {list(tensor.shape)}"
                 )
             )
+        if not tensor.is_floating_point():
+            raise RuntimeError(
+                _hflip_feature_error(
+                    f"payload tensor must be floating point for {key}: {tensor.dtype}"
+                )
+            )
+        if not bool(torch.isfinite(tensor).all().item()):
+            raise RuntimeError(
+                _hflip_feature_error(
+                    f"payload tensor contains NaN/Inf for {key}: {cache_path}"
+                )
+            )
 
-    return True, f"complete: {manifest_path} | payload_check={len(payload_keys)}/{len(expected_keys)}"
+    audit_mode = "full" if full_payload_audit else "sampled"
+    return True, (
+        f"complete: {manifest_path} | payload_check={audit_mode}:"
+        f"{len(payload_keys)}/{len(expected_keys)} | "
+        f"normal_manifest={normal_manifest_path}"
+    )
 
 
 def _qra_required_shapes(cfg):
@@ -1568,6 +1634,13 @@ def check_dabe_pu_cache(cfg, max_samples=None):
                 "unknown_37",
             ]
         )
+    audit_arbiter_weight = bool(getattr(cfg, "USE_SOURCE_ARBITER", False))
+    weight_min = float("inf")
+    weight_max = float("-inf")
+    weight_sum = 0.0
+    weight_nonzero = 0
+    weight_count = 0
+    per_image_max_values = []
     for key in expected_keys:
         row = row_map[key]
         if row.get("backbone_key", cfg.BACKBONE_KEY) != cfg.BACKBONE_KEY:
@@ -1601,8 +1674,48 @@ def check_dabe_pu_cache(cfg, max_samples=None):
         for tensor_key in required_fields:
             shape = expected_shape_37 if tensor_key.endswith("_37") else expected_shape
             _check_dabe_pu_tensor(payload, key, cache_path, tensor_key, shape)
+        if audit_arbiter_weight:
+            weight = payload["weight_map_68"].float()
+            if not bool(torch.isfinite(weight).all().item()):
+                raise RuntimeError(
+                    _dabe_pu_error(
+                        f"weight_map_68 contains NaN/Inf for {key}: {cache_path}"
+                    )
+                )
+            image_min = float(weight.min().item())
+            image_max = float(weight.max().item())
+            if image_min < -1e-6 or image_max > 1.0 + 1e-6:
+                raise RuntimeError(
+                    _dabe_pu_error(
+                        "EGSA requires audited raw weight_map_68 in [0,1], "
+                        f"got min={image_min:.8f}, max={image_max:.8f} for "
+                        f"{key}: {cache_path}"
+                    )
+                )
+            weight_min = min(weight_min, image_min)
+            weight_max = max(weight_max, image_max)
+            weight_sum += float(weight.double().sum().item())
+            weight_nonzero += int((weight > 0.0).sum().item())
+            weight_count += int(weight.numel())
+            per_image_max_values.append(image_max)
 
-    return True, f"complete: {manifest_path} | rows_checked={len(expected_keys)} | version={expected_version}"
+    reason = (
+        f"complete: {manifest_path} | rows_checked={len(expected_keys)} | "
+        f"version={expected_version}"
+    )
+    if audit_arbiter_weight:
+        per_image_max = torch.tensor(per_image_max_values, dtype=torch.float64)
+        reason += (
+            " | EGSA weight audit: "
+            f"min={weight_min:.8f}, max={weight_max:.8f}, "
+            f"mean={weight_sum / max(weight_count, 1):.8f}, "
+            f"nonzero_ratio={weight_nonzero / max(weight_count, 1):.8f}, "
+            "per_image_max="
+            f"{float(per_image_max.min()):.8f}/"
+            f"{float(per_image_max.mean()):.8f}/"
+            f"{float(per_image_max.max()):.8f}"
+        )
+    return True, reason
 
 
 def _tce_cover_error(reason):

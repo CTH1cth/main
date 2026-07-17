@@ -372,6 +372,7 @@ def build_ecst_teacher_weight_map(
     epoch,
     device,
     return_raw=False,
+    return_states=False,
 ):
     """Build the ECST map with the exact former v1.1 AsymNeg operation order."""
     states = build_ecst_evidence_states(
@@ -512,6 +513,10 @@ def build_ecst_teacher_weight_map(
         "state_counts": state_counts,
         **states["margin_stats"],
     }
+    if return_raw and return_states:
+        return effective.detach(), stats, raw.detach(), states
     if return_raw:
         return effective.detach(), stats, raw.detach()
+    if return_states:
+        return effective.detach(), stats, states
     return effective.detach(), stats
