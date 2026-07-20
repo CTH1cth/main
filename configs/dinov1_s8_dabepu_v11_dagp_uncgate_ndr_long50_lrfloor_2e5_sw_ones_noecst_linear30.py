@@ -1,0 +1,30 @@
+from configs.dinov1_s8_dabepu_v11_ecst_dagp_uncgate_ndr_long45_lrfloor_2e5_sw_ones_noecst import *  # noqa: F401,F403
+
+
+EXP_NAME = (
+    "dinov1_s8_dabepu_v11_dagp_uncgate_ndr_"
+    "long50_lrfloor_2e5_sw_ones_noecst_linear30"
+)
+
+MAX_EPOCH = 50
+max_epoch = 50
+
+STATIC_WEIGHT_MODE = "ones"
+USE_ECST = False
+TEACHER_ROUTING_MODE = "none"
+
+SUPERVISION_HANDOVER_MODE = "linear"
+
+DABE_PU_DESPL_STAGE_START = 1
+DABE_PU_DESPL_STAGE_END = 29
+DABE_PU_DESPL_STATIC_START = 1.00
+DABE_PU_DESPL_STATIC_END = 0.05
+DABE_PU_DESPL_TEACHER_START = 0.00
+DABE_PU_DESPL_TEACHER_END = 0.95
+DABE_PU_DESPL_TEACHER_ONLY_START = 30
+
+FUSION_ORIG_DECAY_EPOCHS = 29
+TEACHER_FUSION_PRE_RESET_EPOCHS = 28
+LR_LINEAR_STAGE1_EPOCHS = 28
+
+FINETUNE_RESET_EPOCH = 29

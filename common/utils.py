@@ -1615,6 +1615,7 @@ def check_dabe_pu_cache(cfg, max_samples=None):
     use_oem = bool(getattr(cfg, "USE_DABE_OEM", False)) or str(
         getattr(cfg, "P_INIT_MODE", "")
     ) == "dabe_pu_v11_oem"
+    use_ap_stcr = bool(getattr(cfg, "USE_AP_STCR", False))
     required_fields = [
         "target_soft_68",
         "weight_map_68",
@@ -1634,6 +1635,8 @@ def check_dabe_pu_cache(cfg, max_samples=None):
                 "unknown_37",
             ]
         )
+    if use_ap_stcr:
+        required_fields.extend(["target_soft_37", "bg_anchor_37"])
     audit_arbiter_weight = bool(getattr(cfg, "USE_SOURCE_ARBITER", False))
     weight_min = float("inf")
     weight_max = float("-inf")

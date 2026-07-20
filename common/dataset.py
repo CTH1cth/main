@@ -661,11 +661,14 @@ def _load_dabe_pu_v11(row, expected_dataset, expected_stem, cfg):
     use_oem = bool(getattr(cfg, "USE_DABE_OEM", False)) or str(
         getattr(cfg, "P_INIT_MODE", "")
     ) == "dabe_pu_v11_oem"
+    use_ap_stcr = bool(getattr(cfg, "USE_AP_STCR", False))
     out = {}
     missing = []
     required_fields = list(DABE_PU_REQUIRED_68_FIELDS)
     if use_oem:
         required_fields.extend(DABE_PU_REQUIRED_37_FIELDS)
+    if use_ap_stcr:
+        required_fields.extend(["target_soft_37", "bg_anchor_37"])
     for field in required_fields:
         tensor = payload.get(field)
         if not torch.is_tensor(tensor):
@@ -720,6 +723,8 @@ def _load_dabe_pu_v11(row, expected_dataset, expected_stem, cfg):
         "pu_bg_core_37": out.get("bg_core_pu_37"),
         "pu_extent_37": out.get("extent_candidate_37"),
         "pu_unknown_37": out.get("unknown_37"),
+        "pu_target_soft_37": out.get("target_soft_37"),
+        "pu_bg_anchor_37": out.get("bg_anchor_37"),
         "pu_target_area": float(payload.get("target_soft_area", out["target_soft_68"].mean().item())),
         "pu_weight_mean": float(payload.get("weight_mean", out["weight_map_68"].mean().item())),
         "pu_fg_core_area": float(payload.get("fg_core_pu_area", out["fg_core_pu_68"].mean().item())),
@@ -1135,6 +1140,7 @@ class CachedTrainDataset(Dataset):
         self.use_multi_view_feature = bool(getattr(cfg, "USE_MULTI_VIEW_FEATURE", False))
         self.multi_view_types = [str(view).lower() for view in getattr(cfg, "MULTI_VIEW_TYPES", [])]
         self.use_source_arbiter = bool(getattr(cfg, "USE_SOURCE_ARBITER", False))
+        self.use_ap_stcr = bool(getattr(cfg, "USE_AP_STCR", False))
         self.use_arbiter_hflip = self.use_source_arbiter and bool(
             getattr(cfg, "SOURCE_ARBITER_UTILITY_USE_HFLIP", True)
         )
@@ -1707,6 +1713,33 @@ class CachedTrainDataset(Dataset):
     def __len__(self):
         return len(self.items)
 
+    def load_dabe_pu_target_soft(self, index):
+        """Load only the validated DABE-PU soft target for state-bank setup."""
+        if not self.use_dabe_pu:
+            raise RuntimeError(
+                "load_dabe_pu_target_soft() requires USE_DABE_PU=True."
+            )
+        index = int(index)
+        if index < 0 or index >= len(self.items):
+            raise IndexError(f"DABE-PU target index out of range: {index}.")
+        item = self.items[index]
+        dataset = item["dataset"]
+        stem = item["stem"]
+        payload = _load_dabe_pu_v11(
+            self.dabe_pu_map[(dataset, stem)],
+            dataset,
+            stem,
+            self.cfg,
+        )
+        target = payload["pu_target_soft"].detach().cpu().float()
+        expected = (1, int(self.cfg.LOSS_SIZE), int(self.cfg.LOSS_SIZE))
+        if tuple(target.shape) != expected:
+            raise RuntimeError(
+                f"DABE-PU target shape mismatch for {dataset}/{stem}: "
+                f"{list(target.shape)} != {list(expected)}."
+            )
+        return target
+
     def __getitem__(self, index):
         item = self.items[index]
         dataset = item["dataset"]
@@ -2019,6 +2052,12 @@ class CachedTrainDataset(Dataset):
                     else torch.empty(0),
                     "pu_unknown_37": dabe_pu_payload["pu_unknown_37"].float()
                     if dabe_pu_payload.get("pu_unknown_37") is not None
+                    else torch.empty(0),
+                    "pu_target_soft_37": dabe_pu_payload["pu_target_soft_37"].float()
+                    if self.use_ap_stcr
+                    else torch.empty(0),
+                    "pu_bg_anchor_37": dabe_pu_payload["pu_bg_anchor_37"].float()
+                    if self.use_ap_stcr
                     else torch.empty(0),
                     "pu_target_area": float(dabe_pu_payload["pu_target_area"]),
                     "pu_weight_mean": float(dabe_pu_payload["pu_weight_mean"]),

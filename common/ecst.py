@@ -330,13 +330,6 @@ def build_ecst_evidence_states(
         teacher_prob.shape[-2:],
         device,
     )
-    margin_tau = float(getattr(cfg, "ECST_MARGIN_TAU", 0.05))
-    fg_tendency = torch.sigmoid(margin_68 / margin_tau)
-    extent_dino_lambda = float(getattr(cfg, "ECST_EXTENT_DINO_LAMBDA", math.log(4.0)))
-    extent_floor = float(getattr(cfg, "ECST_EXTENT_BG_WEIGHT_FLOOR", 0.25))
-    dino_ceiling = torch.exp(-extent_dino_lambda * fg_tendency).clamp(extent_floor, 1.0)
-    extent_bg_weight = extent_floor + bg_reliability * (dino_ceiling - extent_floor)
-
     return {
         "mean": mean,
         "variance": variance,
@@ -354,37 +347,69 @@ def build_ecst_evidence_states(
         "extent_teacher_fg": extent_teacher_fg,
         "extent_teacher_bg": extent_teacher_bg,
         "margin_68": margin_68,
-        "fg_tendency": fg_tendency,
-        "dino_ceiling": dino_ceiling,
-        "extent_bg_weight": extent_bg_weight,
-        "extent_floor": extent_floor,
         "margin_stats": margin_stats,
     }
 
 
-def build_ecst_teacher_weight_map(
+def build_ecst_teacher_weight_map_from_states(
     cfg,
-    batch,
     teacher_prob,
-    temporal_mean,
-    temporal_second,
     history_count,
     epoch,
     device,
+    states,
     return_raw=False,
     return_states=False,
 ):
-    """Build the ECST map with the exact former v1.1 AsymNeg operation order."""
-    states = build_ecst_evidence_states(
-        cfg,
-        batch,
-        teacher_prob,
-        temporal_mean,
-        temporal_second,
-        history_count,
-        device,
+    """Build the fixed ECST map from detached source-evidence states."""
+    required = {
+        "mean",
+        "variance",
+        "bg_reliability",
+        "history_valid",
+        "masks",
+        "teacher_fg",
+        "fg_conflict",
+        "bg_conflict",
+        "core_conflict",
+        "core_no_conflict",
+        "extent_teacher_fg",
+        "extent_teacher_bg",
+        "margin_68",
+        "margin_stats",
+    }
+    missing = sorted(required.difference(states))
+    if missing:
+        raise RuntimeError(f"ECST evidence states are missing fields: {missing}.")
+    if tuple(teacher_prob.shape) != tuple(states["mean"].shape):
+        raise RuntimeError(
+            "ECST teacher probability/state shape mismatch: "
+            f"{list(teacher_prob.shape)} != {list(states['mean'].shape)}."
+        )
+
+    routed_states = dict(states)
+    margin_tau = float(getattr(cfg, "ECST_MARGIN_TAU", 0.05))
+    fg_tendency = torch.sigmoid(states["margin_68"] / margin_tau)
+    extent_dino_lambda = float(
+        getattr(cfg, "ECST_EXTENT_DINO_LAMBDA", math.log(4.0))
     )
-    masks = states["masks"]
+    extent_floor = float(getattr(cfg, "ECST_EXTENT_BG_WEIGHT_FLOOR", 0.25))
+    dino_ceiling = torch.exp(
+        -extent_dino_lambda * fg_tendency
+    ).clamp(extent_floor, 1.0)
+    extent_bg_weight = extent_floor + states["bg_reliability"] * (
+        dino_ceiling - extent_floor
+    )
+    routed_states.update(
+        {
+            "fg_tendency": fg_tendency,
+            "dino_ceiling": dino_ceiling,
+            "extent_bg_weight": extent_bg_weight,
+            "extent_floor": extent_floor,
+        }
+    )
+
+    masks = routed_states["masks"]
     scale = float(get_ecst_scale(cfg, epoch))
     raw = torch.ones_like(teacher_prob, dtype=torch.float32, device=device)
     unknown_weight = float(getattr(cfg, "ECST_UNKNOWN_WEIGHT", 0.50))
@@ -392,13 +417,17 @@ def build_ecst_teacher_weight_map(
     core_conflict_weight = float(getattr(cfg, "ECST_CORE_CONFLICT_WEIGHT", 0.20))
     raw = torch.where(masks["unknown"], torch.full_like(raw, unknown_weight), raw)
     raw = torch.where(
-        states["extent_teacher_fg"],
+        routed_states["extent_teacher_fg"],
         torch.full_like(raw, extent_fg_weight),
         raw,
     )
-    raw = torch.where(states["extent_teacher_bg"], states["extent_bg_weight"], raw)
     raw = torch.where(
-        states["core_conflict"],
+        routed_states["extent_teacher_bg"],
+        routed_states["extent_bg_weight"],
+        raw,
+    )
+    raw = torch.where(
+        routed_states["core_conflict"],
         torch.full_like(raw, core_conflict_weight),
         raw,
     )
@@ -406,19 +435,41 @@ def build_ecst_teacher_weight_map(
     weight_max = float(getattr(cfg, "ECST_WEIGHT_MAX", 1.00))
     raw = raw.clamp(weight_min, weight_max)
 
-    _assert_mask_value(raw, states["extent_teacher_fg"], extent_fg_weight, "extent teacher-foreground")
+    _assert_mask_value(
+        raw,
+        routed_states["extent_teacher_fg"],
+        extent_fg_weight,
+        "extent teacher-foreground",
+    )
     _assert_mask_value(raw, masks["unknown"], unknown_weight, "unknown")
-    _assert_mask_value(raw, states["core_conflict"], core_conflict_weight, "core conflict")
-    _assert_mask_value(raw, states["core_no_conflict"], 1.0, "core non-conflict")
+    _assert_mask_value(
+        raw,
+        routed_states["core_conflict"],
+        core_conflict_weight,
+        "core conflict",
+    )
+    _assert_mask_value(
+        raw,
+        routed_states["core_no_conflict"],
+        1.0,
+        "core non-conflict",
+    )
     _assert_mask_value(raw, masks["other"], 1.0, "other")
-    if bool(states["extent_teacher_bg"].any().item()):
-        extent_bg_min = float(raw[states["extent_teacher_bg"]].min().detach().item())
-        extent_bg_max = float(raw[states["extent_teacher_bg"]].max().detach().item())
-        if extent_bg_min < states["extent_floor"] - 1e-5 or extent_bg_max > 1.0 + 1e-5:
+    if bool(routed_states["extent_teacher_bg"].any().item()):
+        extent_bg_min = float(
+            raw[routed_states["extent_teacher_bg"]].min().detach().item()
+        )
+        extent_bg_max = float(
+            raw[routed_states["extent_teacher_bg"]].max().detach().item()
+        )
+        if (
+            extent_bg_min < routed_states["extent_floor"] - 1e-5
+            or extent_bg_max > 1.0 + 1e-5
+        ):
             raise RuntimeError(
                 "ECST extent teacher-background weight out of range: "
                 f"min={extent_bg_min:.8f}, max={extent_bg_max:.8f}, "
-                f"floor={states['extent_floor']:.8f}."
+                f"floor={routed_states['extent_floor']:.8f}."
             )
 
     effective = torch.ones_like(raw) if scale <= 0.0 else ((1.0 - scale) + scale * raw)
@@ -434,10 +485,16 @@ def build_ecst_teacher_weight_map(
 
     margin_fg_like = float(getattr(cfg, "ECST_MARGIN_FG_LIKE", 0.05))
     margin_bg_like = float(getattr(cfg, "ECST_MARGIN_BG_LIKE", -0.05))
-    extent_bg_fg_like = states["extent_teacher_bg"] & (states["margin_68"] >= margin_fg_like)
-    extent_bg_bg_like = states["extent_teacher_bg"] & (states["margin_68"] <= margin_bg_like)
+    extent_bg_fg_like = routed_states["extent_teacher_bg"] & (
+        routed_states["margin_68"] >= margin_fg_like
+    )
+    extent_bg_bg_like = routed_states["extent_teacher_bg"] & (
+        routed_states["margin_68"] <= margin_bg_like
+    )
     extent_bg_ambiguous = (
-        states["extent_teacher_bg"] & (~extent_bg_fg_like) & (~extent_bg_bg_like)
+        routed_states["extent_teacher_bg"]
+        & (~extent_bg_fg_like)
+        & (~extent_bg_bg_like)
     )
 
     region_means = {}
@@ -450,20 +507,41 @@ def build_ecst_teacher_weight_map(
         region_counts[name] = count
 
     state_values = {
-        "core_conflict_map": (effective, states["core_conflict"]),
-        "core_no_conflict_map": (effective, states["core_no_conflict"]),
-        "extent_teacher_fg_map": (effective, states["extent_teacher_fg"]),
-        "extent_teacher_bg_map": (effective, states["extent_teacher_bg"]),
-        "extent_bg_reliability": (states["bg_reliability"], states["extent_teacher_bg"]),
-        "extent_bg_dino_ceiling": (states["dino_ceiling"], states["extent_teacher_bg"]),
-        "extent_bg_raw_weight": (states["extent_bg_weight"], states["extent_teacher_bg"]),
+        "core_conflict_map": (effective, routed_states["core_conflict"]),
+        "core_no_conflict_map": (effective, routed_states["core_no_conflict"]),
+        "extent_teacher_fg_map": (
+            effective,
+            routed_states["extent_teacher_fg"],
+        ),
+        "extent_teacher_bg_map": (
+            effective,
+            routed_states["extent_teacher_bg"],
+        ),
+        "extent_bg_reliability": (
+            routed_states["bg_reliability"],
+            routed_states["extent_teacher_bg"],
+        ),
+        "extent_bg_dino_ceiling": (
+            routed_states["dino_ceiling"],
+            routed_states["extent_teacher_bg"],
+        ),
+        "extent_bg_raw_weight": (
+            routed_states["extent_bg_weight"],
+            routed_states["extent_teacher_bg"],
+        ),
         "extent_bg_fg_like_map": (effective, extent_bg_fg_like),
         "extent_bg_ambiguous_map": (effective, extent_bg_ambiguous),
         "extent_bg_bg_like_map": (effective, extent_bg_bg_like),
         "unknown_map": (effective, masks["unknown"]),
         "other_map": (effective, masks["other"]),
-        "teacher_fg_fg_core": (states["teacher_fg"].float(), masks["fg_core"]),
-        "teacher_fg_extent": (states["teacher_fg"].float(), masks["extent"]),
+        "teacher_fg_fg_core": (
+            routed_states["teacher_fg"].float(),
+            masks["fg_core"],
+        ),
+        "teacher_fg_extent": (
+            routed_states["teacher_fg"].float(),
+            masks["extent"],
+        ),
     }
     state_means = {}
     state_sums = {}
@@ -479,24 +557,48 @@ def build_ecst_teacher_weight_map(
         "history_count_min": int(history_count.min().detach().item()),
         "history_count_mean": float(history_count.float().mean().detach().item()),
         "history_count_max": int(history_count.max().detach().item()),
-        "history_valid_ratio": float(states["history_valid"].float().mean().detach().item()),
-        "temporal_mean_min": float(states["mean"].min().detach().item()),
-        "temporal_mean_mean": float(states["mean"].mean().detach().item()),
-        "temporal_mean_max": float(states["mean"].max().detach().item()),
-        "temporal_var_min": float(states["variance"].min().detach().item()),
-        "temporal_var_mean": float(states["variance"].mean().detach().item()),
-        "temporal_var_max": float(states["variance"].max().detach().item()),
-        "temporal_reliability_mean": float(states["bg_reliability"].mean().detach().item()),
-        "fg_core_conflict_count": int(states["fg_conflict"].sum().detach().item()),
+        "history_valid_ratio": float(
+            routed_states["history_valid"].float().mean().detach().item()
+        ),
+        "temporal_mean_min": float(routed_states["mean"].min().detach().item()),
+        "temporal_mean_mean": float(routed_states["mean"].mean().detach().item()),
+        "temporal_mean_max": float(routed_states["mean"].max().detach().item()),
+        "temporal_var_min": float(
+            routed_states["variance"].min().detach().item()
+        ),
+        "temporal_var_mean": float(
+            routed_states["variance"].mean().detach().item()
+        ),
+        "temporal_var_max": float(
+            routed_states["variance"].max().detach().item()
+        ),
+        "temporal_reliability_mean": float(
+            routed_states["bg_reliability"].mean().detach().item()
+        ),
+        "fg_core_conflict_count": int(
+            routed_states["fg_conflict"].sum().detach().item()
+        ),
         "fg_core_count": int(masks["fg_core"].sum().detach().item()),
-        "bg_core_conflict_count": int(states["bg_conflict"].sum().detach().item()),
+        "bg_core_conflict_count": int(
+            routed_states["bg_conflict"].sum().detach().item()
+        ),
         "bg_core_count": int(masks["bg_core"].sum().detach().item()),
-        "extent_teacher_fg_count": int(states["extent_teacher_fg"].sum().detach().item()),
-        "extent_teacher_bg_count": int(states["extent_teacher_bg"].sum().detach().item()),
+        "extent_teacher_fg_count": int(
+            routed_states["extent_teacher_fg"].sum().detach().item()
+        ),
+        "extent_teacher_bg_count": int(
+            routed_states["extent_teacher_bg"].sum().detach().item()
+        ),
         "extent_count": int(masks["extent"].sum().detach().item()),
-        "dino_margin_min": float(states["margin_68"].min().detach().item()),
-        "dino_margin_mean": float(states["margin_68"].mean().detach().item()),
-        "dino_margin_max": float(states["margin_68"].max().detach().item()),
+        "dino_margin_min": float(
+            routed_states["margin_68"].min().detach().item()
+        ),
+        "dino_margin_mean": float(
+            routed_states["margin_68"].mean().detach().item()
+        ),
+        "dino_margin_max": float(
+            routed_states["margin_68"].max().detach().item()
+        ),
         "teacher_map_raw_min": float(raw.min().detach().item()),
         "teacher_map_raw_mean": float(raw.mean().detach().item()),
         "teacher_map_raw_max": float(raw.max().detach().item()),
@@ -511,12 +613,46 @@ def build_ecst_teacher_weight_map(
         "state_means": state_means,
         "state_sums": state_sums,
         "state_counts": state_counts,
-        **states["margin_stats"],
+        **routed_states["margin_stats"],
     }
     if return_raw and return_states:
-        return effective.detach(), stats, raw.detach(), states
+        return effective.detach(), stats, raw.detach(), routed_states
     if return_raw:
         return effective.detach(), stats, raw.detach()
     if return_states:
-        return effective.detach(), stats, states
+        return effective.detach(), stats, routed_states
     return effective.detach(), stats
+
+
+def build_ecst_teacher_weight_map(
+    cfg,
+    batch,
+    teacher_prob,
+    temporal_mean,
+    temporal_second,
+    history_count,
+    epoch,
+    device,
+    return_raw=False,
+    return_states=False,
+):
+    """Compatibility wrapper preserving the original ECST public interface."""
+    states = build_ecst_evidence_states(
+        cfg,
+        batch,
+        teacher_prob,
+        temporal_mean,
+        temporal_second,
+        history_count,
+        device,
+    )
+    return build_ecst_teacher_weight_map_from_states(
+        cfg=cfg,
+        teacher_prob=teacher_prob,
+        history_count=history_count,
+        epoch=epoch,
+        device=device,
+        states=states,
+        return_raw=return_raw,
+        return_states=return_states,
+    )

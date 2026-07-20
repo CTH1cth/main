@@ -221,6 +221,19 @@ def eval_dataset(
     cacd_logged = False
 
     for batch in loader:
+        if bool(getattr(cfg, "USE_AP_STCR", False)) or str(
+            getattr(cfg, "SUPERVISION_MODE", "")
+        ).strip().lower() == "ap_stcr":
+            forbidden_training_fields = {
+                "pu_target_soft_37",
+                "pu_bg_anchor_37",
+                "sample_index",
+            }.intersection(batch)
+            if forbidden_training_fields:
+                raise RuntimeError(
+                    "AP-STCR training-only state appeared in eval batch: "
+                    f"{sorted(forbidden_training_fields)}"
+                )
         gt = batch["gt"].to(device, non_blocking=True).float()
         stem = batch["stem"][0]
         model_input = make_model_input(cfg, batch, device)
@@ -406,10 +419,78 @@ def main():
             logger.log("[Eval ECST] temporal_memory_used=False")
             logger.log("[Eval ECST] teacher_weight_map_used=False")
             logger.log("[Eval ECST] logits_source=student_final_logits")
+        if bool(getattr(cfg, "USE_SOURCE_ARBITER", False)):
+            arbiter_mode = str(
+                getattr(cfg, "SOURCE_ARBITER_MODE", "residual_over_ecst")
+            ).lower()
+            logger.log(
+                f"[Eval SourceArbiter] mode={arbiter_mode} | training_only=True"
+            )
+            logger.log("[Eval SourceArbiter] router_loaded=False")
+            logger.log("[Eval SourceArbiter] utility_evaluator_loaded=False")
+            logger.log("[Eval SourceArbiter] route_memory_used=False")
+            logger.log("[Eval SourceArbiter] temporal_memory_used=False")
+            logger.log("[Eval SourceArbiter] ecst_map_used=False")
+            logger.log("[Eval SourceArbiter] logits_source=student_final_logits")
         if bool(getattr(cfg, "USE_TEPR_LITE", False)):
             logger.log("[Eval TEPR-Lite] temporal_memory_used=False")
             logger.log("[Eval TEPR-Lite] teacher_weight_map_used=False")
             logger.log("[Eval TEPR-Lite] logits_source=student_final_logits")
+        supervision_mode = str(
+            getattr(cfg, "SUPERVISION_MODE", "")
+        ).strip().lower()
+        if bool(getattr(cfg, "USE_AP_STCR", False)) or (
+            supervision_mode == "ap_stcr"
+        ):
+            logger.log("[Eval AP-STCR] training_only=True")
+            logger.log("[Eval AP-STCR] semantic_cache_used=False")
+            logger.log("[Eval AP-STCR] temporal_history_used=False")
+            logger.log("[Eval AP-STCR] mixed_target_used=False")
+            logger.log("[Eval AP-STCR] teacher_loaded=False")
+            logger.log("[Eval AP-STCR] teacher_forward=False")
+            logger.log("[Eval AP-STCR] logits_source=student_final_logits")
+        if bool(getattr(cfg, "USE_PSSF", False)) or supervision_mode in {
+            "pssf_state",
+            "ppse_v2_state",
+        }:
+            if supervision_mode == "ppse_v2_state":
+                logger.log("[Eval PPSE-v2] training_only=True")
+                logger.log("[Eval PPSE-v2] model_for_eval=student")
+                logger.log(
+                    "[Eval PPSE-v2] use_ppse_at_inference=False"
+                )
+                logger.log(
+                    "[Eval PPSE-v2] use_pssf_actor_at_inference=False"
+                )
+                logger.log(
+                    "[Eval PPSE-v2] use_pssf_learner_at_inference=False"
+                )
+                logger.log(
+                    "[Eval PPSE-v2] use_teacher_at_inference=False"
+                )
+                logger.log(
+                    "[Eval PPSE-v2] "
+                    "use_supervision_state_at_inference=False"
+                )
+                logger.log("[Eval PPSE-v2] q_state_used=False")
+                logger.log("[Eval PPSE-v2] history_used=False")
+                logger.log(
+                    "[Eval PPSE-v2] logits_source=student_final_logits"
+                )
+            else:
+                logger.log("[Eval PSSF] training_only=True")
+                logger.log("[Eval PSSF] use_pssf_at_inference=False")
+                logger.log("[Eval PSSF] use_teacher_at_inference=False")
+                logger.log(
+                    "[Eval PSSF] use_supervision_state_at_inference=False"
+                )
+                logger.log("[Eval PSSF] pssf_network_loaded=False")
+                logger.log("[Eval PSSF] teacher_loaded=False")
+                logger.log("[Eval PSSF] q_state_used=False")
+                logger.log("[Eval PSSF] history_used=False")
+                logger.log(
+                    "[Eval PSSF] logits_source=student_final_logits"
+                )
         if bool(getattr(cfg, "USE_ESA_BER", False)):
             logger.log("[Eval ESA-BER] USE_ESA_BER=True")
             logger.log("[Eval ESA-BER] training_only=True")

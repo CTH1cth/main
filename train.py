@@ -1,7 +1,10 @@
 import argparse
 import csv
+import hashlib
+import json
 import math
 import random
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -12,26 +15,69 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader
 
+from common.ap_stcr import (
+    AnchorPropagatedSemanticTemporalCorrection,
+    accumulate_ap_stcr_epoch,
+    build_ap_stcr_diagnostic_payload,
+    finalize_ap_stcr_epoch,
+    new_ap_stcr_epoch_accumulator,
+    render_ap_stcr_diagnostic,
+    strict_teacher_binary,
+)
 from common.dataset import CachedEvalDataset, CachedTrainDataset
 from common.ecst import (
     TemporalTeacherMemory as ECSTTemporalTeacherMemory,
+    build_ecst_evidence_states,
     build_ecst_region_masks,
     build_ecst_teacher_weight_map,
+    build_ecst_teacher_weight_map_from_states,
     get_ecst_scale,
 )
 from common.source_arbiter import (
     RouteTrajectoryMemory,
+    SignAwareSourceArbiter,
     SourceArbiter,
     apply_loss_space_arbitration,
+    build_directional_utility_target,
     build_delayed_utility_target,
     build_source_arbiter_inputs,
+    build_teacher_source_weight,
+    collect_sign_aware_stats,
+    compute_sign_aware_arbiter_loss,
+    compute_sign_aware_source_gates,
     compute_source_arbiter_loss,
+    compute_r1_shadow_stats,
+    compute_r2b_audit_class_weights,
     compute_source_gates,
     compute_utility_validation_stats,
+    evaluate_r2b_audit_concentration_override,
+    evaluate_r2b_target_audit_v2_admission,
+    get_arbiter_apply_scale,
     get_arbiter_influence_scale,
+    get_arbiter_train_scale,
     get_source_prior,
     source_arbiter_parameter_count,
     source_gate_stats,
+)
+from common.static_weight import (
+    accumulate_static_weight_audit,
+    build_effective_static_weight,
+    build_static_weight_region_masks,
+    finalize_static_weight_audit,
+    get_static_weight_mode,
+    new_static_weight_audit_accumulator,
+    static_weight_protocol_fingerprint,
+)
+from common.teacher_routing import (
+    LEGACY_TEACHER_ROUTING_MODE,
+    accumulate_teacher_routing,
+    build_identity_teacher_route,
+    finalize_teacher_routing,
+    get_teacher_routing_mode,
+    new_teacher_routing_accumulator,
+    teacher_routing_protocol_fingerprint,
+    teacher_routing_uses_ecst,
+    validate_teacher_routing_config,
 )
 from common.gkd_lite import (
     apply_gkd_strength,
@@ -44,6 +90,32 @@ from common.gkd_lite import (
     is_gkd_v3_enabled,
 )
 from common.metrics import CODMetrics
+from common.pssf_retention import (
+    area_resize as pssf_area_resize,
+    bilinear_resize_gain,
+    bilinear_resize_retention,
+    build_pssf_state_channels,
+    build_retention_target,
+    future_state_from_gain,
+    future_state_from_retention,
+    innovation_weighted_image_mean,
+    safe_pearson,
+    safe_spearman,
+    teacher_binary_observation,
+    update_prior_anchored_supervision_state,
+    update_supervision_state,
+    weighted_gain_loss,
+    weighted_retention_loss,
+)
+from common.pssf_state import (
+    PSSFHistoryBank,
+    PSSFStateBank,
+    build_pssf_split,
+    canonical_hash as pssf_canonical_hash,
+    file_sha256 as pssf_file_sha256,
+    save_or_validate_split,
+    save_runtime_payload_atomic,
+)
 from common.utils import (
     Logger,
     cache_status,
@@ -73,6 +145,7 @@ from common.utils import (
     write_yaml,
 )
 from model import build_seg_head, update_ema
+from models.pssf import PredictiveSupervisionStateFilter
 
 
 def _legacy_tepr_module():
@@ -91,6 +164,619 @@ def get_teacher_weight(epoch):
 
 def get_reset_epoch(cfg):
     return int(getattr(cfg, "FINETUNE_RESET_EPOCH", 21))
+
+
+def use_ppse_v2(cfg):
+    return str(getattr(cfg, "SUPERVISION_MODE", "")).strip().lower() == (
+        "ppse_v2_state"
+    )
+
+
+def use_pssf(cfg):
+    supervision_mode = str(
+        getattr(cfg, "SUPERVISION_MODE", "")
+    ).strip().lower()
+    return bool(getattr(cfg, "USE_PSSF", False)) or supervision_mode in {
+        "pssf_state",
+        "ppse_v2_state",
+    }
+
+
+def use_ap_stcr(cfg):
+    supervision_mode = str(
+        getattr(cfg, "SUPERVISION_MODE", "")
+    ).strip().lower()
+    return bool(getattr(cfg, "USE_AP_STCR", False)) or (
+        supervision_mode == "ap_stcr"
+    )
+
+
+def validate_ap_stcr_config(cfg):
+    if not use_ap_stcr(cfg):
+        return False
+    required_values = {
+        "SUPERVISION_MODE": "ap_stcr",
+        "TEACHER_FUSION_MODE": "dabe_pu_despl_sched",
+        "TEACHER_ROUTING_MODE": "none",
+        "STATIC_WEIGHT_MODE": "ones",
+        "DABE_PU_VERSION": "pu_v11",
+        "P_INIT_MODE": "dabe_pu_v11_desplsched",
+        "TEACHER_TARGET_MODE": "binary",
+        "DABE_PU_STATIC_TARGET_MODE": "soft",
+        "SUPERVISION_HANDOVER_MODE": "linear",
+        "FINETUNE_RESET_TIMING": "after_epoch",
+        "HEAD_TYPE": "dagp_safe",
+    }
+    mismatched = {
+        name: getattr(cfg, name, None)
+        for name, expected in required_values.items()
+        if str(getattr(cfg, name, "")).strip().lower() != expected
+    }
+    if mismatched:
+        raise RuntimeError(
+            f"AP-STCR protected protocol mismatch: {mismatched}; "
+            f"expected={required_values}."
+        )
+    required_true = (
+        "USE_AP_STCR",
+        "USE_DABE_PU",
+        "USE_DABE_PU_DESPL_SCHEDULE",
+        "USE_DABE_PU_STATIC_LOSS",
+        "USE_TEACHER_BINARY_FULL_LOSS",
+        "USE_DAGP_SAFE_HEAD",
+        "USE_NDR_BRANCH",
+        "USE_NDR_COARSE_AUX",
+        "USE_BASE_AUX_LOSS",
+        "FINETUNE_RESET_TEACHER",
+    )
+    missing_true = [
+        name for name in required_true if not bool(getattr(cfg, name, False))
+    ]
+    if missing_true:
+        raise RuntimeError(
+            f"AP-STCR protected protocol requires flags: {missing_true}."
+        )
+    forbidden_flags = (
+        "USE_ECST",
+        "USE_PSSF",
+        "USE_SOURCE_ARBITER",
+        "USE_RAST",
+        "USE_ESA_ASYM",
+        "ESA_POST_RESET_ENABLE",
+        "USE_ESA_BER",
+        "USE_TEPR_LITE",
+        "USE_HBNS_LITE",
+        "USE_EPR_POS",
+        "USE_TCE",
+        "USE_LCEG",
+        "USE_CSSD",
+        "USE_HR_BFR",
+        "USE_CACD",
+        "USE_CSD_DECODER",
+        "USE_CSD_V1R",
+        "USE_NDR_V2",
+        "USE_TADR_ROUTER",
+        "USE_MULTI_VIEW_FEATURE",
+        "USE_PROTO_CONTRAST",
+        "USE_DABE_OEM",
+        "USE_DABE_PU_GROUP_BALANCED_STATIC",
+        "USE_DABE_AWARE_LOSS",
+        "USE_DABE_TVERSKY_LOSS",
+        "USE_DABE_AREA_GUARD",
+    )
+    enabled_forbidden = [
+        name for name in forbidden_flags if bool(getattr(cfg, name, False))
+    ]
+    if enabled_forbidden:
+        raise RuntimeError(
+            f"AP-STCR cannot be combined with: {enabled_forbidden}."
+        )
+    if str(getattr(cfg, "GKD_MODE", "off")).strip().lower() != "off":
+        raise RuntimeError("AP-STCR requires GKD_MODE='off'.")
+    exact_ints = {
+        "MAX_EPOCH": 50,
+        "LOSS_SIZE": 68,
+        "DABE_PU_DESPL_STAGE_START": 1,
+        "DABE_PU_DESPL_STAGE_END": 29,
+        "DABE_PU_DESPL_TEACHER_ONLY_START": 30,
+        "FINETUNE_RESET_EPOCH": 29,
+    }
+    bad_ints = {
+        name: getattr(cfg, name, None)
+        for name, expected in exact_ints.items()
+        if int(getattr(cfg, name, -1)) != expected
+    }
+    if bad_ints:
+        raise RuntimeError(
+            f"AP-STCR Linear30 boundary mismatch: {bad_ints}; "
+            f"expected={exact_ints}."
+        )
+    exact_floats = {
+        "DABE_PU_DESPL_STATIC_START": 1.0,
+        "DABE_PU_DESPL_STATIC_END": 0.05,
+        "DABE_PU_DESPL_TEACHER_START": 0.0,
+        "DABE_PU_DESPL_TEACHER_END": 0.95,
+        "LAMBDA_NDR_COARSE_AUX": 0.5,
+        "LAMBDA_BASE_AUX": 0.5,
+        "LAMBDA_BASE_AUX_AFTER_RESET": 0.3,
+        "FINETUNE_RESET_LR": 2e-5,
+        "LR_FLOOR": 2e-5,
+    }
+    bad_floats = {
+        name: getattr(cfg, name, None)
+        for name, expected in exact_floats.items()
+        if not math.isfinite(float(getattr(cfg, name, float("nan"))))
+        or abs(float(getattr(cfg, name)) - expected) > 1e-12
+    }
+    if bad_floats:
+        raise RuntimeError(
+            f"AP-STCR protected numeric mismatch: {bad_floats}; "
+            f"expected={exact_floats}."
+        )
+    if bool(getattr(cfg, "USE_TEACHER_SOFT_FULL_LOSS", False)):
+        raise RuntimeError("AP-STCR requires the binary EMA teacher target.")
+    ap_config = getattr(cfg, "AP_STCR", None)
+    if not isinstance(ap_config, dict):
+        raise RuntimeError("AP-STCR requires an AP_STCR configuration dict.")
+    expected_ap = {
+        "enabled": True,
+        "background_source": "dabe_seed:bg_anchor_37",
+        "history_dtype": "float16",
+        "clear_history_on_reset": True,
+        "teacher_binary_comparison": "strict_gt",
+        "evidence_resolution": 37,
+        "loss_resolution": 68,
+        "temporal_window": 3,
+    }
+    bad_ap = {
+        name: ap_config.get(name)
+        for name, expected in expected_ap.items()
+        if ap_config.get(name) != expected
+    }
+    if bad_ap:
+        raise RuntimeError(
+            f"AP-STCR module configuration mismatch: {bad_ap}; "
+            f"expected={expected_ap}."
+        )
+    if abs(float(ap_config.get("teacher_binary_threshold", -1.0)) - 0.5) > 1e-12:
+        raise RuntimeError("AP-STCR requires teacher_binary_threshold=0.5.")
+    return True
+
+
+def validate_ppse_v2_config(cfg):
+    if not use_ppse_v2(cfg):
+        return False
+    required_values = {
+        "SUPERVISION_MODE": "ppse_v2_state",
+        "TEACHER_FUSION_MODE": "ppse_v2_state",
+        "PPSE_VERSION": "horizon_normalized_prior_anchored_v2",
+        "PSSF_VERSION": "horizon_retention_actor_learner_v2",
+        "PPSE_STATE_STEP_MODE": "inverse_horizon",
+        "PPSE_PRIOR_SOURCE": "dabe_pu_target_soft_68",
+        "PPSE_ACTOR_SYNC_MODE": "epoch_start_hard_copy",
+        "PSSF_RETENTION_TARGET": "future_binary_innovation_retention",
+        "PSSF_TEACHER_OBSERVATION": "binary_68",
+        "PSSF_STATE_DTYPE": "float16",
+        "PSSF_HISTORY_DTYPE": "float16",
+        "PSSF_GAIN_UPSAMPLE_MODE": "bilinear",
+        "DABE_PU_VERSION": "pu_v11",
+        "DABE_PU_STATIC_TARGET_MODE": "soft",
+        "STATIC_WEIGHT_MODE": "ones",
+        "TEACHER_TARGET_MODE": "binary",
+        "TEACHER_ROUTING_MODE": "none",
+        "GKD_MODE": "off",
+    }
+    for name, expected in required_values.items():
+        actual = str(getattr(cfg, name, "")).strip().lower()
+        if actual != expected:
+            raise RuntimeError(
+                f"PPSE-v2 requires {name}={expected!r}, got {actual!r}."
+            )
+
+    required_true = (
+        "USE_PSSF",
+        "USE_DABE_PU",
+        "USE_NDR_BRANCH",
+        "USE_NDR_COARSE_AUX",
+        "USE_BASE_AUX_LOSS",
+        "USE_TEACHER_BINARY_FULL_LOSS",
+        "PPSE_USE_PRIOR_ANCHOR",
+        "PPSE_USE_ACTOR_LEARNER",
+        "PSSF_KEEP_STATE_ACROSS_RESET",
+        "PSSF_CLEAR_HISTORY_AFTER_RESET",
+        "PSSF_KEEP_LEARNER_ACROSS_RESET",
+        "PSSF_KEEP_ACTOR_ACROSS_RESET",
+        "PSSF_KEEP_OPTIMIZER_ACROSS_RESET",
+        "FINETUNE_RESET_REBUILD_OPTIMIZER",
+        "FINETUNE_RESET_REBUILD_SCHEDULER",
+        "FINETUNE_RESET_GLOBAL_STEP",
+        "FINETUNE_RESET_TEACHER",
+        "FINETUNE_RESET_FORCE_LR_FLOOR",
+        "USE_LR_FLOOR",
+        "LR_FLOOR_APPLY_AFTER_FINETUNE_RESET",
+    )
+    missing_true = [
+        name for name in required_true if not bool(getattr(cfg, name, False))
+    ]
+    if missing_true:
+        raise RuntimeError(
+            f"PPSE-v2 requires enabled flags: {missing_true}."
+        )
+
+    required_false = (
+        "PPSE_ACTOR_TRAINABLE",
+        "PPSE_ACTOR_UPDATE_WITHIN_EPOCH",
+        "USE_DABE_PU_DESPL_SCHEDULE",
+        "USE_DABE_PU_STATIC_LOSS",
+        "USE_ECST",
+        "USE_RAST",
+        "USE_ESA_ASYM",
+        "ESA_POST_RESET_ENABLE",
+        "USE_TEPR_LITE",
+        "USE_SOURCE_ARBITER",
+        "USE_EGSA",
+        "USE_TADR_ROUTER",
+        "USE_TCE",
+        "USE_LCEG",
+        "USE_HBNS_LITE",
+        "USE_EPR_POS",
+        "USE_PROTO_CONTRAST",
+        "USE_MULTI_VIEW_FEATURE",
+        "USE_VIEW_CONSISTENCY",
+        "USE_GKD_LITE",
+        "USE_DABE_OEM",
+        "USE_DABE_PU_GROUP_BALANCED_STATIC",
+        "USE_TEACHER_CONF_LOSS",
+        "USE_TEACHER_SOFT_FULL_LOSS",
+        "USE_DABE_AWARE_LOSS",
+        "USE_DABE_TVERSKY_LOSS",
+        "USE_DABE_AREA_GUARD",
+        "USE_DARE",
+        "USE_CSSD",
+        "USE_HR_BFR",
+        "USE_CSD_DECODER",
+        "USE_CSD_V1R",
+        "USE_CACD",
+        "USE_PA_DAGP",
+        "USE_QRA",
+        "USE_CCR",
+        "USE_DREPP",
+        "USE_DESPL_PSEUDO",
+        "USE_DABE_PSEUDO",
+        "USE_MULTI_LEVEL_FEATURE",
+        "PSSF_RESET_NETWORK_AFTER_FINETUNE_RESET",
+        "PSSF_RESET_OPTIMIZER_AFTER_FINETUNE_RESET",
+    )
+    enabled_false = [
+        name for name in required_false if bool(getattr(cfg, name, False))
+    ]
+    if enabled_false:
+        raise RuntimeError(
+            f"PPSE-v2 requires disabled flags: {enabled_false}."
+        )
+
+    exact_integers = {
+        "MAX_EPOCH": 50,
+        "PSSF_PATCH_SIZE": 37,
+        "PSSF_LOSS_SIZE": 68,
+        "PSSF_HORIZON": 3,
+        "PSSF_HISTORY_WINDOW": 3,
+        "PSSF_FEATURE_PROJ_DIM": 32,
+        "PSSF_HIDDEN_DIM": 32,
+        "PSSF_GN_GROUPS": 4,
+        "PSSF_STATE_CHANNELS": 9,
+        "PSSF_EXPECTED_TRAIN_SAMPLES": 4040,
+        "FINETUNE_RESET_EPOCH": 29,
+        "LOSS_SIZE": 68,
+    }
+    for name, expected in exact_integers.items():
+        actual = int(getattr(cfg, name, -1))
+        if actual != expected:
+            raise RuntimeError(
+                f"PPSE-v2 requires {name}={expected}, got {actual}."
+            )
+
+    if str(getattr(cfg, "HEAD_TYPE", "")).lower() != "dagp_safe":
+        raise RuntimeError("PPSE-v2 requires HEAD_TYPE='dagp_safe'.")
+    if bool(getattr(cfg, "USE_NDR_V2", False)):
+        raise RuntimeError("PPSE-v2 requires NDR-v1.")
+    if str(getattr(cfg, "P_INIT_MODE", "")) != "dabe_pu_v11_desplsched":
+        raise RuntimeError(
+            "PPSE-v2 requires P_INIT_MODE='dabe_pu_v11_desplsched'."
+        )
+    if str(getattr(cfg, "FINETUNE_RESET_TIMING", "")).lower() != "after_epoch":
+        raise RuntimeError(
+            "PPSE-v2 requires FINETUNE_RESET_TIMING='after_epoch'."
+        )
+
+    horizon = int(getattr(cfg, "PSSF_HORIZON", -1))
+    expected_step = 1.0 / float(horizon)
+    state_step = float(getattr(cfg, "PPSE_STATE_STEP", float("nan")))
+    if not math.isfinite(state_step) or abs(state_step - expected_step) >= 1e-8:
+        raise RuntimeError(
+            "PPSE-v2 requires PPSE_STATE_STEP=1/PSSF_HORIZON, got "
+            f"{state_step} vs {expected_step}."
+        )
+    init_retention = float(
+        getattr(cfg, "PSSF_INIT_RETENTION", float("nan"))
+    )
+    if not math.isfinite(init_retention) or abs(init_retention - 0.03) > 1e-12:
+        raise RuntimeError("PPSE-v2 requires PSSF_INIT_RETENTION=0.03.")
+    exact_floats = {
+        "PSSF_LR": 1e-3,
+        "PSSF_WEIGHT_DECAY": 1e-4,
+        "PSSF_AUDIT_VAL_RATIO": 0.10,
+        "LAMBDA_NDR_COARSE_AUX": 0.5,
+        "LAMBDA_BASE_AUX": 0.5,
+        "LAMBDA_BASE_AUX_AFTER_RESET": 0.3,
+        "FINETUNE_RESET_LR": 2e-5,
+        "LR_FLOOR": 2e-5,
+    }
+    for name, expected in exact_floats.items():
+        actual = float(getattr(cfg, name, float("nan")))
+        if not math.isfinite(actual) or abs(actual - expected) > 1e-12:
+            raise RuntimeError(
+                f"PPSE-v2 requires {name}={expected}, got {actual}."
+            )
+    if float(getattr(cfg, "PSSF_EPS", 0.0)) <= 0.0:
+        raise RuntimeError("PPSE-v2 requires a positive PSSF_EPS.")
+    return True
+
+
+def validate_pssf_config(cfg):
+    if not use_pssf(cfg):
+        return False
+    if use_ppse_v2(cfg):
+        return validate_ppse_v2_config(cfg)
+    required_values = {
+        "SUPERVISION_MODE": "pssf_state",
+        "TEACHER_FUSION_MODE": "pssf_state",
+        "PSSF_VERSION": "online_innovation_retention_v1",
+        "DABE_PU_VERSION": "pu_v11",
+        "DABE_PU_STATIC_TARGET_MODE": "soft",
+        "TEACHER_ROUTING_MODE": "none",
+        "PSSF_TEACHER_OBSERVATION": "binary_68",
+        "PSSF_RETENTION_TARGET": "future_binary_center",
+        "PSSF_STATE_DTYPE": "float16",
+        "PSSF_HISTORY_DTYPE": "float16",
+        "PSSF_GAIN_UPSAMPLE_MODE": "bilinear",
+        "STATIC_WEIGHT_MODE": "ones",
+        "TEACHER_TARGET_MODE": "binary",
+        "GKD_MODE": "off",
+    }
+    for name, expected in required_values.items():
+        actual = str(getattr(cfg, name, "")).lower()
+        if actual != expected:
+            raise RuntimeError(
+                f"PSSF requires {name}={expected!r}, got {actual!r}."
+            )
+    required_true = {
+        "USE_PSSF": True,
+        "USE_DABE_PU": True,
+        "USE_NDR_BRANCH": True,
+        "USE_NDR_COARSE_AUX": True,
+        "USE_BASE_AUX_LOSS": True,
+        "USE_TEACHER_BINARY_FULL_LOSS": True,
+        "PSSF_KEEP_STATE_ACROSS_RESET": True,
+        "PSSF_CLEAR_HISTORY_AFTER_RESET": True,
+        "FINETUNE_RESET_REBUILD_OPTIMIZER": True,
+        "FINETUNE_RESET_REBUILD_SCHEDULER": True,
+        "FINETUNE_RESET_GLOBAL_STEP": True,
+        "FINETUNE_RESET_TEACHER": True,
+        "FINETUNE_RESET_FORCE_LR_FLOOR": True,
+        "USE_LR_FLOOR": True,
+        "LR_FLOOR_APPLY_AFTER_FINETUNE_RESET": True,
+    }
+    for name, expected in required_true.items():
+        if bool(getattr(cfg, name, False)) is not expected:
+            raise RuntimeError(f"PSSF requires {name}={expected}.")
+    required_false = {
+        "USE_DABE_PU_DESPL_SCHEDULE": False,
+        "USE_DABE_PU_STATIC_LOSS": False,
+        "USE_ECST": False,
+        "USE_RAST": False,
+        "USE_ESA_ASYM": False,
+        "ESA_POST_RESET_ENABLE": False,
+        "USE_TEPR_LITE": False,
+        "USE_SOURCE_ARBITER": False,
+        "USE_EGSA": False,
+        "USE_TADR_ROUTER": False,
+        "USE_TCE": False,
+        "USE_LCEG": False,
+        "USE_HBNS_LITE": False,
+        "USE_EPR_POS": False,
+        "USE_PROTO_CONTRAST": False,
+        "USE_MULTI_VIEW_FEATURE": False,
+        "USE_VIEW_CONSISTENCY": False,
+        "USE_GKD_LITE": False,
+        "USE_DABE_OEM": False,
+        "USE_DABE_PU_GROUP_BALANCED_STATIC": False,
+        "USE_TEACHER_CONF_LOSS": False,
+        "USE_TEACHER_SOFT_FULL_LOSS": False,
+        "USE_DABE_AWARE_LOSS": False,
+        "USE_DABE_TVERSKY_LOSS": False,
+        "USE_DABE_AREA_GUARD": False,
+        "USE_DARE": False,
+        "USE_CSSD": False,
+        "USE_HR_BFR": False,
+        "USE_CSD_DECODER": False,
+        "USE_CSD_V1R": False,
+        "USE_CACD": False,
+        "USE_PA_DAGP": False,
+        "USE_QRA": False,
+        "USE_CCR": False,
+        "USE_DREPP": False,
+        "USE_DESPL_PSEUDO": False,
+        "USE_DABE_PSEUDO": False,
+        "USE_MULTI_LEVEL_FEATURE": False,
+        "PSSF_RESET_NETWORK_AFTER_FINETUNE_RESET": False,
+        "PSSF_RESET_OPTIMIZER_AFTER_FINETUNE_RESET": False,
+    }
+    for name, expected in required_false.items():
+        if bool(getattr(cfg, name, False)) is not expected:
+            raise RuntimeError(f"PSSF requires {name}={expected}.")
+    exact_numeric = {
+        "MAX_EPOCH": 50,
+        "PSSF_PATCH_SIZE": 37,
+        "PSSF_LOSS_SIZE": 68,
+        "PSSF_HORIZON": 3,
+        "PSSF_HISTORY_WINDOW": 3,
+        "PSSF_FEATURE_PROJ_DIM": 32,
+        "PSSF_HIDDEN_DIM": 32,
+        "PSSF_GN_GROUPS": 4,
+        "PSSF_STATE_CHANNELS": 9,
+        "PSSF_EXPECTED_TRAIN_SAMPLES": 4040,
+        "FINETUNE_RESET_EPOCH": 29,
+        "LOSS_SIZE": 68,
+    }
+    for name, expected in exact_numeric.items():
+        actual = int(getattr(cfg, name, -1))
+        if actual != expected:
+            raise RuntimeError(
+                f"PSSF requires {name}={expected}, got {actual}."
+            )
+    if str(getattr(cfg, "HEAD_TYPE", "")).lower() != "dagp_safe":
+        raise RuntimeError("PSSF requires HEAD_TYPE='dagp_safe'.")
+    if bool(getattr(cfg, "USE_NDR_V2", False)):
+        raise RuntimeError("PSSF requires NDR-v1; USE_NDR_V2 must be False.")
+    if str(getattr(cfg, "FINETUNE_RESET_TIMING", "")).lower() != "after_epoch":
+        raise RuntimeError("PSSF requires FINETUNE_RESET_TIMING='after_epoch'.")
+    if not bool(getattr(cfg, "FINETUNE_RESET_TEACHER", False)):
+        raise RuntimeError("PSSF requires FINETUNE_RESET_TEACHER=True.")
+    if str(getattr(cfg, "P_INIT_MODE", "")) != "dabe_pu_v11_desplsched":
+        raise RuntimeError(
+            "PSSF requires P_INIT_MODE='dabe_pu_v11_desplsched'."
+        )
+    exact_floats = {
+        "PSSF_LR": 1e-3,
+        "PSSF_WEIGHT_DECAY": 1e-4,
+        "PSSF_AUDIT_VAL_RATIO": 0.10,
+        "LAMBDA_NDR_COARSE_AUX": 0.5,
+        "LAMBDA_BASE_AUX": 0.5,
+        "LAMBDA_BASE_AUX_AFTER_RESET": 0.3,
+        "FINETUNE_RESET_LR": 2e-5,
+        "LR_FLOOR": 2e-5,
+    }
+    for name, expected in exact_floats.items():
+        actual = float(getattr(cfg, name, float("nan")))
+        if not math.isfinite(actual) or abs(actual - expected) > 1e-12:
+            raise RuntimeError(
+                f"PSSF requires {name}={expected}, got {actual}."
+            )
+    if abs(float(getattr(cfg, "PSSF_INIT_GAIN", -1.0)) - 0.01) > 1e-12:
+        raise RuntimeError("PSSF_INIT_GAIN must equal 0.01.")
+    if float(getattr(cfg, "PSSF_EPS", 0.0)) <= 0.0:
+        raise RuntimeError("PSSF_EPS must be positive.")
+    if not 0.0 < float(getattr(cfg, "PSSF_AUDIT_VAL_RATIO", 0.0)) < 1.0:
+        raise RuntimeError("PSSF_AUDIT_VAL_RATIO must be in (0,1).")
+    return True
+
+
+def resolve_epoch_supervision_for_training(cfg, epoch, use_pure_despl=False):
+    """Resolve legacy handover state without touching it on the PSSF path."""
+    if use_pssf(cfg):
+        supervision_mode = (
+            "ppse_v2_state" if use_ppse_v2(cfg) else "pssf_state"
+        )
+        return {
+            "fixed_weight": 0.0,
+            "teacher_weight": 0.0,
+            "fusion_mode": supervision_mode,
+            "effective_despl_weight": 0.0,
+            "effective_teacher_weight": 0.0,
+            "target_mode": supervision_mode,
+            "teacher_binary_used": True,
+        }
+
+    fixed_weight, teacher_weight, fusion_mode = get_fixed_teacher_weights(
+        cfg, epoch
+    )
+    return {
+        "fixed_weight": fixed_weight,
+        "teacher_weight": teacher_weight,
+        "fusion_mode": fusion_mode,
+        "effective_despl_weight": 1.0 if use_pure_despl else fixed_weight,
+        "effective_teacher_weight": 0.0 if use_pure_despl else teacher_weight,
+        "target_mode": "pure_despl" if use_pure_despl else fusion_mode,
+        "teacher_binary_used": (
+            False if use_pure_despl else bool(teacher_weight > 0.0)
+        ),
+    }
+
+
+def build_ap_stcr_segmentation_group(
+    cfg,
+    epoch,
+    student_out,
+    student_logits,
+    mixed_target,
+):
+    if not use_ap_stcr(cfg):
+        raise RuntimeError("AP-STCR segmentation helper requires USE_AP_STCR.")
+    if mixed_target.requires_grad:
+        raise RuntimeError("AP-STCR mixed target must be detached.")
+    branch_losses = {
+        "final": F.binary_cross_entropy_with_logits(
+            student_logits,
+            mixed_target,
+            reduction="mean",
+        )
+    }
+    branch_weights = {"final": 1.0}
+    zero = student_logits.sum() * 0.0
+    branch_losses["coarse"] = zero
+    branch_losses["base"] = zero
+    if bool(getattr(cfg, "USE_NDR_COARSE_AUX", True)):
+        if not isinstance(student_out, dict) or "coarse_logits_68" not in student_out:
+            raise RuntimeError(
+                "AP-STCR requires coarse_logits_68 for the NDR auxiliary."
+            )
+        coarse_logits = resize_logits_for_loss(
+            student_out["coarse_logits_68"], cfg
+        )
+        branch_losses["coarse"] = F.binary_cross_entropy_with_logits(
+            coarse_logits,
+            mixed_target,
+            reduction="mean",
+        )
+        branch_weights["coarse"] = float(
+            getattr(cfg, "LAMBDA_NDR_COARSE_AUX", 0.5)
+        )
+    if bool(getattr(cfg, "USE_BASE_AUX_LOSS", True)):
+        if not isinstance(student_out, dict) or "base_logits" not in student_out:
+            raise RuntimeError(
+                "AP-STCR requires base_logits for the DAGP base auxiliary."
+            )
+        base_logits = resize_logits_for_loss(student_out["base_logits"], cfg)
+        branch_losses["base"] = F.binary_cross_entropy_with_logits(
+            base_logits,
+            mixed_target,
+            reduction="mean",
+        )
+        branch_weights["base"] = (
+            float(getattr(cfg, "LAMBDA_BASE_AUX", 0.5))
+            if is_before_finetune_reset(cfg, epoch)
+            else float(getattr(cfg, "LAMBDA_BASE_AUX_AFTER_RESET", 0.3))
+        )
+    weight_sum = float(sum(branch_weights.values()))
+    if not math.isfinite(weight_sum) or weight_sum <= 0.0:
+        raise RuntimeError("AP-STCR branch weight sum must be positive.")
+    loss = sum(
+        branch_weights[name] * branch_losses[name]
+        for name in branch_weights
+    ) / weight_sum
+    if not bool(torch.isfinite(loss).item()):
+        raise RuntimeError("AP-STCR segmentation group loss is NaN/Inf.")
+    return {
+        "loss": loss,
+        "loss_final": branch_losses["final"],
+        "loss_coarse": branch_losses["coarse"],
+        "loss_base": branch_losses["base"],
+        "final_weight": branch_weights["final"],
+        "coarse_weight": branch_weights.get("coarse", 0.0),
+        "base_weight": branch_weights.get("base", 0.0),
+        "weight_sum": weight_sum,
+    }
 
 
 def is_finetune_reset_enabled(cfg):
@@ -131,6 +817,133 @@ def _linear_schedule_value(epoch, start_epoch, end_epoch, start_value, end_value
     progress = float(int(epoch) - start_epoch) / float(end_epoch - start_epoch)
     progress = max(0.0, min(1.0, progress))
     return start_value + (end_value - start_value) * progress
+
+
+def get_supervision_handover_mode(cfg):
+    mode = str(
+        getattr(cfg, "SUPERVISION_HANDOVER_MODE", "linear")
+    ).strip().lower()
+    if mode not in {"linear", "power"}:
+        raise RuntimeError(
+            f"Unsupported SUPERVISION_HANDOVER_MODE={mode!r}; "
+            "expected 'linear' or 'power'."
+        )
+    return mode
+
+
+def validate_supervision_handover_config(cfg):
+    mode = get_supervision_handover_mode(cfg)
+    gamma = float(getattr(cfg, "SUPERVISION_HANDOVER_GAMMA", 1.0))
+    if not math.isfinite(gamma) or gamma <= 0.0:
+        raise RuntimeError(
+            "SUPERVISION_HANDOVER_GAMMA must be finite and positive, "
+            f"got {gamma}."
+        )
+    if hasattr(cfg, "SUPERVISION_HANDOVER_MODE"):
+        if (
+            str(getattr(cfg, "TEACHER_FUSION_MODE", "")).strip().lower()
+            != "dabe_pu_despl_sched"
+        ):
+            raise RuntimeError(
+                "Explicit supervision handover requires "
+                "TEACHER_FUSION_MODE='dabe_pu_despl_sched'."
+            )
+        static_start = float(
+            getattr(cfg, "DABE_PU_DESPL_STATIC_START", 1.0)
+        )
+        static_end = float(getattr(cfg, "DABE_PU_DESPL_STATIC_END", 0.05))
+        teacher_start = float(
+            getattr(cfg, "DABE_PU_DESPL_TEACHER_START", 0.0)
+        )
+        teacher_end = float(
+            getattr(cfg, "DABE_PU_DESPL_TEACHER_END", 0.95)
+        )
+        if (
+            abs(static_start + teacher_start - 1.0) >= 1e-8
+            or abs(static_end + teacher_end - 1.0) >= 1e-8
+        ):
+            raise RuntimeError(
+                "Explicit supervision handover requires complementary static/"
+                "teacher endpoints."
+            )
+        stage_start = int(getattr(cfg, "DABE_PU_DESPL_STAGE_START", 1))
+        stage_end = int(getattr(cfg, "DABE_PU_DESPL_STAGE_END", 20))
+        if stage_end <= stage_start:
+            raise RuntimeError(
+                "Explicit supervision handover requires "
+                "DABE_PU_DESPL_STAGE_END > DABE_PU_DESPL_STAGE_START."
+            )
+        teacher_only_start = int(
+            getattr(cfg, "DABE_PU_DESPL_TEACHER_ONLY_START", stage_end + 1)
+        )
+        reset_epoch = get_reset_epoch(cfg)
+        if (
+            teacher_only_start != stage_end + 1
+            or reset_epoch != stage_end
+            or finetune_reset_timing(cfg) != "after_epoch"
+        ):
+            raise RuntimeError(
+                "Supervision handover/reset boundary mismatch: "
+                f"stage_end={stage_end}, reset_epoch={reset_epoch}, "
+                f"reset_timing={finetune_reset_timing(cfg)!r}, "
+                f"teacher_only_start={teacher_only_start}; expected "
+                "after-epoch reset at stage_end and teacher-only at "
+                "stage_end + 1."
+            )
+        synchronized_fields = {
+            "FUSION_ORIG_DECAY_EPOCHS": stage_end,
+            "TEACHER_FUSION_PRE_RESET_EPOCHS": reset_epoch - 1,
+            "LR_LINEAR_STAGE1_EPOCHS": reset_epoch - 1,
+        }
+        mismatched = {
+            name: getattr(cfg, name, None)
+            for name, expected in synchronized_fields.items()
+            if int(getattr(cfg, name, -1)) != expected
+        }
+        if mismatched:
+            raise RuntimeError(
+                "Supervision handover stage metadata mismatch: "
+                f"{mismatched}; expected={synchronized_fields}."
+            )
+        if int(getattr(cfg, "MAX_EPOCH", -1)) < teacher_only_start:
+            raise RuntimeError(
+                "MAX_EPOCH must include the teacher-only stage: "
+                f"MAX_EPOCH={getattr(cfg, 'MAX_EPOCH', None)}, "
+                f"teacher_only_start={teacher_only_start}."
+            )
+    return mode, gamma
+
+
+def supervision_handover_audit_epochs(cfg):
+    stage_end = int(getattr(cfg, "DABE_PU_DESPL_STAGE_END", 20))
+    teacher_only_start = int(
+        getattr(cfg, "DABE_PU_DESPL_TEACHER_ONLY_START", stage_end + 1)
+    )
+    max_epoch = int(getattr(cfg, "MAX_EPOCH", teacher_only_start))
+    milestones = {1, 7, 10, 15, 20, stage_end, teacher_only_start, max_epoch}
+    if stage_end > 20:
+        milestones.add(25)
+    return tuple(sorted(epoch for epoch in milestones if 1 <= epoch <= max_epoch))
+
+
+def validate_stop_after_epoch(stop_after_epoch, max_epoch, start_epoch=1):
+    stop_after_epoch = int(stop_after_epoch)
+    max_epoch = int(max_epoch)
+    start_epoch = int(start_epoch)
+    if stop_after_epoch < 0:
+        raise ValueError("--stop_after_epoch must be 0 or a positive integer.")
+    if stop_after_epoch == 0:
+        return 0
+    if stop_after_epoch > max_epoch:
+        raise ValueError(
+            f"--stop_after_epoch={stop_after_epoch} exceeds max_epoch={max_epoch}."
+        )
+    if stop_after_epoch < start_epoch:
+        raise ValueError(
+            f"--stop_after_epoch={stop_after_epoch} is earlier than "
+            f"start_epoch={start_epoch}."
+        )
+    return stop_after_epoch
 
 
 def get_linear_scale(epoch, start, ramp_end, stop):
@@ -247,29 +1060,59 @@ def get_dabe_pu_balanced_v2_schedule(epoch, cfg):
 
 def get_dabe_pu_despl_schedule(epoch, cfg):
     epoch = int(epoch)
+    handover_mode = get_supervision_handover_mode(cfg)
     teacher_only_start = int(
         getattr(cfg, "DABE_PU_DESPL_TEACHER_ONLY_START", get_reset_epoch(cfg) + 1)
     )
     if epoch >= teacher_only_start:
-        return 0.0, 1.0
-    stage_start = int(getattr(cfg, "DABE_PU_DESPL_STAGE_START", 1))
-    stage_end = int(getattr(cfg, "DABE_PU_DESPL_STAGE_END", max(1, teacher_only_start - 1)))
-    static_weight = _linear_schedule_value(
-        epoch,
-        stage_start,
-        stage_end,
-        float(getattr(cfg, "DABE_PU_DESPL_STATIC_START", 1.0)),
-        float(getattr(cfg, "DABE_PU_DESPL_STATIC_END", 0.05)),
-    )
-    teacher_weight = _linear_schedule_value(
-        epoch,
-        stage_start,
-        stage_end,
-        float(getattr(cfg, "DABE_PU_DESPL_TEACHER_START", 0.0)),
-        float(getattr(cfg, "DABE_PU_DESPL_TEACHER_END", 0.95)),
-    )
+        static_weight, teacher_weight = 0.0, 1.0
+    else:
+        stage_start = int(getattr(cfg, "DABE_PU_DESPL_STAGE_START", 1))
+        stage_end = int(
+            getattr(
+                cfg,
+                "DABE_PU_DESPL_STAGE_END",
+                max(1, teacher_only_start - 1),
+            )
+        )
+        if handover_mode == "power":
+            _, gamma = validate_supervision_handover_config(cfg)
+            progress = float(epoch - stage_start) / float(
+                stage_end - stage_start
+            )
+            progress = max(0.0, min(1.0, progress))
+            teacher_start = float(
+                getattr(cfg, "DABE_PU_DESPL_TEACHER_START", 0.0)
+            )
+            teacher_end = float(
+                getattr(cfg, "DABE_PU_DESPL_TEACHER_END", 0.95)
+            )
+            teacher_weight = teacher_start + (
+                teacher_end - teacher_start
+            ) * (progress ** gamma)
+            static_weight = 1.0 - teacher_weight
+        else:
+            # Keep the historical operation order unchanged for existing configs.
+            static_weight = _linear_schedule_value(
+                epoch,
+                stage_start,
+                stage_end,
+                float(getattr(cfg, "DABE_PU_DESPL_STATIC_START", 1.0)),
+                float(getattr(cfg, "DABE_PU_DESPL_STATIC_END", 0.05)),
+            )
+            teacher_weight = _linear_schedule_value(
+                epoch,
+                stage_start,
+                stage_end,
+                float(getattr(cfg, "DABE_PU_DESPL_TEACHER_START", 0.0)),
+                float(getattr(cfg, "DABE_PU_DESPL_TEACHER_END", 0.95)),
+            )
     static_weight = max(0.0, min(1.0, float(static_weight)))
     teacher_weight = max(0.0, min(1.0, float(teacher_weight)))
+    assert abs(static_weight + teacher_weight - 1.0) < 1e-8, (
+        "DABE-PU supervision weights must sum to one: "
+        f"epoch={epoch}, static={static_weight}, teacher={teacher_weight}"
+    )
     return static_weight, teacher_weight
 
 
@@ -417,7 +1260,10 @@ def teacher_routing_apply_flag(cfg, branch):
     branch = str(branch).lower()
     if branch not in suffixes:
         raise ValueError(f"Unsupported teacher routing branch: {branch}")
-    if bool(getattr(cfg, "USE_ECST", False)):
+    routing_mode = get_teacher_routing_mode(cfg)
+    if routing_mode == "none":
+        return True
+    if routing_mode == "ecst" or bool(getattr(cfg, "USE_ECST", False)):
         prefix = "ECST"
     elif bool(getattr(cfg, "USE_TEPR_LITE", False)):
         prefix = "TEPR"
@@ -429,13 +1275,18 @@ def teacher_routing_apply_flag(cfg, branch):
 def validate_ecst_config(cfg):
     if not bool(getattr(cfg, "USE_ECST", False)):
         return
+    arbiter_mode = str(
+        getattr(cfg, "SOURCE_ARBITER_MODE", "residual_over_ecst")
+    ).lower()
+    sign_aware_mode = arbiter_mode == "sign_aware_pure_loss_space"
     required_flags = {
         "USE_DABE_PU": True,
         "USE_DABE_PU_DESPL_SCHEDULE": True,
         "USE_DABE_PU_STATIC_LOSS": True,
         "USE_TEACHER_BINARY_FULL_LOSS": True,
         "ECST_USE_PREUPDATE_STATS": True,
-        "ECST_RESET_MEMORY_AT_FINETUNE_RESET": True,
+        # R2b keeps source temporal evidence alive after the epoch20 reset.
+        "ECST_RESET_MEMORY_AT_FINETUNE_RESET": not sign_aware_mode,
         "USE_DAGP_SAFE_HEAD": True,
         "USE_NDR_BRANCH": True,
         "USE_NDR_COARSE_AUX": True,
@@ -530,14 +1381,26 @@ def validate_ecst_config(cfg):
         int(getattr(cfg, "ECST_MEMORY_UPDATE_START_EPOCH", -1)),
         int(getattr(cfg, "ECST_MEMORY_UPDATE_END_EPOCH", -1)),
     )
-    if schedule != (7, 15, 21, 1, 20):
-        raise RuntimeError(f"ECST schedule must be (7,15,21,1,20), got {schedule}.")
+    expected_schedule = (
+        (7, 15, 46, 1, 45)
+        if sign_aware_mode
+        else (7, 15, 21, 1, 20)
+    )
+    if schedule != expected_schedule:
+        raise RuntimeError(
+            f"ECST schedule must be {expected_schedule}, got {schedule}."
+        )
     if int(getattr(cfg, "ECST_MIN_HISTORY", -1)) != 3:
         raise RuntimeError("ECST_MIN_HISTORY must be 3.")
     if str(getattr(cfg, "ECST_MEMORY_DTYPE", "")).lower() != "float16":
         raise RuntimeError("ECST_MEMORY_DTYPE must be float16.")
-    if int(getattr(cfg, "LOSS_SIZE", -1)) != 68 or int(getattr(cfg, "MAX_EPOCH", -1)) != 45:
-        raise RuntimeError("ECST clean path requires LOSS_SIZE=68 and MAX_EPOCH=45.")
+    max_epoch = int(getattr(cfg, "MAX_EPOCH", -1))
+    allowed_max_epochs = {20, 45} if sign_aware_mode else {45}
+    if int(getattr(cfg, "LOSS_SIZE", -1)) != 68 or max_epoch not in allowed_max_epochs:
+        raise RuntimeError(
+            "ECST clean path requires LOSS_SIZE=68 and MAX_EPOCH in "
+            f"{sorted(allowed_max_epochs)}, got {max_epoch}."
+        )
     if get_reset_epoch(cfg) != 20 or finetune_reset_timing(cfg) != "after_epoch":
         raise RuntimeError("ECST clean path requires epoch20 after-epoch reset.")
     if not bool(getattr(cfg, "FINETUNE_RESET_TEACHER", False)):
@@ -546,15 +1409,41 @@ def validate_ecst_config(cfg):
         raise RuntimeError("ECST clean path requires binary teacher target.")
     if get_dabe_pu_despl_static_target_mode(cfg) != "soft":
         raise RuntimeError("ECST clean path requires soft DABE-PU static target.")
-    if not all(teacher_routing_apply_flag(cfg, branch) for branch in ("final", "coarse", "base")):
+    routing_flags = {
+        branch: teacher_routing_apply_flag(cfg, branch)
+        for branch in ("final", "coarse", "base")
+    }
+    if (
+        bool(getattr(cfg, "USE_SOURCE_ARBITER", False))
+        and arbiter_mode
+        in {"pure_loss_space", "sign_aware_pure_loss_space"}
+    ):
+        if any(routing_flags.values()):
+            raise RuntimeError(
+                "EGSA-R2 pure_loss_space requires all ECST_APPLY_* loss flags "
+                f"disabled, got {routing_flags}."
+            )
+    elif not all(routing_flags.values()):
         raise RuntimeError("ECST requires final/coarse/base teacher routing enabled.")
 
 
 def validate_source_arbiter_config(cfg):
     if not bool(getattr(cfg, "USE_SOURCE_ARBITER", False)):
         return
+    mode = str(getattr(cfg, "SOURCE_ARBITER_MODE", "")).lower()
+    if mode not in {
+        "residual_over_ecst",
+        "pure_loss_space",
+        "sign_aware_pure_loss_space",
+    }:
+        raise RuntimeError(f"Unsupported SOURCE_ARBITER_MODE={mode!r}.")
+    identity = {
+        "residual_over_ecst": "EGSA-R1",
+        "pure_loss_space": "EGSA-R2",
+        "sign_aware_pure_loss_space": "EGSA-R2b",
+    }[mode]
     if not bool(getattr(cfg, "USE_ECST", False)):
-        raise RuntimeError("EGSA-R1 requires USE_ECST=True.")
+        raise RuntimeError(f"{identity} requires USE_ECST=True.")
     required_true = (
         "USE_DABE_PU",
         "USE_DABE_PU_DESPL_SCHEDULE",
@@ -566,7 +1455,6 @@ def validate_source_arbiter_config(cfg):
         "SOURCE_ARBITER_DETACH_INPUTS",
         "SOURCE_ARBITER_DETACH_GATE_FOR_SEG",
         "SOURCE_ARBITER_SHARE_GATE_ACROSS_BRANCHES",
-        "SOURCE_ARBITER_USE_ECST_TEACHER_MAP",
         "SOURCE_ARBITER_USE_DISAGREEMENT_SCALE",
         "SOURCE_ARBITER_SAVE_MEMORY",
         "SOURCE_ARBITER_USE_UTILITY_EVALUATOR",
@@ -575,7 +1463,72 @@ def validate_source_arbiter_config(cfg):
     )
     disabled = [name for name in required_true if not bool(getattr(cfg, name, False))]
     if disabled:
-        raise RuntimeError(f"EGSA-R1 required flags are disabled: {disabled}.")
+        raise RuntimeError(f"{identity} required flags are disabled: {disabled}.")
+    use_ecst_teacher_map = bool(
+        getattr(cfg, "SOURCE_ARBITER_USE_ECST_TEACHER_MAP", False)
+    )
+    if mode == "residual_over_ecst" and not use_ecst_teacher_map:
+        raise RuntimeError("EGSA-R1 requires SOURCE_ARBITER_USE_ECST_TEACHER_MAP=True.")
+    if mode in {"pure_loss_space", "sign_aware_pure_loss_space"}:
+        if use_ecst_teacher_map:
+            raise RuntimeError(
+                f"{identity} forbids ECST as a teacher source loss weight."
+            )
+        if not bool(getattr(cfg, "SOURCE_ARBITER_USE_STRUCTURED_EVIDENCE", False)):
+            raise RuntimeError(
+                f"{identity} requires SOURCE_ARBITER_USE_STRUCTURED_EVIDENCE=True."
+            )
+    if mode == "pure_loss_space":
+        audit_enabled = bool(
+            getattr(cfg, "SOURCE_ARBITER_ECST_AUDIT_ONLY", False)
+        )
+        audit_consumers = {
+            "SOURCE_ARBITER_COMPUTE_R1_SHADOW_LOSS": bool(
+                getattr(cfg, "SOURCE_ARBITER_COMPUTE_R1_SHADOW_LOSS", False)
+            ),
+            "SOURCE_ARBITER_LOG_PLAIN_VS_ECST_TEACHER": bool(
+                getattr(
+                    cfg,
+                    "SOURCE_ARBITER_LOG_PLAIN_VS_ECST_TEACHER",
+                    False,
+                )
+            ),
+            "SOURCE_ARBITER_SAVE_GATE_VIS": bool(
+                getattr(cfg, "SOURCE_ARBITER_SAVE_GATE_VIS", False)
+            ),
+        }
+        invalid_consumers = [
+            name for name, enabled in audit_consumers.items() if enabled
+        ]
+        if not audit_enabled and invalid_consumers:
+            raise RuntimeError(
+                "EGSA-R2 ECST audit is disabled but audit consumers are "
+                f"enabled: {invalid_consumers}."
+            )
+    elif mode == "sign_aware_pure_loss_space":
+        forbidden_audit = {
+            "SOURCE_ARBITER_ECST_AUDIT_ONLY": bool(
+                getattr(cfg, "SOURCE_ARBITER_ECST_AUDIT_ONLY", False)
+            ),
+            "SOURCE_ARBITER_COMPUTE_R1_SHADOW_LOSS": bool(
+                getattr(cfg, "SOURCE_ARBITER_COMPUTE_R1_SHADOW_LOSS", False)
+            ),
+            "SOURCE_ARBITER_LOG_PLAIN_VS_ECST_TEACHER": bool(
+                getattr(
+                    cfg,
+                    "SOURCE_ARBITER_LOG_PLAIN_VS_ECST_TEACHER",
+                    False,
+                )
+            ),
+        }
+        enabled_audit = [
+            name for name, enabled_flag in forbidden_audit.items() if enabled_flag
+        ]
+        if enabled_audit:
+            raise RuntimeError(
+                "EGSA-R2b uses ECST only as structured evidence and forbids "
+                f"fixed-map audit consumers: {enabled_audit}."
+            )
     forbidden = (
         "USE_RAST",
         "USE_ESA_ASYM",
@@ -600,10 +1553,287 @@ def validate_source_arbiter_config(cfg):
     )
     enabled = [name for name in forbidden if bool(getattr(cfg, name, False))]
     if enabled:
-        raise RuntimeError(f"EGSA-R1 cannot be combined with: {enabled}.")
+        raise RuntimeError(f"{identity} cannot be combined with: {enabled}.")
+    if mode == "sign_aware_pure_loss_space":
+        expected_strings = {
+            "SOURCE_ARBITER_VERSION": "egsa_r2b_signaware_directional_v1",
+            "SOURCE_ARBITER_MODE": mode,
+            "SOURCE_ARBITER_STAGE": (
+                "stage20"
+                if int(getattr(cfg, "MAX_EPOCH", -1)) == 20
+                else "long45"
+            ),
+            "SOURCE_ARBITER_UTILITY_MODE": "directional_gradient_alignment",
+            "SOURCE_ARBITER_UTILITY_CLASS_BALANCE": (
+                "audit_v2_fixed_sqrt_inverse"
+            ),
+            "SOURCE_ARBITER_TARGET_AUDIT_SCHEMA": (
+                "egsa_r2b_target_audit_v2"
+            ),
+            "SOURCE_ARBITER_DABE_WEIGHT_INPUT_MODE": "raw_clamped",
+            "SOURCE_ARBITER_MEMORY_DTYPE": "float16",
+            "SOURCE_ARBITER_DABE_SOURCE": "dabe_pu_weighted_soft",
+            "SOURCE_ARBITER_TEACHER_SOURCE": "ema_binary_raw_bce",
+            "DABE_PU_VERSION": "pu_v11",
+            "TEACHER_FUSION_MODE": "dabe_pu_despl_sched",
+            "TEACHER_TARGET_MODE": "binary",
+            "DABE_PU_STATIC_TARGET_MODE": "soft",
+            "HEAD_TYPE": "dagp_safe",
+        }
+        mismatched = {
+            name: getattr(cfg, name, None)
+            for name, expected in expected_strings.items()
+            if str(getattr(cfg, name, "")).lower() != expected
+        }
+        if mismatched:
+            raise RuntimeError(
+                f"EGSA-R2b string configuration mismatch: {mismatched}; "
+                f"expected={expected_strings}."
+            )
+        expected_integers = {
+            "SOURCE_ARBITER_INPUT_CHANNELS": 18,
+            "SOURCE_ARBITER_OUTPUT_CHANNELS": 2,
+            "SOURCE_ARBITER_HIDDEN_1": 32,
+            "SOURCE_ARBITER_HIDDEN_2": 32,
+            "SOURCE_ARBITER_HIDDEN_3": 16,
+            "SOURCE_ARBITER_DILATION": 2,
+            "SOURCE_ARBITER_TRAIN_START_EPOCH": 7,
+            "SOURCE_ARBITER_TRAIN_RAMP_END_EPOCH": 15,
+            "SOURCE_ARBITER_TRAIN_STOP_EPOCH": 21,
+            "SOURCE_ARBITER_APPLY_START_EPOCH": 7,
+            "SOURCE_ARBITER_APPLY_RAMP_END_EPOCH": 15,
+            "SOURCE_ARBITER_APPLY_STOP_EPOCH": 46,
+            "SOURCE_ARBITER_FREEZE_AFTER_EPOCH": 20,
+            "SOURCE_ARBITER_MEMORY_UPDATE_START_EPOCH": 1,
+            "SOURCE_ARBITER_MEMORY_UPDATE_END_EPOCH": 20,
+            "SOURCE_ARBITER_MIN_MEMORY_AGE_EPOCH": 1,
+            "SOURCE_ARBITER_MAX_MEMORY_AGE_EPOCH": 2,
+            "SOURCE_ARBITER_UTILITY_MIN_HISTORY": 3,
+            "SOURCE_ARBITER_UTILITY_INTERVAL": 1,
+            "SOURCE_ARBITER_VALIDATION_MODULUS": 10,
+            "SOURCE_ARBITER_AUDIT_POS_MIN_VALID_PIXELS": 10000,
+            "SOURCE_ARBITER_AUDIT_POS_MIN_HARD_MINORITY_PIXELS": 500,
+            "SOURCE_ARBITER_AUDIT_POS_MIN_MINORITY_IMAGES": 128,
+            "SOURCE_ARBITER_AUDIT_NEG_MIN_VALID_PIXELS": 50000,
+            "SOURCE_ARBITER_AUDIT_NEG_MIN_HARD_MINORITY_PIXELS": 1000,
+            "SOURCE_ARBITER_AUDIT_NEG_MIN_MINORITY_IMAGES": 256,
+            "SOURCE_ARBITER_TARGET_AUDIT_MINI_RUN_MAX_EPOCH": 8,
+            "DABE_PU_DESPL_STAGE_END": 20,
+            "DABE_PU_DESPL_TEACHER_ONLY_START": 46,
+            "ECST_MEMORY_UPDATE_START_EPOCH": 1,
+            "ECST_MEMORY_UPDATE_END_EPOCH": 45,
+            "ECST_STOP_EPOCH": 46,
+        }
+        bad_integers = {
+            name: int(getattr(cfg, name, -1))
+            for name, expected in expected_integers.items()
+            if int(getattr(cfg, name, -1)) != expected
+        }
+        if bad_integers:
+            raise RuntimeError(
+                f"EGSA-R2b integer configuration mismatch: {bad_integers}; "
+                f"expected={expected_integers}."
+            )
+        expected_values = {
+            "SOURCE_ARBITER_POS_RESIDUAL_BOUND": 1.5,
+            "SOURCE_ARBITER_NEG_RESIDUAL_BOUND": 4.0,
+            "SOURCE_ARBITER_PRIOR_EPS": 1e-4,
+            "SOURCE_ARBITER_DISAGREEMENT_DENOM": 0.5,
+            "SOURCE_ARBITER_DINO_MARGIN_TAU": 0.05,
+            "SOURCE_ARBITER_UTILITY_TAU": 0.05,
+            "SOURCE_ARBITER_UTILITY_MIN_FUTURE_MOVE": 0.03,
+            "SOURCE_ARBITER_UTILITY_MIN_SEMANTIC_MOVE": 0.05,
+            "SOURCE_ARBITER_UTILITY_MAX_VIEW_DIFF": 0.15,
+            "SOURCE_ARBITER_UTILITY_VIEW_TAU": 0.05,
+            "SOURCE_ARBITER_UTILITY_FUTURE_WEIGHT_SCALE": 0.15,
+            "SOURCE_ARBITER_UTILITY_SEMANTIC_WEIGHT_SCALE": 0.25,
+            "SOURCE_ARBITER_UTILITY_DABE_FG_THRESH": 0.70,
+            "SOURCE_ARBITER_UTILITY_DABE_BG_THRESH": 0.30,
+            "SOURCE_ARBITER_UTILITY_DABE_WEIGHT_THRESH": 0.70,
+            "SOURCE_ARBITER_UTILITY_CLASS_WEIGHT_MIN": 0.5,
+            "SOURCE_ARBITER_UTILITY_CLASS_WEIGHT_MAX": 4.0,
+            "SOURCE_ARBITER_LAMBDA_UTILITY": 1.0,
+            "SOURCE_ARBITER_LAMBDA_PRIOR": 0.10,
+            "SOURCE_ARBITER_LAMBDA_MASS": 0.01,
+            "SOURCE_ARBITER_LAMBDA_SMOOTH": 0.005,
+            "SOURCE_ARBITER_MASS_TOLERANCE": 0.30,
+            "SOURCE_ARBITER_POST_RESET_STATIC_PRIOR": 0.05,
+            "SOURCE_ARBITER_POST_RESET_TEACHER_PRIOR": 0.95,
+            "SOURCE_ARBITER_AUDIT_POS_MIN_HARD_MINORITY_RATIO": 0.01,
+            "SOURCE_ARBITER_AUDIT_POS_MIN_SOFT_MINORITY_MASS": 2000.0,
+            "SOURCE_ARBITER_AUDIT_POS_MIN_ACTIVE_BATCH_RATIO": 0.90,
+            "SOURCE_ARBITER_AUDIT_NEG_MIN_HARD_MINORITY_RATIO": 0.01,
+            "SOURCE_ARBITER_AUDIT_NEG_MIN_SOFT_MINORITY_MASS": 2000.0,
+            "SOURCE_ARBITER_AUDIT_NEG_MIN_ACTIVE_BATCH_RATIO": 0.99,
+            "SOURCE_ARBITER_AUDIT_MAX_TOP1P_IMAGE_SHARE": 0.25,
+            "SOURCE_ARBITER_AUDIT_MAX_TOP10P_IMAGE_SHARE": 0.60,
+            "DABE_PU_DESPL_STATIC_END": 0.05,
+            "DABE_PU_DESPL_TEACHER_END": 0.95,
+        }
+        bad_values = {}
+        for name, expected in expected_values.items():
+            actual = float(getattr(cfg, name, float("nan")))
+            if not math.isfinite(actual) or abs(actual - expected) > 1e-10:
+                bad_values[name] = actual
+        if bad_values:
+            raise RuntimeError(
+                f"EGSA-R2b numeric configuration mismatch: {bad_values}; "
+                f"expected={expected_values}."
+            )
+        required_sign_flags = {
+            "SOURCE_ARBITER_ZERO_INIT_HEAD": True,
+            "SOURCE_ARBITER_UTILITY_SEPARATE_SIGN_BRANCHES": True,
+            "SOURCE_ARBITER_UTILITY_REQUIRE_DIRECTION_AGREEMENT": True,
+            "SOURCE_ARBITER_UTILITY_USE_FG_CORE": True,
+            "SOURCE_ARBITER_UTILITY_USE_BG_CORE": True,
+            "SOURCE_ARBITER_KEEP_TEMPORAL_MEMORY_AFTER_RESET": True,
+            "SOURCE_ARBITER_RELEASE_ROUTE_MEMORY_AFTER_FREEZE": True,
+            "SOURCE_ARBITER_RELEASE_UTILITY_EVALUATOR_AFTER_FREEZE": True,
+            "SOURCE_ARBITER_RESUME_ONLY": True,
+        }
+        bad_flags = {
+            name: bool(getattr(cfg, name, False))
+            for name, expected in required_sign_flags.items()
+            if bool(getattr(cfg, name, False)) is not expected
+        }
+        if bad_flags:
+            raise RuntimeError(
+                f"EGSA-R2b boolean configuration mismatch: {bad_flags}; "
+                f"expected={required_sign_flags}."
+            )
+        max_epoch = int(getattr(cfg, "MAX_EPOCH", -1))
+        exploratory_stage45 = bool(
+            getattr(cfg, "SOURCE_ARBITER_EXPLORATORY_STAGE45", False)
+        )
+        expected_resume_epoch = (
+            6 if max_epoch == 20 or exploratory_stage45 else 20
+        )
+        if int(getattr(cfg, "SOURCE_ARBITER_REQUIRED_RESUME_EPOCH", -1)) != (
+            expected_resume_epoch
+        ):
+            raise RuntimeError(
+                "EGSA-R2b resume epoch mismatch: "
+                f"MAX_EPOCH={max_epoch}, expected={expected_resume_epoch}."
+            )
+        if exploratory_stage45:
+            if max_epoch != 45 or str(
+                getattr(cfg, "SOURCE_ARBITER_STAGE", "")
+            ).lower() != "long45":
+                raise RuntimeError(
+                    "EGSA-R2b exploratory Stage45 requires MAX_EPOCH=45 and "
+                    "SOURCE_ARBITER_STAGE='long45'."
+                )
+            if not bool(
+                getattr(
+                    cfg,
+                    "SOURCE_ARBITER_AUDIT_CONCENTRATION_OVERRIDE",
+                    False,
+                )
+            ):
+                raise RuntimeError(
+                    "EGSA-R2b exploratory Stage45 requires the explicit "
+                    "concentration-only audit override."
+                )
+            fixed_weights = {
+                "SOURCE_ARBITER_POS_TEACHER_CLASS_WEIGHT": 3.4297335021,
+                "SOURCE_ARBITER_POS_DABE_CLASS_WEIGHT": 0.7226316013,
+                "SOURCE_ARBITER_NEG_TEACHER_CLASS_WEIGHT": 3.7554045924,
+                "SOURCE_ARBITER_NEG_DABE_CLASS_WEIGHT": 0.7199848699,
+            }
+            bad_fixed_weights = {
+                name: getattr(cfg, name, None)
+                for name, expected in fixed_weights.items()
+                if not math.isfinite(
+                    float(getattr(cfg, name, float("nan")))
+                )
+                or abs(float(getattr(cfg, name)) - expected) > 1e-10
+            }
+            if bad_fixed_weights:
+                raise RuntimeError(
+                    "EGSA-R2b exploratory Stage45 class-weight mismatch: "
+                    f"{bad_fixed_weights}; expected={fixed_weights}."
+                )
+            if bool(
+                getattr(
+                    cfg,
+                    "SOURCE_ARBITER_UTILITY_CLASS_WEIGHT_EPOCH_EMA",
+                    False,
+                )
+            ):
+                raise RuntimeError(
+                    "EGSA-R2b exploratory Stage45 currently requires fixed "
+                    "Audit v2 class weights; per-batch and epoch EMA updates "
+                    "are disabled."
+                )
+            if not bool(
+                getattr(
+                    cfg,
+                    "SOURCE_ARBITER_USE_EXPLORATORY_STAGE45_STOP_RULES",
+                    False,
+                )
+            ):
+                raise RuntimeError(
+                    "EGSA-R2b exploratory Stage45 requires the approved "
+                    "catastrophic-stop policy."
+                )
+            stop_integers = {
+                "SOURCE_ARBITER_STOP_RESIDUAL_SATURATION_PATIENCE": 2,
+                "SOURCE_ARBITER_STOP_NEG_CONFLICT_START_EPOCH": 11,
+                "SOURCE_ARBITER_STOP_NEG_CONFLICT_PATIENCE": 2,
+                "SOURCE_ARBITER_POST_RESET_AREA_PATIENCE": 3,
+                "SOURCE_ARBITER_STOP_AREA_CEILING_PATIENCE": 2,
+            }
+            bad_stop_integers = {
+                name: getattr(cfg, name, None)
+                for name, expected in stop_integers.items()
+                if int(getattr(cfg, name, -1)) != expected
+            }
+            stop_values = {
+                "SOURCE_ARBITER_STOP_RESIDUAL_SATURATION_MAX": 0.60,
+                "SOURCE_ARBITER_STOP_AREA_MAX_EPOCH10": 0.135,
+                "SOURCE_ARBITER_STOP_AREA_MAX_EPOCH20": 0.115,
+                "SOURCE_ARBITER_STOP_AREA_POST_RESET": 0.105,
+                "SOURCE_ARBITER_POST_RESET_MIN_EPOCH20_AREA_RATIO": 0.90,
+                "SOURCE_ARBITER_STOP_AREA_CEILING": 0.190,
+            }
+            bad_stop_values = {
+                name: getattr(cfg, name, None)
+                for name, expected in stop_values.items()
+                if not math.isfinite(
+                    float(getattr(cfg, name, float("nan")))
+                )
+                or abs(float(getattr(cfg, name)) - expected) > 1e-10
+            }
+            if bad_stop_integers or bad_stop_values:
+                raise RuntimeError(
+                    "EGSA-R2b exploratory Stage45 stop-policy mismatch: "
+                    f"integers={bad_stop_integers}, values={bad_stop_values}."
+                )
+        if bool(getattr(cfg, "ECST_RESET_MEMORY_AT_FINETUNE_RESET", True)):
+            raise RuntimeError(
+                "EGSA-R2b must preserve source temporal memory at epoch20 reset."
+            )
+        if any(
+            teacher_routing_apply_flag(cfg, branch)
+            for branch in ("final", "coarse", "base")
+        ):
+            raise RuntimeError(
+                "EGSA-R2b teacher source must be raw binary BCE with all "
+                "ECST_APPLY_* flags disabled."
+            )
+        if get_reset_epoch(cfg) != 20 or finetune_reset_timing(cfg) != "after_epoch":
+            raise RuntimeError(
+                "EGSA-R2b requires the original epoch20 after-epoch reset."
+            )
+        return
+
     expected_strings = {
-        "SOURCE_ARBITER_VERSION": "egsa_r1_delayed_cv_v1",
-        "SOURCE_ARBITER_MODE": "residual_over_ecst",
+        "SOURCE_ARBITER_VERSION": (
+            "egsa_r2_pure_delayed_cv_v1"
+            if mode == "pure_loss_space"
+            else "egsa_r1_delayed_cv_v1"
+        ),
+        "SOURCE_ARBITER_MODE": mode,
         "SOURCE_ARBITER_DABE_WEIGHT_INPUT_MODE": "raw_clamped",
         "SOURCE_ARBITER_MEMORY_DTYPE": "float16",
         "DABE_PU_VERSION": "pu_v11",
@@ -612,6 +1842,13 @@ def validate_source_arbiter_config(cfg):
         "DABE_PU_STATIC_TARGET_MODE": "soft",
         "HEAD_TYPE": "dagp_safe",
     }
+    if mode == "pure_loss_space":
+        expected_strings.update(
+            {
+                "SOURCE_ARBITER_DABE_SOURCE": "dabe_pu_weighted_soft",
+                "SOURCE_ARBITER_TEACHER_SOURCE": "ema_binary_raw_bce",
+            }
+        )
     mismatched = {
         name: getattr(cfg, name, None)
         for name, expected in expected_strings.items()
@@ -619,7 +1856,7 @@ def validate_source_arbiter_config(cfg):
     }
     if mismatched:
         raise RuntimeError(
-            f"EGSA-R1 string configuration mismatch: {mismatched}; "
+            f"{identity} string configuration mismatch: {mismatched}; "
             f"expected={expected_strings}."
         )
     integer_values = {
@@ -647,7 +1884,7 @@ def validate_source_arbiter_config(cfg):
     }
     if bad_integers:
         raise RuntimeError(
-            f"EGSA-R1 integer configuration mismatch: {bad_integers}; "
+            f"{identity} integer configuration mismatch: {bad_integers}; "
             f"expected={integer_values}."
         )
     expected_values = {
@@ -682,13 +1919,725 @@ def validate_source_arbiter_config(cfg):
             bad_values[name] = actual
     if bad_values:
         raise RuntimeError(
-            f"EGSA-R1 numeric configuration mismatch: {bad_values}; "
+            f"{identity} numeric configuration mismatch: {bad_values}; "
             f"expected={expected_values}."
         )
     if not bool(getattr(cfg, "SOURCE_ARBITER_ZERO_INIT_HEAD", False)):
-        raise RuntimeError("EGSA-R1 requires a zero-initialized router head.")
+        raise RuntimeError(f"{identity} requires a zero-initialized router head.")
     if get_reset_epoch(cfg) != 20 or finetune_reset_timing(cfg) != "after_epoch":
-        raise RuntimeError("EGSA-R1 requires the original epoch20 after-epoch reset.")
+        raise RuntimeError(
+            f"{identity} requires the original epoch20 after-epoch reset."
+        )
+
+
+def _resolve_main_relative_path(value):
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    return path.resolve()
+
+
+def _sha256_file(path, chunk_size=8 * 1024 * 1024):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while True:
+            chunk = handle.read(int(chunk_size))
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_r2b_target_audit(cfg):
+    mode = str(getattr(cfg, "SOURCE_ARBITER_MODE", "")).lower()
+    if mode != "sign_aware_pure_loss_space":
+        return None
+    if not bool(getattr(cfg, "SOURCE_ARBITER_REQUIRE_TARGET_AUDIT", True)):
+        raise RuntimeError("EGSA-R2b requires the directional target audit.")
+
+    audit_path = _resolve_main_relative_path(
+        getattr(cfg, "SOURCE_ARBITER_TARGET_AUDIT_PATH", "")
+    )
+    source_path = _resolve_main_relative_path(
+        getattr(cfg, "SOURCE_ARBITER_TARGET_AUDIT_SOURCE_CKPT", "")
+    )
+    project_root = Path(__file__).resolve().parent.parent
+    for label, path in (("audit", audit_path), ("source checkpoint", source_path)):
+        try:
+            path.relative_to(project_root)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"EGSA-R2b {label} must be inside {project_root}, got {path}."
+            ) from exc
+        if not path.is_file():
+            raise FileNotFoundError(f"EGSA-R2b {label} not found: {path}")
+
+    expected_sha = str(
+        getattr(cfg, "SOURCE_ARBITER_TARGET_AUDIT_SOURCE_SHA256", "")
+    ).lower()
+    actual_sha = _sha256_file(source_path)
+    if actual_sha != expected_sha:
+        raise RuntimeError(
+            "EGSA-R2b audit source checkpoint hash mismatch: "
+            f"{actual_sha} != {expected_sha}."
+        )
+    try:
+        artifact = json.loads(audit_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Cannot read EGSA-R2b target audit artifact: {audit_path}"
+        ) from exc
+    expected_schema = str(
+        getattr(
+            cfg,
+            "SOURCE_ARBITER_TARGET_AUDIT_SCHEMA",
+            "egsa_r2b_target_audit_v2",
+        )
+    )
+    if artifact.get("schema_version") != expected_schema:
+        raise RuntimeError(
+            "EGSA-R2b target audit schema mismatch: "
+            f"{artifact.get('schema_version')!r} != {expected_schema!r}."
+        )
+    source = artifact.get("source_checkpoint", {})
+    if (
+        int(source.get("epoch", -1)) != 6
+        or str(source.get("sha256", "")).lower() != actual_sha
+    ):
+        raise RuntimeError(
+            "EGSA-R2b target audit source identity does not match the "
+            f"canonical epoch6 checkpoint: {source!r}."
+        )
+    branches = artifact.get("branches", {})
+    admission = evaluate_r2b_target_audit_v2_admission(
+        branches,
+        cfg,
+        full_audit=artifact.get("full_audit") is True,
+        processed_images=artifact.get("processed_images"),
+        expected_images=4040,
+        diagnostic_only=artifact.get("diagnostic_only") is True,
+    )
+    failures = list(admission["failures"])
+    artifact_failures = artifact.get("failures")
+    if not isinstance(artifact_failures, list) or sorted(
+        str(item) for item in artifact_failures
+    ) != sorted(failures):
+        raise RuntimeError(
+            "EGSA-R2b Audit v2 failure list does not match recomputed "
+            f"admission: artifact={artifact_failures!r}, recomputed={failures!r}."
+        )
+    strict_pass = bool(admission["passed"])
+    if bool(artifact.get("passed")) is not strict_pass:
+        raise RuntimeError(
+            "EGSA-R2b Audit v2 strict-pass marker disagrees with recomputed "
+            f"admission: artifact={artifact.get('passed')!r}, "
+            f"recomputed={strict_pass}."
+        )
+
+    override_enabled = bool(
+        getattr(cfg, "SOURCE_ARBITER_AUDIT_CONCENTRATION_OVERRIDE", False)
+    )
+    allowed_failures = list(
+        getattr(cfg, "SOURCE_ARBITER_AUDIT_ALLOWED_FAILURES", [])
+    )
+    canonical_allowed_failures = [
+        "positive:top_1_percent_images_minority_share",
+        "positive:top_10_percent_images_minority_share",
+    ]
+    if override_enabled and allowed_failures != canonical_allowed_failures:
+        raise RuntimeError(
+            "EGSA-R2b concentration override may allow only the two fixed "
+            "positive-branch concentration failures, in canonical order: "
+            f"{allowed_failures!r} != {canonical_allowed_failures!r}."
+        )
+    override = evaluate_r2b_audit_concentration_override(
+        failures,
+        allowed_failures,
+        full_audit=artifact.get("full_audit") is True,
+        processed_images=artifact.get("processed_images", -1),
+        expected_images=4040,
+    )
+    SOURCE_ARBITER_AUDIT_OVERRIDE_PASSED = bool(
+        override_enabled and override["override_passed"]
+    )
+    override_passed = SOURCE_ARBITER_AUDIT_OVERRIDE_PASSED
+    if (
+        bool(getattr(cfg, "SOURCE_ARBITER_TARGET_AUDIT_REQUIRE_PASS", True))
+        and not strict_pass
+        and not override_passed
+    ):
+        raise RuntimeError(
+            "EGSA-R2b target audit did not strictly pass and no valid "
+            "concentration-only override applies: "
+            + "; ".join(failures)
+        )
+    if not strict_pass and not override_passed:
+        raise RuntimeError(
+            "EGSA-R2b target audit does not authorize this run: "
+            f"failures={failures}, unexpected={override['unexpected_failures']}."
+        )
+    if (
+        strict_pass
+        and str(getattr(cfg, "SOURCE_ARBITER_STAGE", "")).lower() == "stage20"
+        and artifact.get("mini_run_authorized") is not True
+    ):
+        raise RuntimeError(
+            "EGSA-R2b Audit v2 did not authorize the epoch7-8 mini-run."
+        )
+    if artifact.get("stage20_authorized") is not False:
+        raise RuntimeError(
+            "EGSA-R2b Audit v2 must not directly authorize Stage20."
+        )
+    weight_min = float(
+        getattr(cfg, "SOURCE_ARBITER_UTILITY_CLASS_WEIGHT_MIN", 0.5)
+    )
+    weight_max = float(
+        getattr(cfg, "SOURCE_ARBITER_UTILITY_CLASS_WEIGHT_MAX", 4.0)
+    )
+    class_weights = {}
+    suggested = artifact.get("suggested_class_weights", {})
+    for branch_name in ("positive", "negative"):
+        branch = branches.get(branch_name, {})
+        expected_weights = compute_r2b_audit_class_weights(
+            branch.get("valid_pixels", 0),
+            branch.get("teacher_preferred_pixels", 0),
+            branch.get("dabe_preferred_pixels", 0),
+            weight_min=weight_min,
+            weight_max=weight_max,
+        )
+        branch_weights = suggested.get(branch_name, {})
+        for source_name in ("teacher", "dabe"):
+            actual = float(branch_weights.get(source_name, float("nan")))
+            expected = float(expected_weights[source_name])
+            if not math.isfinite(actual) or abs(actual - expected) > 1e-10:
+                raise RuntimeError(
+                    "EGSA-R2b Audit v2 class-weight mismatch: "
+                    f"{branch_name}.{source_name}={actual} != {expected}."
+                )
+        configured_weights = {
+            "teacher": float(
+                getattr(
+                    cfg,
+                    f"SOURCE_ARBITER_{branch_name.upper()}_TEACHER_CLASS_WEIGHT",
+                    expected_weights["teacher"],
+                )
+            ),
+            "dabe": float(
+                getattr(
+                    cfg,
+                    f"SOURCE_ARBITER_{branch_name.upper()}_DABE_CLASS_WEIGHT",
+                    expected_weights["dabe"],
+                )
+            ),
+        }
+        for source_name in ("teacher", "dabe"):
+            configured = configured_weights[source_name]
+            expected = float(expected_weights[source_name])
+            if (
+                not math.isfinite(configured)
+                or not weight_min <= configured <= weight_max
+                or abs(configured - expected) > 1e-10
+            ):
+                raise RuntimeError(
+                    "EGSA-R2b configured class weight does not match the full "
+                    "Audit v2 result: "
+                    f"{branch_name}.{source_name}={configured} != {expected}."
+                )
+        class_weights[branch_name] = configured_weights
+    stage45_authorized = bool(
+        str(getattr(cfg, "SOURCE_ARBITER_STAGE", "")).lower() == "long45"
+        and override_passed
+    )
+    return {
+        "path": str(audit_path),
+        "source_path": str(source_path),
+        "source_sha256": actual_sha,
+        "schema_version": expected_schema,
+        "positive_valid_pixels": int(branches["positive"]["valid_pixels"]),
+        "negative_valid_pixels": int(branches["negative"]["valid_pixels"]),
+        "strict_pass": strict_pass,
+        "audit_failures": failures,
+        "allowed_failures": allowed_failures,
+        "unexpected_failures": list(override["unexpected_failures"]),
+        "concentration_override_enabled": override_enabled,
+        "concentration_override_passed": override_passed,
+        "SOURCE_ARBITER_AUDIT_OVERRIDE_PASSED": (
+            SOURCE_ARBITER_AUDIT_OVERRIDE_PASSED
+        ),
+        "mini_run_authorized": bool(
+            strict_pass and artifact.get("mini_run_authorized") is True
+        ),
+        "stage20_authorized": False,
+        "stage45_exploratory_training_authorized": stage45_authorized,
+        "class_weights": class_weights,
+    }
+
+
+def load_r2b_paired_r1_areas(cfg):
+    if str(getattr(cfg, "SOURCE_ARBITER_MODE", "")).lower() != (
+        "sign_aware_pure_loss_space"
+    ):
+        return {}
+    if bool(
+        getattr(cfg, "SOURCE_ARBITER_USE_EXPLORATORY_STAGE45_STOP_RULES", False)
+    ):
+        return {}
+    log_path = _resolve_main_relative_path(
+        getattr(cfg, "SOURCE_ARBITER_PAIRED_R1_LOG", "")
+    )
+    if not log_path.is_file():
+        raise FileNotFoundError(
+            f"EGSA-R2b paired R1 train log not found: {log_path}"
+        )
+    pattern = re.compile(
+        r"\[PredArea\]\s+epoch=(\d+).*?"
+        r"student_pred_area_mean=([0-9.eE+-]+)"
+    )
+    areas = {}
+    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = pattern.search(line)
+        if match:
+            areas[int(match.group(1))] = float(match.group(2))
+    if not areas:
+        raise RuntimeError(
+            f"EGSA-R2b could not parse any paired R1 areas from {log_path}."
+        )
+    return areas
+
+
+def evaluate_r2b_exploratory_stop_conditions(
+    cfg,
+    epoch,
+    source_sums,
+    source_batches,
+    student_area,
+    monitor_state,
+):
+    """Evaluate only the explicitly approved R2b exploratory stop rules."""
+    state = dict(monitor_state or {})
+    batches = max(int(source_batches), 1)
+    avg = {
+        name: float(value) / float(batches)
+        for name, value in source_sums.items()
+    }
+    reasons = []
+    details = {
+        "epoch": int(epoch),
+        "student_area": float(student_area),
+        "source_batches": int(source_batches),
+    }
+    for name in (
+        "gate_teacher_positive_mean",
+        "gate_teacher_positive_std",
+        "gate_teacher_negative_mean",
+        "gate_teacher_negative_std",
+        "gate_teacher_mean",
+        "gate_teacher_std",
+        "residual_positive_mean",
+        "residual_positive_std",
+        "residual_negative_mean",
+        "residual_negative_std",
+        "positive_head_gradient_norm",
+        "negative_head_gradient_norm",
+    ):
+        details[name] = float(avg.get(name, 0.0))
+
+    nonfinite = [
+        name
+        for name, value in {"student_area": student_area, **avg}.items()
+        if not math.isfinite(float(value))
+    ]
+    if nonfinite:
+        reasons.append("nan_or_inf")
+        details["nonfinite_fields"] = nonfinite
+
+    saturation_max = float(
+        getattr(cfg, "SOURCE_ARBITER_STOP_RESIDUAL_SATURATION_MAX", 0.60)
+    )
+    saturation_patience = int(
+        getattr(cfg, "SOURCE_ARBITER_STOP_RESIDUAL_SATURATION_PATIENCE", 2)
+    )
+    for branch in ("positive", "negative"):
+        value = float(
+            avg.get(f"residual_{branch}_saturation_ratio", 0.0)
+        )
+        key = f"{branch}_saturation_streak"
+        state[key] = int(state.get(key, 0)) + 1 if value > saturation_max else 0
+        details[f"residual_{branch}_saturation_ratio"] = value
+        details[key] = int(state[key])
+        if int(state[key]) >= saturation_patience:
+            reasons.append(f"{branch}_residual_saturation")
+
+    conflict_start = int(
+        getattr(cfg, "SOURCE_ARBITER_STOP_NEG_CONFLICT_START_EPOCH", 11)
+    )
+    conflict_gate = float(
+        avg.get("gate_negative_teacher_bg_fg_core", 0.0)
+    )
+    teacher_prior = float(avg.get("teacher_prior", 0.0))
+    conflict_not_below = (
+        int(epoch) >= conflict_start and conflict_gate >= teacher_prior
+    )
+    conflict_key = "negative_conflict_not_below_prior_streak"
+    state[conflict_key] = (
+        int(state.get(conflict_key, 0)) + 1 if conflict_not_below else 0
+    )
+    details.update(
+        {
+            "negative_gate_teacher_bg_dabe_fg_core": conflict_gate,
+            "teacher_prior": teacher_prior,
+            conflict_key: int(state[conflict_key]),
+        }
+    )
+    if int(state[conflict_key]) >= int(
+        getattr(cfg, "SOURCE_ARBITER_STOP_NEG_CONFLICT_PATIENCE", 2)
+    ):
+        reasons.append("negative_conflict_gate_not_below_teacher_prior")
+
+    if int(epoch) <= 10:
+        area_floor = float(
+            getattr(cfg, "SOURCE_ARBITER_STOP_AREA_MAX_EPOCH10", 0.135)
+        )
+    elif int(epoch) <= 20:
+        area_floor = float(
+            getattr(cfg, "SOURCE_ARBITER_STOP_AREA_MAX_EPOCH20", 0.115)
+        )
+    else:
+        area_floor = float(
+            getattr(cfg, "SOURCE_ARBITER_STOP_AREA_POST_RESET", 0.105)
+        )
+    details["student_area_floor"] = area_floor
+    if float(student_area) < area_floor:
+        reasons.append("student_area_below_phase_floor")
+
+    if int(epoch) == 20:
+        state["epoch20_student_area"] = float(student_area)
+    epoch20_area = state.get("epoch20_student_area")
+    post_reset_below = (
+        int(epoch) >= 21
+        and epoch20_area is not None
+        and float(student_area)
+        < float(
+            getattr(
+                cfg,
+                "SOURCE_ARBITER_POST_RESET_MIN_EPOCH20_AREA_RATIO",
+                0.90,
+            )
+        )
+        * float(epoch20_area)
+    )
+    post_reset_key = "post_reset_area_below_streak"
+    state[post_reset_key] = (
+        int(state.get(post_reset_key, 0)) + 1 if post_reset_below else 0
+    )
+    if int(state[post_reset_key]) >= int(
+        getattr(cfg, "SOURCE_ARBITER_POST_RESET_AREA_PATIENCE", 3)
+    ):
+        reasons.append("post_reset_area_below_epoch20_ratio")
+
+    area_above = float(student_area) > float(
+        getattr(cfg, "SOURCE_ARBITER_STOP_AREA_CEILING", 0.190)
+    )
+    area_above_key = "area_above_ceiling_streak"
+    state[area_above_key] = (
+        int(state.get(area_above_key, 0)) + 1 if area_above else 0
+    )
+    if int(state[area_above_key]) >= int(
+        getattr(cfg, "SOURCE_ARBITER_STOP_AREA_CEILING_PATIENCE", 2)
+    ):
+        reasons.append("student_area_above_ceiling")
+
+    details.update(
+        {
+            "epoch20_student_area": (
+                None if epoch20_area is None else float(epoch20_area)
+            ),
+            post_reset_key: int(state[post_reset_key]),
+            area_above_key: int(state[area_above_key]),
+        }
+    )
+    state["last_epoch"] = int(epoch)
+    return sorted(set(reasons)), details, state
+
+
+def evaluate_r2b_stop_conditions(
+    cfg,
+    epoch,
+    source_sums,
+    source_batches,
+    student_area,
+    val_results,
+    paired_r1_areas,
+    monitor_state,
+):
+    """Evaluate R2b safety criteria without changing the training loss."""
+    if str(getattr(cfg, "SOURCE_ARBITER_MODE", "")).lower() != (
+        "sign_aware_pure_loss_space"
+    ):
+        return [], {}, monitor_state
+    if bool(
+        getattr(cfg, "SOURCE_ARBITER_USE_EXPLORATORY_STAGE45_STOP_RULES", False)
+    ):
+        return evaluate_r2b_exploratory_stop_conditions(
+            cfg=cfg,
+            epoch=epoch,
+            source_sums=source_sums,
+            source_batches=source_batches,
+            student_area=student_area,
+            monitor_state=monitor_state,
+        )
+    state = dict(monitor_state or {})
+    batches = max(int(source_batches), 1)
+    avg = {
+        name: float(value) / float(batches)
+        for name, value in source_sums.items()
+    }
+    reasons = []
+    details = {
+        "epoch": int(epoch),
+        "student_area": float(student_area),
+    }
+
+    train_scale = float(avg.get("train_scale", 0.0))
+    apply_scale = float(avg.get("influence_scale", 0.0))
+    negative_valid = float(
+        source_sums.get("negative_branch_valid_pixels", 0.0)
+    )
+    negative_teacher = float(
+        source_sums.get("negative_branch_teacher_preferred_count", 0.0)
+    )
+    negative_dabe = float(
+        source_sums.get("negative_branch_dabe_preferred_count", 0.0)
+    )
+    negative_teacher_ratio = negative_teacher / max(negative_valid, 1.0)
+    negative_dabe_ratio = negative_dabe / max(negative_valid, 1.0)
+    negative_dabe_recall = float(
+        avg.get("negative_branch_dabe_recall", 0.0)
+    )
+    details.update(
+        {
+            "train_scale": train_scale,
+            "apply_scale": apply_scale,
+            "negative_valid_pixels": negative_valid,
+            "negative_teacher_preferred_ratio": negative_teacher_ratio,
+            "negative_dabe_preferred_ratio": negative_dabe_ratio,
+            "negative_dabe_recall": negative_dabe_recall,
+        }
+    )
+
+    if train_scale > 0.0 and negative_valid > 0.0:
+        if negative_teacher_ratio > float(
+            getattr(
+                cfg,
+                "SOURCE_ARBITER_STOP_NEG_TEACHER_PREFERRED_MAX",
+                0.99,
+            )
+        ):
+            reasons.append("negative_teacher_preferred_ratio_too_high")
+        if negative_dabe_ratio < float(
+            getattr(
+                cfg,
+                "SOURCE_ARBITER_STOP_NEG_DABE_PREFERRED_MIN",
+                0.01,
+            )
+        ):
+            reasons.append("negative_dabe_preferred_ratio_too_low")
+        if negative_dabe_recall < float(
+            getattr(
+                cfg,
+                "SOURCE_ARBITER_STOP_NEG_DABE_RECALL_MIN",
+                0.20,
+            )
+        ):
+            reasons.append("negative_dabe_recall_too_low")
+
+        negative_correction_ratio = float(
+            avg.get("negative_below_prior_ratio", 0.0)
+        )
+        no_correction = negative_correction_ratio < float(
+            getattr(
+                cfg,
+                "SOURCE_ARBITER_STOP_NEG_CORRECTION_MIN_RATIO",
+                0.01,
+            )
+        )
+        no_correction_streak = (
+            int(state.get("no_negative_correction_streak", 0)) + 1
+            if no_correction
+            else 0
+        )
+        state["no_negative_correction_streak"] = no_correction_streak
+        details["negative_correction_ratio"] = negative_correction_ratio
+        details["no_negative_correction_streak"] = no_correction_streak
+        if no_correction_streak >= int(
+            getattr(
+                cfg,
+                "SOURCE_ARBITER_STOP_NO_NEG_CORRECTION_PATIENCE",
+                2,
+            )
+        ):
+            reasons.append("negative_correction_absent")
+    else:
+        state["no_negative_correction_streak"] = 0
+
+    if apply_scale > 0.0:
+        teacher_prior = float(avg.get("teacher_prior", 0.0))
+        conflict_gate = max(
+            float(avg.get("gate_negative_teacher_bg_fg_core", 0.0)),
+            float(avg.get("gate_negative_teacher_bg_high_fg", 0.0)),
+        )
+        negative_saturation = float(
+            avg.get("residual_negative_saturation_ratio", 0.0)
+        )
+        applied_gate = float(avg.get("gate_teacher_mean", 0.0))
+        details.update(
+            {
+                "teacher_prior": teacher_prior,
+                "negative_conflict_gate": conflict_gate,
+                "negative_residual_saturation_ratio": negative_saturation,
+                "applied_teacher_gate_mean": applied_gate,
+            }
+        )
+        if (
+            float(avg.get("dangerous_negative_ratio", 0.0)) > 0.0
+            and conflict_gate
+            > teacher_prior
+            + float(
+                getattr(
+                    cfg,
+                    "SOURCE_ARBITER_STOP_CONFLICT_GATE_TOLERANCE",
+                    1e-6,
+                )
+            )
+        ):
+            reasons.append("negative_conflict_gate_above_prior")
+        if negative_saturation > float(
+            getattr(
+                cfg,
+                "SOURCE_ARBITER_STOP_NEG_SATURATION_MAX",
+                0.60,
+            )
+        ):
+            reasons.append("negative_residual_saturation")
+        if applied_gate >= float(
+            getattr(
+                cfg,
+                "SOURCE_ARBITER_STOP_APPLIED_GATE_NEAR_ONE",
+                0.99,
+            )
+        ):
+            reasons.append("applied_teacher_gate_near_one")
+
+    paired_area = paired_r1_areas.get(int(epoch))
+    paired_below = False
+    if paired_area is not None:
+        paired_ratio = float(student_area) / max(float(paired_area), 1e-12)
+        paired_below = paired_ratio < float(
+            getattr(cfg, "SOURCE_ARBITER_MIN_PAIRED_R1_AREA_RATIO", 0.85)
+        )
+        details["paired_r1_area"] = float(paired_area)
+        details["paired_r1_area_ratio"] = paired_ratio
+    paired_streak = (
+        int(state.get("paired_area_below_streak", 0)) + 1
+        if paired_below
+        else 0
+    )
+    state["paired_area_below_streak"] = paired_streak
+    details["paired_area_below_streak"] = paired_streak
+    if paired_streak >= int(
+        getattr(cfg, "SOURCE_ARBITER_AREA_STOP_PATIENCE", 2)
+    ):
+        reasons.append("student_area_below_paired_r1")
+
+    previous_area = state.get("previous_student_area")
+    if (
+        previous_area is not None
+        and float(student_area)
+        < float(getattr(cfg, "SOURCE_ARBITER_MIN_ABSOLUTE_AREA", 0.115))
+        and float(student_area) < float(previous_area)
+    ):
+        reasons.append("student_area_below_absolute_floor_and_decreasing")
+    if int(epoch) == 20:
+        state["epoch20_student_area"] = float(student_area)
+    epoch20_area = state.get("epoch20_student_area")
+    if (
+        int(epoch) > 20
+        and epoch20_area is not None
+        and float(student_area)
+        < float(
+            getattr(
+                cfg,
+                "SOURCE_ARBITER_POST_RESET_MIN_EPOCH20_AREA_RATIO",
+                0.85,
+            )
+        )
+        * float(epoch20_area)
+    ):
+        reasons.append("post_reset_area_below_epoch20_floor")
+    state["previous_student_area"] = float(student_area)
+    details["epoch20_student_area"] = (
+        None if epoch20_area is None else float(epoch20_area)
+    )
+
+    dataset_name = "TE-CAMO" if "TE-CAMO" in val_results else str(
+        getattr(cfg, "BEST_DATASET", "")
+    )
+    metrics = val_results.get(dataset_name)
+    metric_history = list(state.get("te_camo_metric_history", []))
+    if isinstance(metrics, dict):
+        current_metrics = {
+            "epoch": int(epoch),
+            "SMeasure": float(metrics["SMeasure"]),
+            "WFM": float(metrics["WFM"]),
+            "E_MEAN": float(metrics["E_MEAN"]),
+            "F_MEAN": float(metrics["F_MEAN"]),
+            "MAE": float(metrics["MAE"]),
+            "student_area": float(student_area),
+        }
+        metric_history.append(current_metrics)
+        metric_history = metric_history[-8:]
+        details["validation_dataset"] = dataset_name
+        details["validation_metrics"] = current_metrics
+        patience = int(
+            getattr(cfg, "SOURCE_ARBITER_STOP_PERFORMANCE_PATIENCE", 3)
+        )
+        required_points = patience + 1
+        if len(metric_history) >= required_points:
+            recent = metric_history[-required_points:]
+            structure_declines = all(
+                all(
+                    recent[index][name] < recent[index - 1][name]
+                    for name in ("SMeasure", "WFM", "E_MEAN")
+                )
+                for index in range(1, len(recent))
+            )
+            mae_rises = all(
+                recent[index]["MAE"] > recent[index - 1]["MAE"]
+                for index in range(1, len(recent))
+            )
+            if structure_declines:
+                reasons.append("validation_structure_metrics_decline")
+            if mae_rises:
+                reasons.append("validation_mae_rises")
+        if len(metric_history) >= 2:
+            previous = metric_history[-2]
+            current = metric_history[-1]
+            if (
+                current["student_area"] < previous["student_area"]
+                and current["F_MEAN"]
+                <= previous["F_MEAN"]
+                - float(
+                    getattr(
+                        cfg,
+                        "SOURCE_ARBITER_STOP_FM_MATERIAL_DROP",
+                        0.01,
+                    )
+                )
+            ):
+                reasons.append("area_and_fmean_materially_decline")
+    state["te_camo_metric_history"] = metric_history
+    state["last_epoch"] = int(epoch)
+    return sorted(set(reasons)), details, state
 
 
 def validate_tepr_lite_config(cfg):
@@ -4111,7 +6060,29 @@ def teacher_route_bce_with_logits(
     eps=1e-6,
 ):
     """Apply the active teacher router without coupling ECST to legacy routing."""
-    if bool(getattr(cfg, "USE_ECST", False)):
+    routing_mode = get_teacher_routing_mode(cfg)
+    if routing_mode == "none":
+        if teacher_map is None:
+            raise RuntimeError("No-ECST teacher route map is unavailable")
+        if tuple(logits.shape) != tuple(target.shape) or tuple(
+            teacher_map.shape
+        ) != tuple(target.shape):
+            raise RuntimeError(
+                "No-ECST logits/target/map shape mismatch: "
+                f"{list(logits.shape)}/{list(target.shape)}/"
+                f"{list(teacher_map.shape)}"
+            )
+        expected = torch.ones_like(
+            teacher_map,
+            dtype=teacher_map.dtype,
+            device=teacher_map.device,
+        )
+        if teacher_map.requires_grad or not torch.equal(teacher_map, expected):
+            raise RuntimeError(
+                "TEACHER_ROUTING_MODE='none' requires an exact detached all-one map"
+            )
+        return F.binary_cross_entropy_with_logits(logits, target, reduction="mean")
+    if routing_mode == "ecst" or bool(getattr(cfg, "USE_ECST", False)):
         return teacher_weighted_bce_with_logits(
             logits,
             target,
@@ -4234,6 +6205,98 @@ def make_ecst_inactive_stats(batch, teacher_prob, device):
         "ecst_skipped_no_fg_proto": 0,
         "ecst_skipped_no_bg_proto": 0,
     }
+
+
+def make_ecst_evidence_only_stats(
+    cfg,
+    batch,
+    teacher_prob,
+    history_count,
+    epoch,
+    states,
+    device,
+):
+    """Summarize R2 evidence without constructing the fixed ECST map."""
+    stats = make_ecst_inactive_stats(batch, teacher_prob, device)
+    masks = states["masks"]
+    extent_teacher_bg = states["extent_teacher_bg"]
+    reliability_count = float(
+        extent_teacher_bg.float().sum().detach().item()
+    )
+    reliability_sum = float(
+        (
+            states["bg_reliability"] * extent_teacher_bg.float()
+        ).sum().detach().item()
+    )
+    stats.update(
+        {
+            "ecst_scale": float(get_ecst_scale(cfg, epoch)),
+            "memory_active": True,
+            "history_count_min": int(history_count.min().detach().item()),
+            "history_count_mean": float(
+                history_count.float().mean().detach().item()
+            ),
+            "history_count_max": int(history_count.max().detach().item()),
+            "history_valid_ratio": float(
+                states["history_valid"].float().mean().detach().item()
+            ),
+            "temporal_mean_min": float(
+                states["mean"].min().detach().item()
+            ),
+            "temporal_mean_mean": float(
+                states["mean"].mean().detach().item()
+            ),
+            "temporal_mean_max": float(
+                states["mean"].max().detach().item()
+            ),
+            "temporal_var_min": float(
+                states["variance"].min().detach().item()
+            ),
+            "temporal_var_mean": float(
+                states["variance"].mean().detach().item()
+            ),
+            "temporal_var_max": float(
+                states["variance"].max().detach().item()
+            ),
+            "temporal_reliability_mean": float(
+                states["bg_reliability"].mean().detach().item()
+            ),
+            "fg_core_conflict_count": int(
+                states["fg_conflict"].sum().detach().item()
+            ),
+            "fg_core_count": int(masks["fg_core"].sum().detach().item()),
+            "bg_core_conflict_count": int(
+                states["bg_conflict"].sum().detach().item()
+            ),
+            "bg_core_count": int(masks["bg_core"].sum().detach().item()),
+            "extent_teacher_fg_count": int(
+                states["extent_teacher_fg"].sum().detach().item()
+            ),
+            "extent_teacher_bg_count": int(
+                extent_teacher_bg.sum().detach().item()
+            ),
+            "extent_count": int(masks["extent"].sum().detach().item()),
+            "dino_margin_min": float(
+                states["margin_68"].min().detach().item()
+            ),
+            "dino_margin_mean": float(
+                states["margin_68"].mean().detach().item()
+            ),
+            "dino_margin_max": float(
+                states["margin_68"].max().detach().item()
+            ),
+            "audit_available": False,
+            **states["margin_stats"],
+        }
+    )
+    stats["state_sums"]["extent_bg_reliability"] = reliability_sum
+    stats["state_counts"]["extent_bg_reliability"] = reliability_count
+    stats["state_means"]["extent_bg_reliability"] = (
+        reliability_sum / reliability_count
+        if reliability_count > 0.0
+        else 0.0
+    )
+    return stats
 
 
 def new_ecst_epoch_accumulator():
@@ -6924,6 +8987,78 @@ def restore_rng_state(state):
         torch.cuda.set_rng_state_all(state["cuda"])
 
 
+def build_ap_stcr_protocol_fingerprint(cfg, ap_stcr):
+    payload = {
+        "schema_version": "ap_stcr_protocol_v1",
+        "manifest_hash": ap_stcr.manifest_hash,
+        "ap_stcr": dict(getattr(cfg, "AP_STCR")),
+        "protected_protocol": {
+            name: getattr(cfg, name)
+            for name in (
+                "BACKBONE_KEY",
+                "DABE_PU_VERSION",
+                "P_INIT_MODE",
+                "TEACHER_FUSION_MODE",
+                "TEACHER_ROUTING_MODE",
+                "STATIC_WEIGHT_MODE",
+                "DABE_PU_DESPL_STAGE_START",
+                "DABE_PU_DESPL_STAGE_END",
+                "DABE_PU_DESPL_TEACHER_ONLY_START",
+                "DABE_PU_DESPL_STATIC_START",
+                "DABE_PU_DESPL_STATIC_END",
+                "DABE_PU_DESPL_TEACHER_START",
+                "DABE_PU_DESPL_TEACHER_END",
+                "FINETUNE_RESET_EPOCH",
+                "FINETUNE_RESET_TIMING",
+                "FINETUNE_RESET_TEACHER",
+                "LOSS_SIZE",
+                "LAMBDA_NDR_COARSE_AUX",
+                "LAMBDA_BASE_AUX",
+                "LAMBDA_BASE_AUX_AFTER_RESET",
+            )
+        },
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest(), payload
+
+
+def ap_stcr_checkpoint_phase(cfg, epoch):
+    epoch = int(epoch)
+    reset_epoch = get_reset_epoch(cfg)
+    if (
+        is_after_epoch_finetune_reset(cfg)
+        and epoch == reset_epoch
+    ):
+        return "pending_after_epoch_reset"
+    if epoch > reset_epoch:
+        return "post_reset_active"
+    return "pre_reset_active"
+
+
+def build_ap_stcr_checkpoint_extra(
+    cfg,
+    epoch,
+    global_step,
+    ap_stcr,
+    protocol_fingerprint,
+    train_loader_generator,
+):
+    return {
+        "ap_stcr_runtime_state": ap_stcr.state_dict(),
+        "ap_stcr_protocol_fingerprint": str(protocol_fingerprint),
+        "ap_stcr_manifest_hash": str(ap_stcr.manifest_hash),
+        "checkpoint_phase": ap_stcr_checkpoint_phase(cfg, epoch),
+        "global_step": int(global_step),
+        "rng_state": capture_rng_state(),
+        "train_loader_generator_state": train_loader_generator.get_state(),
+    }
+
+
 def save_checkpoint(
     path,
     epoch,
@@ -6959,6 +9094,1775 @@ def save_checkpoint(
     torch.save(payload, path)
 
 
+def _pssf_bank_dtype(name):
+    normalized = str(name).lower()
+    if normalized == "float16":
+        return torch.float16
+    raise RuntimeError(
+        f"PSSF CPU bank dtype must be 'float16', got {name!r}."
+    )
+
+
+def _pssf_module_has_grad(module):
+    return any(parameter.grad is not None for parameter in module.parameters())
+
+
+def _pssf_assert_no_grad(module, label):
+    leaked = [
+        name
+        for name, parameter in module.named_parameters()
+        if parameter.grad is not None
+    ]
+    if leaked:
+        raise RuntimeError(
+            f"PSSF gradient isolation failed for {label}; "
+            f"first leaked parameters={leaked[:20]}."
+        )
+
+
+def pssf_state_dict_hash(state_dict):
+    digest = hashlib.sha256()
+    for name, tensor in state_dict.items():
+        if not torch.is_tensor(tensor):
+            raise RuntimeError(
+                f"PSSF state_dict entry {name!r} is not a tensor."
+            )
+        value = tensor.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(str(tuple(value.shape)).encode("ascii"))
+        digest.update(value.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def pssf_module_state_hash(module):
+    return pssf_state_dict_hash(module.state_dict())
+
+
+def sync_ppse_v2_actor(learner, actor, epoch):
+    if learner is None or actor is None:
+        raise RuntimeError("PPSE-v2 actor/learner modules are required.")
+    actor.load_state_dict(learner.state_dict(), strict=True)
+    actor.eval()
+    for parameter in actor.parameters():
+        parameter.requires_grad_(False)
+        parameter.grad = None
+    learner_hash = pssf_module_state_hash(learner)
+    actor_hash = pssf_module_state_hash(actor)
+    if learner_hash != actor_hash:
+        raise RuntimeError(
+            "PPSE-v2 actor hard-copy failed at epoch "
+            f"{int(epoch)}: {actor_hash} != {learner_hash}."
+        )
+    return {
+        "actor_sync_epoch": int(epoch),
+        "actor_hash_start": actor_hash,
+        "learner_hash_start": learner_hash,
+    }
+
+
+def initialize_pssf_runtime_state(cfg, train_dataset, artifact_root, sample_limit):
+    keys = [(str(dataset), str(stem)) for dataset, stem in train_dataset.keys]
+    expected_count = int(getattr(cfg, "PSSF_EXPECTED_TRAIN_SAMPLES", 4040))
+    if int(sample_limit) < 0 and len(keys) != expected_count:
+        raise RuntimeError(
+            "Formal PSSF training requires the complete unique train set: "
+            f"{len(keys)} != {expected_count}."
+        )
+    if len(keys) != len(set(keys)):
+        raise RuntimeError("PSSF training dataset contains duplicate keys.")
+
+    initial_targets = [
+        train_dataset.load_dabe_pu_target_soft(index)
+        for index in range(len(train_dataset))
+    ]
+    state_bank = PSSFStateBank(
+        keys=keys,
+        initial_targets=initial_targets,
+        loss_size=int(getattr(cfg, "PSSF_LOSS_SIZE", 68)),
+        dtype=_pssf_bank_dtype(getattr(cfg, "PSSF_STATE_DTYPE", "float16")),
+    )
+    history_bank = PSSFHistoryBank(
+        sample_count=len(train_dataset),
+        patch_size=int(getattr(cfg, "PSSF_PATCH_SIZE", 37)),
+        horizon=int(getattr(cfg, "PSSF_HORIZON", 3)),
+        dtype=_pssf_bank_dtype(
+            getattr(cfg, "PSSF_HISTORY_DTYPE", "float16")
+        ),
+    )
+    train_mask, audit_val_mask, split_manifest = build_pssf_split(
+        keys,
+        audit_val_ratio=float(getattr(cfg, "PSSF_AUDIT_VAL_RATIO", 0.10)),
+        seed=int(getattr(cfg, "PSSF_AUDIT_SPLIT_SEED", 2027)),
+    )
+    split_path = Path(artifact_root) / "pssf_split_manifest.json"
+    save_or_validate_split(split_path, split_manifest)
+    if int(sample_limit) < 0:
+        expected_train = int(round(expected_count * 0.90))
+        expected_audit = expected_count - expected_train
+        if int(train_mask.sum()) != expected_train or int(
+            audit_val_mask.sum()
+        ) != expected_audit:
+            raise RuntimeError(
+                "PSSF formal split count mismatch: "
+                f"train/audit={int(train_mask.sum())}/"
+                f"{int(audit_val_mask.sum())}, expected "
+                f"{expected_train}/{expected_audit}."
+            )
+    return {
+        "state_bank": state_bank,
+        "history_bank": history_bank,
+        "train_mask": train_mask,
+        "audit_val_mask": audit_val_mask,
+        "split_manifest": split_manifest,
+        "split_path": split_path,
+    }
+
+
+def build_pssf_protocol_fingerprint(
+    cfg,
+    config_path,
+    pssf,
+    state_bank,
+    split_manifest,
+    pssf_actor=None,
+):
+    config_path = Path(config_path).resolve()
+    source_config = Path(str(getattr(cfg, "PSSF_SOURCE_CONFIG", "")))
+    if not source_config.is_absolute():
+        source_config = (Path(__file__).resolve().parent / source_config).resolve()
+    if not config_path.is_file():
+        raise FileNotFoundError(f"PSSF config file not found: {config_path}")
+    if not source_config.is_file():
+        raise FileNotFoundError(
+            f"PSSF protected source config not found: {source_config}"
+        )
+    fields = {
+        name: getattr(cfg, name)
+        for name in sorted(dir(cfg))
+        if name.startswith("PSSF_")
+    }
+    ppse_fields = {
+        name: getattr(cfg, name)
+        for name in sorted(dir(cfg))
+        if name.startswith("PPSE_")
+    }
+    resolved_config = config_to_dict(cfg)
+    payload = {
+        "schema_version": (
+            "ppse_v2_protocol_v2"
+            if use_ppse_v2(cfg)
+            else "pssf_protocol_v1"
+        ),
+        "config_path": str(config_path),
+        "config_file_sha256": pssf_file_sha256(config_path),
+        "source_config_path": str(source_config),
+        "source_config_sha256": pssf_file_sha256(source_config),
+        "resolved_config_sha256": pssf_canonical_hash(resolved_config),
+        "supervision_mode": str(getattr(cfg, "SUPERVISION_MODE", "")),
+        "teacher_fusion_mode": str(
+            getattr(cfg, "TEACHER_FUSION_MODE", "")
+        ),
+        "dabe_pu_root": str(getattr(cfg, "DABE_PU_ROOT", "")),
+        "dabe_pu_version": str(getattr(cfg, "DABE_PU_VERSION", "")),
+        "feature_cache_root": str(getattr(cfg, "CACHE_ROOT", "")),
+        "feature_cache_version": str(
+            getattr(cfg, "FEATURE_CACHE_VERSION", "")
+        ),
+        "backbone_key": str(cfg.BACKBONE_KEY),
+        "head_type": str(getattr(cfg, "HEAD_TYPE", "")),
+        "loss_size": int(cfg.LOSS_SIZE),
+        "max_epoch": int(cfg.MAX_EPOCH),
+        "reset_epoch": get_reset_epoch(cfg),
+        "reset_timing": finetune_reset_timing(cfg),
+        "ema_weight": float(cfg.EMA_WEIGHT),
+        "student_lr": float(cfg.DINO["lr"]),
+        "lr_floor": float(getattr(cfg, "LR_FLOOR", 0.0)),
+        "seed": int(cfg.SEED),
+        "dagp": {
+            name: resolved_config[name]
+            for name in sorted(resolved_config)
+            if name.startswith("DAGP_")
+        },
+        "ndr": {
+            name: resolved_config[name]
+            for name in sorted(resolved_config)
+            if name.startswith("NDR_") or name == "USE_NDR_BRANCH"
+        },
+        "model": pssf.protocol(),
+        "pssf_fields": fields,
+        "sample_manifest_hash": state_bank.manifest_hash,
+        "split_manifest_hash": split_manifest["manifest_hash"],
+    }
+    if use_ppse_v2(cfg):
+        if pssf_actor is None:
+            raise RuntimeError(
+                "PPSE-v2 protocol fingerprint requires the actor module."
+            )
+        payload["ppse_fields"] = ppse_fields
+        payload["actor_model"] = pssf_actor.protocol()
+    return pssf_canonical_hash(payload), payload
+
+
+def select_pssf_visual_indices(
+    keys,
+    audit_val_mask,
+    seed,
+    camo_count,
+    cod10k_count,
+    strict=True,
+):
+    if int(audit_val_mask.numel()) != len(keys):
+        raise RuntimeError("PSSF visual split mask length mismatch.")
+    grouped = {"TR-CAMO": [], "TR-COD10K": []}
+    for index, (dataset, _) in enumerate(keys):
+        if not bool(audit_val_mask[index].item()):
+            continue
+        dataset_upper = str(dataset).upper()
+        if "COD10K" in dataset_upper:
+            grouped["TR-COD10K"].append(index)
+        elif "CAMO" in dataset_upper:
+            grouped["TR-CAMO"].append(index)
+    rng = random.Random(int(seed))
+    selected = []
+    for name, count in (
+        ("TR-CAMO", int(camo_count)),
+        ("TR-COD10K", int(cod10k_count)),
+    ):
+        candidates = sorted(grouped[name])
+        if strict and len(candidates) < count:
+            raise RuntimeError(
+                f"PSSF audit-val visual pool is too small for {name}: "
+                f"{len(candidates)} < {count}."
+            )
+        rng.shuffle(candidates)
+        selected.extend(candidates[: min(count, len(candidates))])
+    if len(selected) != len(set(selected)):
+        raise RuntimeError("PSSF visual sample selection contains duplicates.")
+    return selected
+
+
+def build_pssf_segmentation_group(
+    cfg,
+    epoch,
+    student_out,
+    student_logits,
+    q_target,
+):
+    if not isinstance(student_out, dict):
+        raise RuntimeError("PSSF requires decoder auxiliary dictionary output.")
+    if "coarse_logits_68" not in student_out:
+        raise RuntimeError("PSSF requires coarse_logits_68.")
+    if "base_logits" not in student_out:
+        raise RuntimeError("PSSF requires base_logits.")
+    q_target = q_target.detach().float()
+    final_loss = F.binary_cross_entropy_with_logits(
+        student_logits, q_target, reduction="mean"
+    )
+    coarse_logits = resize_logits_for_loss(
+        student_out["coarse_logits_68"], cfg
+    )
+    base_logits = resize_logits_for_loss(student_out["base_logits"], cfg)
+    coarse_loss = F.binary_cross_entropy_with_logits(
+        coarse_logits, q_target, reduction="mean"
+    )
+    base_loss = F.binary_cross_entropy_with_logits(
+        base_logits, q_target, reduction="mean"
+    )
+    coarse_weight = 0.5
+    base_weight = 0.5 if is_before_finetune_reset(cfg, epoch) else 0.3
+    weight_sum = 1.0 + coarse_weight + base_weight
+    group_loss = (
+        final_loss
+        + coarse_weight * coarse_loss
+        + base_weight * base_loss
+    ) / weight_sum
+    for name, value in (
+        ("final", final_loss),
+        ("coarse", coarse_loss),
+        ("base", base_loss),
+        ("group", group_loss),
+    ):
+        if not bool(torch.isfinite(value).item()):
+            raise RuntimeError(f"PSSF segmentation {name} loss is NaN/Inf.")
+    return {
+        "loss": group_loss,
+        "loss_final": final_loss,
+        "loss_coarse": coarse_loss,
+        "loss_base": base_loss,
+        "coarse_weight": coarse_weight,
+        "base_weight": base_weight,
+        "weight_sum": weight_sum,
+    }
+
+
+def _pssf_delayed_split_metrics(
+    image_mask,
+    prediction,
+    target,
+    q_prev_37,
+    teacher_binary_37,
+    eps,
+    retention_semantics=False,
+):
+    image_mask = image_mask.bool()
+    result = {
+        "images": int(image_mask.sum().item()),
+        "valid_images": 0,
+        "target_count": 0,
+        "target_sum": 0.0,
+        "target_sq_sum": 0.0,
+        "target_le_005_count": 0,
+        "target_ge_095_count": 0,
+        "target_mid_count": 0,
+        "innovation_sum": 0.0,
+        "innovation_count": 0,
+        "weight_sum": 0.0,
+        "weighted_sq_error_sum": 0.0,
+        "weighted_abs_error_sum": 0.0,
+        "pearson_sum": 0.0,
+        "pearson_count": 0,
+        "spearman_sum": 0.0,
+        "spearman_count": 0,
+        "patch_future_mae_sum": 0.0,
+        "scalar_future_mae_sum": 0.0,
+        "relative_improvement_sum": 0.0,
+        "patch_better_count": 0,
+        "scalar_better_count": 0,
+    }
+    if result["images"] == 0:
+        return result
+
+    prediction = prediction[image_mask].detach().float()
+    target_key = (
+        "retention_target" if retention_semantics else "gain_target"
+    )
+    gain_target = target[target_key][image_mask].detach().float()
+    innovation_weight = (
+        target["innovation_weight"][image_mask].detach().float()
+    )
+    future_center = target["future_center"][image_mask].detach().float()
+    q_prev = q_prev_37[image_mask].detach().float()
+    teacher_binary = teacher_binary_37[image_mask].detach().float()
+    error = prediction - gain_target
+    per_image_weight = innovation_weight.flatten(1).sum(dim=1)
+    result["valid_images"] = int(
+        (per_image_weight > float(eps)).sum().item()
+    )
+    result["target_count"] = int(gain_target.numel())
+    result["target_sum"] = float(gain_target.sum().item())
+    result["target_sq_sum"] = float(gain_target.square().sum().item())
+    result["target_le_005_count"] = int(
+        (gain_target <= 0.05).sum().item()
+    )
+    result["target_ge_095_count"] = int(
+        (gain_target >= 0.95).sum().item()
+    )
+    result["target_mid_count"] = int(
+        ((gain_target > 0.05) & (gain_target < 0.95)).sum().item()
+    )
+    result["innovation_sum"] = float(innovation_weight.sum().item())
+    result["innovation_count"] = int(innovation_weight.numel())
+    result["weight_sum"] = float(innovation_weight.sum().item())
+    result["weighted_sq_error_sum"] = float(
+        (innovation_weight * error.square()).sum().item()
+    )
+    result["weighted_abs_error_sum"] = float(
+        (innovation_weight * error.abs()).sum().item()
+    )
+
+    pearson, pearson_valid = safe_pearson(prediction, gain_target)
+    spearman, spearman_valid = safe_spearman(prediction, gain_target)
+    result["pearson_sum"] = float(pearson[pearson_valid].sum().item())
+    result["pearson_count"] = int(pearson_valid.sum().item())
+    result["spearman_sum"] = float(spearman[spearman_valid].sum().item())
+    result["spearman_count"] = int(spearman_valid.sum().item())
+
+    future_builder = (
+        future_state_from_retention
+        if retention_semantics
+        else future_state_from_gain
+    )
+    patch_future = future_builder(
+        q_prev,
+        teacher_binary,
+        prediction,
+    )
+    scalar_gain = innovation_weighted_image_mean(
+        prediction,
+        innovation_weight,
+        eps=eps,
+    ).view(-1, 1, 1, 1)
+    scalar_future = future_builder(
+        q_prev,
+        teacher_binary,
+        scalar_gain,
+    )
+    patch_mae = (patch_future - future_center).abs().flatten(1).mean(dim=1)
+    scalar_mae = (
+        (scalar_future - future_center).abs().flatten(1).mean(dim=1)
+    )
+    relative_improvement = (scalar_mae - patch_mae) / (
+        scalar_mae + float(eps)
+    )
+    result["patch_future_mae_sum"] = float(patch_mae.sum().item())
+    result["scalar_future_mae_sum"] = float(scalar_mae.sum().item())
+    result["relative_improvement_sum"] = float(
+        relative_improvement.sum().item()
+    )
+    result["patch_better_count"] = int((patch_mae < scalar_mae).sum().item())
+    result["scalar_better_count"] = int(
+        (scalar_mae < patch_mae).sum().item()
+    )
+    return result
+
+
+def _empty_pssf_delayed_split_metrics():
+    return {
+        "images": 0,
+        "valid_images": 0,
+        "target_count": 0,
+        "target_sum": 0.0,
+        "target_sq_sum": 0.0,
+        "target_le_005_count": 0,
+        "target_ge_095_count": 0,
+        "target_mid_count": 0,
+        "innovation_sum": 0.0,
+        "innovation_count": 0,
+        "weight_sum": 0.0,
+        "weighted_sq_error_sum": 0.0,
+        "weighted_abs_error_sum": 0.0,
+        "pearson_sum": 0.0,
+        "pearson_count": 0,
+        "spearman_sum": 0.0,
+        "spearman_count": 0,
+        "patch_future_mae_sum": 0.0,
+        "scalar_future_mae_sum": 0.0,
+        "relative_improvement_sum": 0.0,
+        "patch_better_count": 0,
+        "scalar_better_count": 0,
+    }
+
+
+def run_pssf_batch(
+    cfg,
+    epoch,
+    batch,
+    model_input,
+    student_prob,
+    teacher_prob,
+    teacher_binary,
+    p0_soft,
+    pssf,
+    pssf_optimizer,
+    state_bank,
+    history_bank,
+    pssf_train_mask,
+    pssf_audit_val_mask,
+    student,
+    teacher,
+    optimizer,
+    device,
+    pssf_actor=None,
+):
+    ppse_v2 = use_ppse_v2(cfg)
+    if ppse_v2 and pssf_actor is None:
+        raise RuntimeError("PPSE-v2 current state requires a frozen actor.")
+    if "sample_index" not in batch:
+        raise RuntimeError("PSSF batch is missing stable sample_index.")
+    if not torch.is_tensor(model_input):
+        raise RuntimeError("PSSF requires the raw cached DINO tensor input.")
+    indices = batch["sample_index"].detach().cpu().long()
+    batch_size = int(student_prob.shape[0])
+    if indices.ndim != 1 or int(indices.numel()) != batch_size:
+        raise RuntimeError(
+            f"PSSF sample_index must be [B], got {list(indices.shape)}."
+        )
+    if int(indices.min()) < 0 or int(indices.max()) >= len(state_bank):
+        raise RuntimeError("PSSF sample_index is out of range.")
+    datasets = [str(value) for value in batch["dataset"]]
+    stems = [str(value) for value in batch["stem"]]
+    for local_index, sample_index in enumerate(indices.tolist()):
+        actual_key = (datasets[local_index], stems[local_index])
+        expected_key = state_bank.keys[int(sample_index)]
+        if actual_key != expected_key:
+            raise RuntimeError(
+                "PSSF stable index/key mismatch: "
+                f"index={sample_index}, actual={actual_key}, "
+                f"expected={expected_key}."
+            )
+
+    patch_size = int(getattr(cfg, "PSSF_PATCH_SIZE", 37))
+    loss_size = int(getattr(cfg, "PSSF_LOSS_SIZE", 68))
+    history_window = int(getattr(cfg, "PSSF_HISTORY_WINDOW", 3))
+    eps = float(getattr(cfg, "PSSF_EPS", 1e-6))
+    q_prev_68 = state_bank.fetch(indices, device)
+    if tuple(q_prev_68.shape) != (
+        batch_size,
+        1,
+        loss_size,
+        loss_size,
+    ):
+        raise RuntimeError(f"PSSF Q shape mismatch: {list(q_prev_68.shape)}.")
+    p0_37 = pssf_area_resize(p0_soft.detach(), patch_size)
+    q_prev_37 = pssf_area_resize(q_prev_68, patch_size)
+    teacher_soft_37 = pssf_area_resize(
+        teacher_prob.detach(), patch_size
+    )
+    teacher_bin_37 = pssf_area_resize(
+        teacher_binary.detach(), patch_size
+    )
+    student_soft_37 = pssf_area_resize(
+        student_prob.detach(), patch_size
+    )
+    temporal_mean_cpu, temporal_var_cpu = (
+        history_bank.compute_temporal_stats(
+            indices=indices,
+            epoch=epoch,
+            current_teacher_soft_37=teacher_soft_37,
+            history_window=history_window,
+        )
+    )
+    temporal_mean_37 = temporal_mean_cpu.to(
+        device=device, dtype=torch.float32, non_blocking=True
+    )
+    temporal_var_37 = temporal_var_cpu.to(
+        device=device, dtype=torch.float32, non_blocking=True
+    )
+    history_bank.write(
+        indices=indices,
+        epoch=epoch,
+        q_prev_37=q_prev_37,
+        teacher_soft_37=teacher_soft_37,
+        teacher_bin_37=teacher_bin_37,
+        student_soft_37=student_soft_37,
+        temporal_mean_37=temporal_mean_37,
+        temporal_var_37=temporal_var_37,
+    )
+
+    delayed = history_bank.matured_context(indices, epoch, device)
+    zero = student_prob.new_zeros(())
+    delayed_stats = {
+        "delayed_active": 0.0,
+        "source_epoch": -1.0,
+        "gain_loss": 0.0,
+        "gain_mae": 0.0,
+        "gain_target_mean": 0.0,
+        "innovation_weight_mean": 0.0,
+        "train_image_ratio": 0.0,
+        "audit_val_image_ratio": 0.0,
+        "audit_gain_mae": 0.0,
+        "patch_future_mse": 0.0,
+        "scalar_future_mse": 0.0,
+        "patch_better": 0.0,
+        "gain_target_pearson": 0.0,
+        "gain_target_spearman": 0.0,
+    }
+    for split_name in ("train", "audit_val"):
+        for name, value in _empty_pssf_delayed_split_metrics().items():
+            delayed_stats[f"{split_name}_{name}"] = value
+    delayed_visuals = None
+    pssf_train_loss = zero
+    if delayed is not None:
+        source_state = build_pssf_state_channels(
+            p0_37,
+            delayed["q_prev_37"],
+            delayed["teacher_soft_37"],
+            delayed["teacher_bin_37"],
+            delayed["student_soft_37"],
+            delayed["temporal_mean_37"],
+            delayed["temporal_var_37"],
+        )
+        target = build_retention_target(
+            delayed["q_prev_37"],
+            delayed["teacher_bin_37"],
+            delayed["future_teacher_bin_37"],
+            eps=eps,
+        )
+        train_images = pssf_train_mask.index_select(0, indices).to(device)
+        audit_images = pssf_audit_val_mask.index_select(0, indices).to(device)
+        if not bool((train_images ^ audit_images).all().item()):
+            raise RuntimeError("PSSF train/audit split is not complementary.")
+
+        optimizer.zero_grad(set_to_none=True)
+        pssf_optimizer.zero_grad(set_to_none=True)
+        _pssf_assert_no_grad(student, "student before PSSF backward")
+        _pssf_assert_no_grad(teacher, "teacher before PSSF backward")
+        if ppse_v2:
+            _pssf_assert_no_grad(
+                pssf_actor, "PPSE-v2 actor before learner backward"
+            )
+        prediction = pssf(model_input.detach(), source_state)
+        train_split_stats = _pssf_delayed_split_metrics(
+            image_mask=train_images,
+            prediction=prediction,
+            target=target,
+            q_prev_37=delayed["q_prev_37"],
+            teacher_binary_37=delayed["teacher_bin_37"],
+            eps=eps,
+            retention_semantics=ppse_v2,
+        )
+        audit_split_stats = _pssf_delayed_split_metrics(
+            image_mask=audit_images,
+            prediction=prediction,
+            target=target,
+            q_prev_37=delayed["q_prev_37"],
+            teacher_binary_37=delayed["teacher_bin_37"],
+            eps=eps,
+            retention_semantics=ppse_v2,
+        )
+        if bool(train_images.any().item()):
+            loss_builder = (
+                weighted_retention_loss if ppse_v2 else weighted_gain_loss
+            )
+            target_key = (
+                "retention_target" if ppse_v2 else "gain_target"
+            )
+            pssf_train_loss, train_mae = loss_builder(
+                prediction[train_images],
+                target[target_key][train_images],
+                target["innovation_weight"][train_images],
+                eps=eps,
+            )
+            pssf_train_loss.backward()
+            if not _pssf_module_has_grad(pssf):
+                raise RuntimeError(
+                    "PSSF delayed target produced no PSSF gradients."
+                )
+            _pssf_assert_no_grad(student, "student after PSSF backward")
+            _pssf_assert_no_grad(teacher, "teacher after PSSF backward")
+            if ppse_v2:
+                _pssf_assert_no_grad(
+                    pssf_actor,
+                    "PPSE-v2 actor after learner backward",
+                )
+            for name, parameter in pssf.named_parameters():
+                if parameter.grad is not None and not bool(
+                    torch.isfinite(parameter.grad).all().item()
+                ):
+                    raise RuntimeError(
+                        f"PSSF gradient contains NaN/Inf: {name}."
+                    )
+            pssf_optimizer.step()
+            gain_mae = float(train_mae.detach().item())
+        else:
+            gain_mae = 0.0
+        pssf_optimizer.zero_grad(set_to_none=True)
+        _pssf_assert_no_grad(pssf, "PSSF before segmentation backward")
+        if ppse_v2:
+            _pssf_assert_no_grad(
+                pssf_actor, "PPSE-v2 actor before segmentation backward"
+            )
+
+        with torch.no_grad():
+            if bool(audit_images.any().item()):
+                audit_loss_builder = (
+                    weighted_retention_loss
+                    if ppse_v2
+                    else weighted_gain_loss
+                )
+                audit_target_key = (
+                    "retention_target" if ppse_v2 else "gain_target"
+                )
+                _, audit_mae = audit_loss_builder(
+                    prediction[audit_images],
+                    target[audit_target_key][audit_images],
+                    target["innovation_weight"][audit_images],
+                    eps=eps,
+                )
+                audit_gain_mae = float(audit_mae.item())
+            else:
+                audit_gain_mae = 0.0
+            future_builder = (
+                future_state_from_retention
+                if ppse_v2
+                else future_state_from_gain
+            )
+            target_key = (
+                "retention_target" if ppse_v2 else "gain_target"
+            )
+            patch_future = future_builder(
+                delayed["q_prev_37"],
+                delayed["teacher_bin_37"],
+                prediction.detach(),
+            )
+            scalar_gain = innovation_weighted_image_mean(
+                prediction.detach(),
+                target["innovation_weight"],
+                eps=eps,
+            ).view(-1, 1, 1, 1)
+            scalar_future = future_builder(
+                delayed["q_prev_37"],
+                delayed["teacher_bin_37"],
+                scalar_gain,
+            )
+            target_weight = target["innovation_weight"]
+            denominator = target_weight.sum() + eps
+            patch_mse = (
+                target_weight
+                * (patch_future - target["future_center"]).square()
+            ).sum() / denominator
+            scalar_mse = (
+                target_weight
+                * (scalar_future - target["future_center"]).square()
+            ).sum() / denominator
+            pearson, pearson_valid = safe_pearson(
+                prediction.detach(), target[target_key]
+            )
+            spearman, spearman_valid = safe_spearman(
+                prediction.detach(), target[target_key]
+            )
+            delayed_visuals = {
+                "gain_target_37": target[target_key].detach(),
+                "gain_abs_error_37": (
+                    prediction.detach() - target[target_key]
+                ).abs(),
+                "future_center_37": target["future_center"].detach(),
+                "patch_future_37": patch_future.detach(),
+                "scalar_future_37": scalar_future.detach(),
+            }
+            if ppse_v2:
+                delayed_visuals.update(
+                    {
+                        "retention_target_37": target[
+                            "retention_target"
+                        ].detach(),
+                        "retention_abs_error_37": (
+                            prediction.detach()
+                            - target["retention_target"]
+                        ).abs(),
+                    }
+                )
+        delayed_stats = {
+            "delayed_active": 1.0,
+            "source_epoch": float(delayed["source_epoch"]),
+            "gain_loss": float(pssf_train_loss.detach().item()),
+            "gain_mae": gain_mae,
+            "gain_target_mean": float(
+                target[target_key].mean().detach().item()
+            ),
+            "innovation_weight_mean": float(
+                target["innovation_weight"].mean().detach().item()
+            ),
+            "train_image_ratio": float(train_images.float().mean().item()),
+            "audit_val_image_ratio": float(
+                audit_images.float().mean().item()
+            ),
+            "audit_gain_mae": audit_gain_mae,
+            "patch_future_mse": float(patch_mse.item()),
+            "scalar_future_mse": float(scalar_mse.item()),
+            "patch_better": float(patch_mse.item() < scalar_mse.item()),
+            "gain_target_pearson": float(
+                pearson[pearson_valid].mean().item()
+                if bool(pearson_valid.any().item())
+                else 0.0
+            ),
+            "gain_target_spearman": float(
+                spearman[spearman_valid].mean().item()
+                if bool(spearman_valid.any().item())
+                else 0.0
+            ),
+            **{
+                f"train_{name}": value
+                for name, value in train_split_stats.items()
+            },
+            **{
+                f"audit_val_{name}": value
+                for name, value in audit_split_stats.items()
+            },
+        }
+        history_bank.mark_consumed(indices, delayed["source_epoch"])
+
+    current_state = build_pssf_state_channels(
+        p0_37,
+        q_prev_37,
+        teacher_soft_37,
+        teacher_bin_37,
+        student_soft_37,
+        temporal_mean_37,
+        temporal_var_37,
+    )
+    with torch.no_grad():
+        current_predictor = pssf_actor if ppse_v2 else pssf
+        if ppse_v2 and current_predictor is pssf:
+            raise RuntimeError(
+                "[PPSE-v2 ERROR] learner_used_as_current_actor"
+            )
+        gain_37 = current_predictor(model_input.detach(), current_state)
+        if ppse_v2:
+            gain_68 = bilinear_resize_retention(gain_37, loss_size)
+            state_update = update_prior_anchored_supervision_state(
+                q_prev_68=q_prev_68,
+                p0_soft_68=p0_soft.detach(),
+                teacher_binary_68=teacher_binary.detach(),
+                retention_68=gain_68,
+                state_step=float(getattr(cfg, "PPSE_STATE_STEP")),
+            )
+            q_current = state_update["q_current"]
+            proposal = state_update["proposal"]
+            p0_write_weight = state_update["p0_write_weight"]
+            teacher_write_weight = state_update[
+                "teacher_write_weight"
+            ]
+            state_memory_weight = float(
+                state_update["state_memory_weight"]
+            )
+        else:
+            gain_68 = bilinear_resize_gain(gain_37, loss_size)
+            q_current = update_supervision_state(
+                q_prev_68,
+                teacher_binary.detach(),
+                gain_68,
+            )
+            proposal = q_current
+            p0_write_weight = torch.zeros_like(q_current)
+            teacher_write_weight = gain_68
+            state_memory_weight = 1.0
+    state_bank.update(indices, q_current)
+    with torch.no_grad():
+        gain_flat = gain_68.detach().float().flatten(1)
+        gain_image_mean = gain_flat.mean(dim=1, keepdim=True)
+        current_stats = {
+            "gain_count": int(gain_flat.numel()),
+            "gain_sum": float(gain_flat.sum().item()),
+            "gain_sq_sum": float(gain_flat.square().sum().item()),
+            "gain_spatial_std_sum": float(
+                gain_flat.std(dim=1, unbiased=False).sum().item()
+            ),
+            "gain_image_count": batch_size,
+            "gain_above_image_mean_count": int(
+                (gain_flat > gain_image_mean).sum().item()
+            ),
+            "gain_below_image_mean_count": int(
+                (gain_flat < gain_image_mean).sum().item()
+            ),
+            "actual_write_abs_sum": float(
+                (q_current - q_prev_68).abs().sum().item()
+            ),
+            "innovation_abs_sum": float(
+                (teacher_binary.detach() - q_prev_68).abs().sum().item()
+            ),
+            "state_pixel_count": int(q_current.numel()),
+            "q_prev_sum": float(q_prev_68.sum().item()),
+            "q_soft_sum": float(q_current.sum().item()),
+            "q_binary_sum": float((q_current > 0.5).float().sum().item()),
+            "p0_soft_sum": float(p0_soft.detach().float().sum().item()),
+            "p0_binary_sum": float(
+                (p0_soft.detach() > 0.5).float().sum().item()
+            ),
+            "student_prob_sum": float(student_prob.detach().sum().item()),
+            "student_pred_sum": float(
+                (student_prob.detach() > 0.5).float().sum().item()
+            ),
+            "teacher_prob_sum": float(teacher_prob.detach().sum().item()),
+            "teacher_pred_sum": float(teacher_binary.detach().sum().item()),
+            "temporal_var_sum": float(temporal_var_37.sum().item()),
+            "temporal_var_count": int(temporal_var_37.numel()),
+            "state_memory_weight_sum": (
+                state_memory_weight * int(q_current.numel())
+            ),
+            "p0_write_weight_sum": float(
+                p0_write_weight.sum().item()
+            ),
+            "teacher_write_weight_sum": float(
+                teacher_write_weight.sum().item()
+            ),
+            "teacher_write_weight_max": float(
+                teacher_write_weight.max().item()
+            ),
+            "proposal_soft_sum": float(proposal.sum().item()),
+            "proposal_binary_sum": float(
+                (proposal > 0.5).float().sum().item()
+            ),
+            "q_to_p0_abs_sum": float(
+                (q_current - p0_soft.detach()).abs().sum().item()
+            ),
+            "q_to_teacher_abs_sum": float(
+                (q_current - teacher_binary.detach()).abs().sum().item()
+            ),
+            "proposal_to_p0_abs_sum": float(
+                (proposal - p0_soft.detach()).abs().sum().item()
+            ),
+            "proposal_to_teacher_abs_sum": float(
+                (proposal - teacher_binary.detach()).abs().sum().item()
+            ),
+            "prior_correction_abs_sum": float(
+                (
+                    state_update["prior_correction"].abs().sum().item()
+                    if ppse_v2
+                    else 0.0
+                )
+            ),
+            "coefficient_sum_error_max": float(
+                state_update["coefficient_sum_error_max"]
+                if ppse_v2
+                else 0.0
+            ),
+            "p0_write_histogram": torch.histc(
+                p0_write_weight.float(),
+                bins=1001,
+                min=0.0,
+                max=1.0,
+            ).cpu().to(torch.int64),
+            "teacher_write_histogram": torch.histc(
+                teacher_write_weight.float(),
+                bins=1001,
+                min=0.0,
+                max=1.0,
+            ).cpu().to(torch.int64),
+            "gain_histogram": torch.histc(
+                gain_68.detach().float(),
+                bins=1001,
+                min=0.0,
+                max=1.0,
+            ).cpu().to(torch.int64),
+        }
+    return {
+        "indices": indices,
+        "q_prev_68": q_prev_68.detach(),
+        "q_current_68": q_current.detach(),
+        "gain_37": gain_37.detach(),
+        "gain_68": gain_68.detach(),
+        "retention_37": gain_37.detach(),
+        "retention_68": gain_68.detach(),
+        "proposal_68": proposal.detach(),
+        "p0_write_weight_68": p0_write_weight.detach(),
+        "teacher_write_weight_68": teacher_write_weight.detach(),
+        "state_memory_weight": state_memory_weight,
+        "coefficient_sum_error_max": float(
+            state_update["coefficient_sum_error_max"]
+            if ppse_v2
+            else 0.0
+        ),
+        "current_actor": "pssf_actor" if ppse_v2 else "pssf",
+        "temporal_mean_37": temporal_mean_37.detach(),
+        "temporal_var_37": temporal_var_37.detach(),
+        "current_state_shape": list(current_state.shape),
+        "teacher_soft_68": teacher_prob.detach(),
+        "teacher_binary_68": teacher_binary.detach(),
+        "student_soft_68": student_prob.detach(),
+        "p0_soft_68": p0_soft.detach(),
+        "delayed_visuals": delayed_visuals,
+        "current_stats": current_stats,
+        "pssf_train_loss": pssf_train_loss.detach(),
+        **delayed_stats,
+    }
+
+
+def new_pssf_epoch_accumulator():
+    return {
+        "batches": 0,
+        "images": 0,
+        "delayed_batches": 0,
+        "current_sums": {},
+        "split_sums": {
+            "train": {},
+            "audit_val": {},
+        },
+        "gain_histogram": torch.zeros(1001, dtype=torch.int64),
+        "p0_write_histogram": torch.zeros(1001, dtype=torch.int64),
+        "teacher_write_histogram": torch.zeros(1001, dtype=torch.int64),
+        "gain_min": None,
+        "gain_max": None,
+        "coefficient_sum_error_max": 0.0,
+        "teacher_write_weight_max": 0.0,
+    }
+
+
+def accumulate_pssf_epoch(accumulator, result):
+    batch_size = int(result["indices"].numel())
+    accumulator["batches"] += 1
+    accumulator["images"] += batch_size
+    accumulator["delayed_batches"] += int(result["delayed_active"] > 0.0)
+    gain = result["gain_68"]
+    current_stats = result["current_stats"]
+    histogram = current_stats["gain_histogram"]
+    if tuple(histogram.shape) != (1001,):
+        raise RuntimeError("PSSF gain histogram shape mismatch.")
+    accumulator["gain_histogram"] += histogram
+    for histogram_name in (
+        "p0_write_histogram",
+        "teacher_write_histogram",
+    ):
+        current_histogram = current_stats[histogram_name]
+        if tuple(current_histogram.shape) != (1001,):
+            raise RuntimeError(
+                f"PSSF {histogram_name} shape mismatch."
+            )
+        accumulator[histogram_name] += current_histogram
+    for name, value in current_stats.items():
+        if name.endswith("_histogram"):
+            continue
+        if name in {
+            "coefficient_sum_error_max",
+            "teacher_write_weight_max",
+        }:
+            accumulator[name] = max(
+                float(accumulator.get(name, 0.0)),
+                float(value),
+            )
+            continue
+        accumulator["current_sums"][name] = (
+            accumulator["current_sums"].get(name, 0.0)
+            + float(value)
+        )
+    if result["delayed_active"] > 0.0:
+        for split_name in ("train", "audit_val"):
+            prefix = f"{split_name}_"
+            split_sums = accumulator["split_sums"][split_name]
+            for name in (
+                "images",
+                "valid_images",
+                "target_count",
+                "target_sum",
+                "target_sq_sum",
+                "target_le_005_count",
+                "target_ge_095_count",
+                "target_mid_count",
+                "innovation_sum",
+                "innovation_count",
+                "weight_sum",
+                "weighted_sq_error_sum",
+                "weighted_abs_error_sum",
+                "pearson_sum",
+                "pearson_count",
+                "spearman_sum",
+                "spearman_count",
+                "patch_future_mae_sum",
+                "scalar_future_mae_sum",
+                "relative_improvement_sum",
+                "patch_better_count",
+                "scalar_better_count",
+            ):
+                split_sums[name] = (
+                    split_sums.get(name, 0.0)
+                    + float(result[prefix + name])
+                )
+    gain_min = float(gain.min().item())
+    gain_max = float(gain.max().item())
+    accumulator["gain_min"] = (
+        gain_min
+        if accumulator["gain_min"] is None
+        else min(accumulator["gain_min"], gain_min)
+    )
+    accumulator["gain_max"] = (
+        gain_max
+        if accumulator["gain_max"] is None
+        else max(accumulator["gain_max"], gain_max)
+    )
+
+
+def _pssf_histogram_quantile(histogram, quantile):
+    total = int(histogram.sum().item())
+    if total <= 0:
+        return 0.0
+    target = max(1, int(math.ceil(float(quantile) * total)))
+    index = int(
+        torch.searchsorted(
+            histogram.cumsum(dim=0),
+            torch.tensor(target, dtype=torch.int64),
+        ).item()
+    )
+    return min(max(index / 1000.0, 0.0), 1.0)
+
+
+def _finalize_pssf_split_stats(values, eps=1e-12):
+    images = max(float(values.get("images", 0.0)), 0.0)
+    target_count = max(float(values.get("target_count", 0.0)), 0.0)
+    target_sum = float(values.get("target_sum", 0.0))
+    target_sq_sum = float(values.get("target_sq_sum", 0.0))
+    target_mean = target_sum / max(target_count, 1.0)
+    target_variance = max(
+        target_sq_sum / max(target_count, 1.0) - target_mean * target_mean,
+        0.0,
+    )
+    weight_sum = float(values.get("weight_sum", 0.0))
+    return {
+        "images": images,
+        "valid_ratio": float(values.get("valid_images", 0.0))
+        / max(images, 1.0),
+        "target_gain_mean": target_mean,
+        "target_gain_std": math.sqrt(target_variance),
+        "target_gain_le_005_ratio": float(
+            values.get("target_le_005_count", 0.0)
+        )
+        / max(target_count, 1.0),
+        "target_gain_ge_095_ratio": float(
+            values.get("target_ge_095_count", 0.0)
+        )
+        / max(target_count, 1.0),
+        "target_gain_mid_ratio": float(
+            values.get("target_mid_count", 0.0)
+        )
+        / max(target_count, 1.0),
+        "innovation_weight_mean": float(
+            values.get("innovation_sum", 0.0)
+        )
+        / max(float(values.get("innovation_count", 0.0)), 1.0),
+        "gain_wmse": float(values.get("weighted_sq_error_sum", 0.0))
+        / max(weight_sum, float(eps)),
+        "gain_wmae": float(values.get("weighted_abs_error_sum", 0.0))
+        / max(weight_sum, float(eps)),
+        "pearson": float(values.get("pearson_sum", 0.0))
+        / max(float(values.get("pearson_count", 0.0)), 1.0),
+        "spearman": float(values.get("spearman_sum", 0.0))
+        / max(float(values.get("spearman_count", 0.0)), 1.0),
+        "future_mae_patch": float(
+            values.get("patch_future_mae_sum", 0.0)
+        )
+        / max(images, 1.0),
+        "future_mae_scalar": float(
+            values.get("scalar_future_mae_sum", 0.0)
+        )
+        / max(images, 1.0),
+        "patch_vs_scalar_improvement": float(
+            values.get("relative_improvement_sum", 0.0)
+        )
+        / max(images, 1.0),
+        "patch_better_ratio": float(
+            values.get("patch_better_count", 0.0)
+        )
+        / max(images, 1.0),
+        "scalar_better_ratio": float(
+            values.get("scalar_better_count", 0.0)
+        )
+        / max(images, 1.0),
+    }
+
+
+def finalize_pssf_epoch(accumulator):
+    batches = max(int(accumulator["batches"]), 1)
+    current = accumulator["current_sums"]
+    gain_count = max(float(current.get("gain_count", 0.0)), 1.0)
+    gain_mean = float(current.get("gain_sum", 0.0)) / gain_count
+    gain_variance = max(
+        float(current.get("gain_sq_sum", 0.0)) / gain_count
+        - gain_mean * gain_mean,
+        0.0,
+    )
+    image_count = max(float(current.get("gain_image_count", 0.0)), 1.0)
+    state_pixel_count = max(
+        float(current.get("state_pixel_count", 0.0)), 1.0
+    )
+    train_stats = _finalize_pssf_split_stats(
+        accumulator["split_sums"]["train"]
+    )
+    audit_stats = _finalize_pssf_split_stats(
+        accumulator["split_sums"]["audit_val"]
+    )
+    row = {
+        "history_phase": "history_warmup"
+        if int(accumulator["delayed_batches"]) == 0
+        else "delayed_active",
+        "gain_mean": gain_mean,
+        "gain_global_std": math.sqrt(gain_variance),
+        "gain_std": math.sqrt(gain_variance),
+        "gain_spatial_std": float(
+            current.get("gain_spatial_std_sum", 0.0)
+        )
+        / image_count,
+        "gain_p10": _pssf_histogram_quantile(
+            accumulator["gain_histogram"], 0.10
+        ),
+        "gain_p50": _pssf_histogram_quantile(
+            accumulator["gain_histogram"], 0.50
+        ),
+        "gain_p90": _pssf_histogram_quantile(
+            accumulator["gain_histogram"], 0.90
+        ),
+        "gain_above_image_mean_ratio": float(
+            current.get("gain_above_image_mean_count", 0.0)
+        )
+        / gain_count,
+        "gain_below_image_mean_ratio": float(
+            current.get("gain_below_image_mean_count", 0.0)
+        )
+        / gain_count,
+        "actual_write_abs_mean": float(
+            current.get("actual_write_abs_sum", 0.0)
+        )
+        / state_pixel_count,
+        "innovation_abs_mean": float(
+            current.get("innovation_abs_sum", 0.0)
+        )
+        / state_pixel_count,
+        "q_prev_mean": float(current.get("q_prev_sum", 0.0))
+        / state_pixel_count,
+        "q_current_mean": float(current.get("q_soft_sum", 0.0))
+        / state_pixel_count,
+        "q_soft_mean": float(current.get("q_soft_sum", 0.0))
+        / state_pixel_count,
+        "q_binary_area": float(current.get("q_binary_sum", 0.0))
+        / state_pixel_count,
+        "proposal_soft_mean": float(
+            current.get("proposal_soft_sum", 0.0)
+        )
+        / state_pixel_count,
+        "proposal_binary_area": float(
+            current.get("proposal_binary_sum", 0.0)
+        )
+        / state_pixel_count,
+        "p0_soft_mean": float(current.get("p0_soft_sum", 0.0))
+        / state_pixel_count,
+        "p0_binary_area": float(current.get("p0_binary_sum", 0.0))
+        / state_pixel_count,
+        "student_prob_mean": float(
+            current.get("student_prob_sum", 0.0)
+        )
+        / state_pixel_count,
+        "student_pred_area": float(
+            current.get("student_pred_sum", 0.0)
+        )
+        / state_pixel_count,
+        "teacher_prob_mean": float(
+            current.get("teacher_prob_sum", 0.0)
+        )
+        / state_pixel_count,
+        "teacher_pred_area": float(
+            current.get("teacher_pred_sum", 0.0)
+        )
+        / state_pixel_count,
+        "temporal_var_mean": float(
+            current.get("temporal_var_sum", 0.0)
+        )
+        / max(float(current.get("temporal_var_count", 0.0)), 1.0),
+        "state_memory_weight": float(
+            current.get("state_memory_weight_sum", 0.0)
+        )
+        / state_pixel_count,
+        "p0_write_weight_mean": float(
+            current.get("p0_write_weight_sum", 0.0)
+        )
+        / state_pixel_count,
+        "p0_write_weight_p10": _pssf_histogram_quantile(
+            accumulator["p0_write_histogram"], 0.10
+        ),
+        "p0_write_weight_p90": _pssf_histogram_quantile(
+            accumulator["p0_write_histogram"], 0.90
+        ),
+        "teacher_write_weight_mean": float(
+            current.get("teacher_write_weight_sum", 0.0)
+        )
+        / state_pixel_count,
+        "teacher_write_weight_p10": _pssf_histogram_quantile(
+            accumulator["teacher_write_histogram"], 0.10
+        ),
+        "teacher_write_weight_p90": _pssf_histogram_quantile(
+            accumulator["teacher_write_histogram"], 0.90
+        ),
+        "teacher_write_weight_max": float(
+            accumulator.get("teacher_write_weight_max", 0.0)
+        ),
+        "q_to_p0_mae": float(
+            current.get("q_to_p0_abs_sum", 0.0)
+        )
+        / state_pixel_count,
+        "q_to_teacher_mae": float(
+            current.get("q_to_teacher_abs_sum", 0.0)
+        )
+        / state_pixel_count,
+        "proposal_to_p0_mae": float(
+            current.get("proposal_to_p0_abs_sum", 0.0)
+        )
+        / state_pixel_count,
+        "proposal_to_teacher_mae": float(
+            current.get("proposal_to_teacher_abs_sum", 0.0)
+        )
+        / state_pixel_count,
+        "prior_correction_abs_mean": float(
+            current.get("prior_correction_abs_sum", 0.0)
+        )
+        / state_pixel_count,
+        "coefficient_sum_error_max": float(
+            accumulator.get("coefficient_sum_error_max", 0.0)
+        ),
+        "target_gain_mean_train": train_stats["target_gain_mean"],
+        "target_gain_std_train": train_stats["target_gain_std"],
+        "target_gain_mean_val": audit_stats["target_gain_mean"],
+        "target_gain_std_val": audit_stats["target_gain_std"],
+        "gain_wmse_train": train_stats["gain_wmse"],
+        "gain_wmae_train": train_stats["gain_wmae"],
+        "gain_wmse_val": audit_stats["gain_wmse"],
+        "gain_wmae_val": audit_stats["gain_wmae"],
+        "future_mae_patch_train": train_stats["future_mae_patch"],
+        "future_mae_scalar_train": train_stats["future_mae_scalar"],
+        "future_mae_patch_val": audit_stats["future_mae_patch"],
+        "future_mae_scalar_val": audit_stats["future_mae_scalar"],
+        "patch_vs_scalar_improvement_train": train_stats[
+            "patch_vs_scalar_improvement"
+        ],
+        "patch_vs_scalar_improvement_val": audit_stats[
+            "patch_vs_scalar_improvement"
+        ],
+        "patch_better_ratio_train": train_stats["patch_better_ratio"],
+        "patch_better_ratio_val": audit_stats["patch_better_ratio"],
+        "scalar_better_ratio_train": train_stats["scalar_better_ratio"],
+        "scalar_better_ratio_val": audit_stats["scalar_better_ratio"],
+        "pssf_train_valid_ratio": train_stats["valid_ratio"],
+        "pssf_val_valid_ratio": audit_stats["valid_ratio"],
+        "target_gain_le_005_ratio_train": train_stats[
+            "target_gain_le_005_ratio"
+        ],
+        "target_gain_ge_095_ratio_train": train_stats[
+            "target_gain_ge_095_ratio"
+        ],
+        "target_gain_mid_ratio_train": train_stats[
+            "target_gain_mid_ratio"
+        ],
+        "target_gain_le_005_ratio_val": audit_stats[
+            "target_gain_le_005_ratio"
+        ],
+        "target_gain_ge_095_ratio_val": audit_stats[
+            "target_gain_ge_095_ratio"
+        ],
+        "target_gain_mid_ratio_val": audit_stats[
+            "target_gain_mid_ratio"
+        ],
+        "innovation_weight_mean_train": train_stats[
+            "innovation_weight_mean"
+        ],
+        "innovation_weight_mean_val": audit_stats[
+            "innovation_weight_mean"
+        ],
+        "pearson_train": train_stats["pearson"],
+        "pearson_val": audit_stats["pearson"],
+        "spearman_train": train_stats["spearman"],
+        "spearman_val": audit_stats["spearman"],
+        # Compatibility aliases for existing log call sites.
+        "gain_loss": train_stats["gain_wmse"],
+        "gain_mae": train_stats["gain_wmae"],
+        "audit_gain_mae": audit_stats["gain_wmae"],
+        "gain_target_mean": train_stats["target_gain_mean"],
+        "innovation_weight_mean": train_stats[
+            "innovation_weight_mean"
+        ],
+        "gain_target_pearson": train_stats["pearson"],
+        "gain_target_spearman": train_stats["spearman"],
+        "patch_future_mse": train_stats["future_mae_patch"],
+        "scalar_future_mse": train_stats["future_mae_scalar"],
+        "patch_better": train_stats["patch_better_ratio"],
+    }
+    row.update(
+        {
+            "batches": int(accumulator["batches"]),
+            "images": int(accumulator["images"]),
+            "delayed_batches": int(accumulator["delayed_batches"]),
+            "delayed_batch_ratio": float(
+                accumulator["delayed_batches"] / batches
+            ),
+            "gain_min": float(
+                accumulator["gain_min"]
+                if accumulator["gain_min"] is not None
+                else 0.0
+            ),
+            "gain_max": float(
+                accumulator["gain_max"]
+                if accumulator["gain_max"] is not None
+                else 0.0
+            ),
+        }
+    )
+    row.update(
+        {
+            "retention_min": row["gain_min"],
+            "retention_mean": row["gain_mean"],
+            "retention_global_std": row["gain_global_std"],
+            "retention_spatial_std": row["gain_spatial_std"],
+            "retention_p10": row["gain_p10"],
+            "retention_p50": row["gain_p50"],
+            "retention_p90": row["gain_p90"],
+            "retention_max": row["gain_max"],
+            "actual_state_change_abs_mean": row[
+                "actual_write_abs_mean"
+            ],
+            "state_change_abs_mean": row["actual_write_abs_mean"],
+            "teacher_innovation_abs_mean": row[
+                "innovation_abs_mean"
+            ],
+            "target_retention_mean_train": row[
+                "target_gain_mean_train"
+            ],
+            "target_retention_std_train": row[
+                "target_gain_std_train"
+            ],
+            "target_retention_mean_val": row[
+                "target_gain_mean_val"
+            ],
+            "target_retention_std_val": row[
+                "target_gain_std_val"
+            ],
+            "retention_wmse_train": row["gain_wmse_train"],
+            "retention_wmae_train": row["gain_wmae_train"],
+            "retention_wmse_val": row["gain_wmse_val"],
+            "retention_wmae_val": row["gain_wmae_val"],
+            "patch_scalar_improvement_train": row[
+                "patch_vs_scalar_improvement_train"
+            ],
+            "patch_scalar_improvement_val": row[
+                "patch_vs_scalar_improvement_val"
+            ],
+        }
+    )
+    return row
+
+
+def append_pssf_epoch_csv(path, epoch, row, segmentation_stats):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "epoch": int(epoch),
+        **row,
+        **{
+            f"seg_{name}": float(value)
+            for name, value in segmentation_stats.items()
+        },
+    }
+    write_header = not path.is_file()
+    with path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(record))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(record)
+
+
+def pssf_checkpoint_phase(cfg, epoch):
+    if int(epoch) == get_reset_epoch(cfg) and is_after_epoch_finetune_reset(cfg):
+        return "pending_after_epoch_reset"
+    if int(epoch) > get_reset_epoch(cfg):
+        return "post_reset_active"
+    return "active_pre_reset"
+
+
+def build_pssf_runtime_payload(
+    cfg,
+    epoch,
+    protocol_fingerprint,
+    state_bank,
+    history_bank,
+    pssf_optimizer,
+    split_manifest,
+    global_step,
+    train_loader_generator,
+    pssf=None,
+    pssf_actor=None,
+    actor_sync_epoch=None,
+):
+    payload = {
+        "schema_version": "pssf_runtime_v1",
+        "epoch": int(epoch),
+        "runtime_epoch": int(epoch),
+        "checkpoint_phase": pssf_checkpoint_phase(cfg, epoch),
+        "reset_status": {
+            "reset_epoch": get_reset_epoch(cfg),
+            "pending_after_epoch_reset": bool(
+                int(epoch) == get_reset_epoch(cfg)
+                and is_after_epoch_finetune_reset(cfg)
+            ),
+            "history_segment_start_epoch": int(
+                history_bank.segment_start_epoch
+            ),
+        },
+        "protocol_fingerprint": str(protocol_fingerprint),
+        "sample_manifest_hash": state_bank.manifest_hash,
+        "split_manifest_hash": split_manifest["manifest_hash"],
+        "state_bank": state_bank.state_dict(),
+        "history_bank": history_bank.state_dict(),
+        "pssf_optimizer": pssf_optimizer.state_dict(),
+        "global_step": int(global_step),
+        "rng_state": capture_rng_state(),
+        "train_loader_generator_state": train_loader_generator.get_state(),
+    }
+    if use_ppse_v2(cfg):
+        if pssf is None or pssf_actor is None:
+            raise RuntimeError(
+                "PPSE-v2 runtime requires learner and actor modules."
+            )
+        if int(actor_sync_epoch) != int(epoch):
+            raise RuntimeError(
+                "PPSE-v2 runtime actor_sync_epoch must equal runtime epoch: "
+                f"{actor_sync_epoch} != {epoch}."
+            )
+        learner_state = pssf.state_dict()
+        actor_state = pssf_actor.state_dict()
+        payload.update(
+            {
+                "schema_version": "ppse_v2_runtime_v2",
+                "ppse_version": str(getattr(cfg, "PPSE_VERSION", "")),
+                "pssf_learner": learner_state,
+                "pssf_actor": actor_state,
+                "actor_sync_epoch": int(actor_sync_epoch),
+                "q_state_68": payload["state_bank"]["q_state"],
+                "history_tensors": payload["history_bank"]["maps"],
+                "history_epoch_tags": payload["history_bank"][
+                    "epoch_tag"
+                ],
+                "history_target_consumed": payload["history_bank"][
+                    "target_consumed"
+                ],
+                "learner_state_sha256": pssf_state_dict_hash(
+                    learner_state
+                ),
+                "actor_state_sha256": pssf_state_dict_hash(actor_state),
+            }
+        )
+    return payload
+
+
+def build_pssf_checkpoint_extra(
+    cfg,
+    epoch,
+    global_step,
+    pssf,
+    protocol_fingerprint,
+    runtime_path,
+    runtime_sha256,
+    pssf_actor=None,
+    actor_sync_epoch=None,
+):
+    if not use_pssf(cfg):
+        return None
+    if not runtime_sha256:
+        raise RuntimeError("PSSF checkpoint requires a paired runtime hash.")
+    result = {
+        "pssf_protocol_fingerprint": str(protocol_fingerprint),
+        "pssf_runtime_path": str(Path(runtime_path).resolve()),
+        "pssf_runtime_epoch": int(epoch),
+        "pssf_runtime_sha256": str(runtime_sha256),
+        "checkpoint_phase": pssf_checkpoint_phase(cfg, epoch),
+        "global_step": int(global_step),
+    }
+    if use_ppse_v2(cfg):
+        if pssf_actor is None:
+            raise RuntimeError(
+                "PPSE-v2 checkpoint requires the frozen actor state."
+            )
+        if int(actor_sync_epoch) != int(epoch):
+            raise RuntimeError(
+                "PPSE-v2 checkpoint actor_sync_epoch must equal epoch: "
+                f"{actor_sync_epoch} != {epoch}."
+            )
+        result.update(
+            {
+                "ppse_version": str(getattr(cfg, "PPSE_VERSION", "")),
+                "pssf_learner": pssf.state_dict(),
+                "pssf_actor": pssf_actor.state_dict(),
+                "actor_sync_epoch": int(actor_sync_epoch),
+            }
+        )
+    else:
+        result["pssf"] = pssf.state_dict()
+    return result
+
+
+def load_pssf_resume_state(
+    cfg,
+    checkpoint,
+    pssf,
+    pssf_optimizer,
+    protocol_fingerprint,
+    state_bank,
+    history_bank,
+    split_manifest,
+    train_loader_generator,
+    pssf_actor=None,
+):
+    required = {
+        "pssf_protocol_fingerprint",
+        "pssf_runtime_path",
+        "pssf_runtime_epoch",
+        "pssf_runtime_sha256",
+        "checkpoint_phase",
+        "global_step",
+    }
+    if use_ppse_v2(cfg):
+        required.update(
+            {
+                "pssf_learner",
+                "pssf_actor",
+                "actor_sync_epoch",
+                "ppse_version",
+            }
+        )
+        if pssf_actor is None:
+            raise RuntimeError(
+                "PPSE-v2 resume requires an instantiated actor module."
+            )
+    else:
+        required.add("pssf")
+    missing = sorted(required.difference(checkpoint))
+    if missing:
+        raise RuntimeError(
+            "PSSF resume requires a PSSF checkpoint/runtime pair; "
+            f"missing checkpoint fields={missing}."
+        )
+    saved_epoch = int(checkpoint["epoch"])
+    if int(checkpoint["pssf_runtime_epoch"]) != saved_epoch:
+        raise RuntimeError("PSSF checkpoint/runtime epoch metadata mismatch.")
+    if (
+        str(checkpoint["pssf_protocol_fingerprint"])
+        != str(protocol_fingerprint)
+    ):
+        raise RuntimeError("PSSF protocol fingerprint mismatch.")
+    saved_config = checkpoint.get("config", {})
+    if str(saved_config.get("EXP_NAME", "")) != str(cfg.EXP_NAME):
+        raise RuntimeError(
+            "PSSF resume forbids cross-experiment checkpoints: "
+            f"{saved_config.get('EXP_NAME')} != {cfg.EXP_NAME}."
+        )
+    runtime_path = Path(checkpoint["pssf_runtime_path"])
+    if not runtime_path.is_file():
+        raise FileNotFoundError(
+            f"PSSF paired runtime not found: {runtime_path}"
+        )
+    actual_sha = pssf_file_sha256(runtime_path)
+    if actual_sha != str(checkpoint["pssf_runtime_sha256"]):
+        raise RuntimeError(
+            "PSSF paired runtime hash mismatch: "
+            f"{actual_sha} != {checkpoint['pssf_runtime_sha256']}."
+        )
+    runtime = torch.load(runtime_path, map_location="cpu", weights_only=False)
+    expected_runtime_schema = (
+        "ppse_v2_runtime_v2"
+        if use_ppse_v2(cfg)
+        else "pssf_runtime_v1"
+    )
+    if runtime.get("schema_version") != expected_runtime_schema:
+        raise RuntimeError("PSSF runtime schema mismatch.")
+    checks = {
+        "epoch": saved_epoch,
+        "runtime_epoch": saved_epoch,
+        "checkpoint_phase": str(checkpoint["checkpoint_phase"]),
+        "protocol_fingerprint": str(protocol_fingerprint),
+        "sample_manifest_hash": state_bank.manifest_hash,
+        "split_manifest_hash": split_manifest["manifest_hash"],
+        "global_step": int(checkpoint["global_step"]),
+    }
+    for name, expected in checks.items():
+        actual = runtime.get(name)
+        if actual != expected:
+            raise RuntimeError(
+                f"PSSF runtime {name} mismatch: {actual!r} != {expected!r}."
+            )
+    if use_ppse_v2(cfg):
+        required_runtime_fields = {
+            "pssf_learner",
+            "pssf_actor",
+            "actor_sync_epoch",
+            "q_state_68",
+            "history_tensors",
+            "history_epoch_tags",
+            "history_target_consumed",
+            "learner_state_sha256",
+            "actor_state_sha256",
+        }
+        missing_runtime_fields = sorted(
+            required_runtime_fields.difference(runtime)
+        )
+        if missing_runtime_fields:
+            raise RuntimeError(
+                "PPSE-v2 runtime is missing paired state fields: "
+                f"{missing_runtime_fields}."
+            )
+        expected_version = str(getattr(cfg, "PPSE_VERSION", ""))
+        if str(checkpoint["ppse_version"]) != expected_version:
+            raise RuntimeError("PPSE-v2 checkpoint version mismatch.")
+        if str(runtime.get("ppse_version", "")) != expected_version:
+            raise RuntimeError("PPSE-v2 runtime version mismatch.")
+        if int(checkpoint["actor_sync_epoch"]) != saved_epoch:
+            raise RuntimeError(
+                "PPSE-v2 checkpoint actor_sync_epoch mismatch."
+            )
+        if int(runtime.get("actor_sync_epoch", -1)) != saved_epoch:
+            raise RuntimeError("PPSE-v2 runtime actor_sync_epoch mismatch.")
+        learner_checkpoint_hash = pssf_state_dict_hash(
+            checkpoint["pssf_learner"]
+        )
+        actor_checkpoint_hash = pssf_state_dict_hash(
+            checkpoint["pssf_actor"]
+        )
+        learner_runtime_hash = pssf_state_dict_hash(
+            runtime["pssf_learner"]
+        )
+        actor_runtime_hash = pssf_state_dict_hash(runtime["pssf_actor"])
+        if learner_checkpoint_hash != learner_runtime_hash:
+            raise RuntimeError(
+                "PPSE-v2 learner checkpoint/runtime state mismatch."
+            )
+        if actor_checkpoint_hash != actor_runtime_hash:
+            raise RuntimeError(
+                "PPSE-v2 actor checkpoint/runtime state mismatch."
+            )
+        if learner_runtime_hash != str(
+            runtime.get("learner_state_sha256", "")
+        ):
+            raise RuntimeError("PPSE-v2 runtime learner hash mismatch.")
+        if actor_runtime_hash != str(
+            runtime.get("actor_state_sha256", "")
+        ):
+            raise RuntimeError("PPSE-v2 runtime actor hash mismatch.")
+        if not torch.equal(
+            runtime.get("q_state_68"),
+            runtime["state_bank"]["q_state"],
+        ):
+            raise RuntimeError("PPSE-v2 runtime Q state alias mismatch.")
+        history_alias = runtime.get("history_tensors")
+        if (
+            not isinstance(history_alias, dict)
+            or set(history_alias) != set(runtime["history_bank"]["maps"])
+        ):
+            raise RuntimeError(
+                "PPSE-v2 runtime history tensor alias mismatch."
+            )
+        for name, value in runtime["history_bank"]["maps"].items():
+            if not torch.equal(history_alias[name], value):
+                raise RuntimeError(
+                    "PPSE-v2 runtime history tensor mismatch: "
+                    f"{name}."
+                )
+        if not torch.equal(
+            runtime.get("history_epoch_tags"),
+            runtime["history_bank"]["epoch_tag"],
+        ):
+            raise RuntimeError(
+                "PPSE-v2 runtime history epoch tag mismatch."
+            )
+        if not torch.equal(
+            runtime.get("history_target_consumed"),
+            runtime["history_bank"]["target_consumed"],
+        ):
+            raise RuntimeError(
+                "PPSE-v2 runtime target-consumed state mismatch."
+            )
+        pssf.load_state_dict(checkpoint["pssf_learner"], strict=True)
+        pssf_actor.load_state_dict(checkpoint["pssf_actor"], strict=True)
+        pssf_actor.eval()
+        for parameter in pssf_actor.parameters():
+            parameter.requires_grad_(False)
+            parameter.grad = None
+    else:
+        pssf.load_state_dict(checkpoint["pssf"], strict=True)
+    pssf_optimizer.load_state_dict(runtime["pssf_optimizer"])
+    state_bank.load_state_dict(runtime["state_bank"])
+    history_bank.load_state_dict(runtime["history_bank"])
+    restore_rng_state(runtime["rng_state"])
+    train_loader_generator.set_state(
+        runtime["train_loader_generator_state"]
+    )
+    return {
+        "runtime_path": runtime_path,
+        "runtime_sha256": actual_sha,
+        "global_step": int(runtime["global_step"]),
+        "phase": str(runtime["checkpoint_phase"]),
+        "actor_sync_epoch": (
+            int(runtime["actor_sync_epoch"])
+            if use_ppse_v2(cfg)
+            else None
+        ),
+        "learner_restored": bool(use_ppse_v2(cfg)),
+        "actor_restored": bool(use_ppse_v2(cfg)),
+    }
+
+
 @torch.no_grad()
 def update_slow_evaluator(evaluator, student, decay):
     decay = float(decay)
@@ -6976,6 +10880,288 @@ def update_slow_evaluator(evaluator, student, decay):
             target.copy_(source)
 
 
+def infer_checkpoint_source_arbiter_mode(checkpoint):
+    explicit = str(checkpoint.get("source_arbiter_mode", "")).lower()
+    if explicit:
+        return explicit
+    config = checkpoint.get("config", {})
+    if isinstance(config, dict):
+        configured = str(config.get("SOURCE_ARBITER_MODE", "")).lower()
+        if configured:
+            return configured
+        version = str(config.get("SOURCE_ARBITER_VERSION", "")).lower()
+        if version.startswith("egsa_r1"):
+            return "residual_over_ecst"
+        if version.startswith("egsa_r2b"):
+            return "sign_aware_pure_loss_space"
+        if version.startswith("egsa_r2"):
+            return "pure_loss_space"
+    return ""
+
+
+def validate_source_arbiter_resume_mode(cfg, checkpoint):
+    """Validate same-mode resume and the explicit canonical epoch6 forks."""
+    target_mode = str(
+        getattr(cfg, "SOURCE_ARBITER_MODE", "residual_over_ecst")
+    ).lower()
+    saved_mode = infer_checkpoint_source_arbiter_mode(checkpoint)
+    saved_epoch = int(checkpoint.get("epoch", -1))
+    phase = str(checkpoint.get("checkpoint_phase", ""))
+    if saved_mode == target_mode:
+        if target_mode in {"pure_loss_space", "sign_aware_pure_loss_space"}:
+            if checkpoint.get("teacher_source_weight_mode") != "ones":
+                raise RuntimeError(
+                    "Pure loss-space resume requires "
+                    "teacher_source_weight_mode='ones'."
+                )
+            if checkpoint.get("ecst_weighting_used_for_training") is not False:
+                raise RuntimeError(
+                    "Pure loss-space resume requires "
+                    "ecst_weighting_used_for_training=False."
+                )
+            lifecycle = checkpoint.get("source_arbiter_lifecycle", {})
+            if (
+                saved_epoch <= int(
+                    getattr(cfg, "ECST_MEMORY_UPDATE_END_EPOCH", 20)
+                )
+                and (
+                    not isinstance(lifecycle, dict)
+                    or "source_temporal_memory_active" not in lifecycle
+                )
+            ):
+                raise RuntimeError(
+                    "EGSA-R2 active resume is missing the source temporal "
+                    "memory lifecycle marker."
+                )
+        if target_mode == "sign_aware_pure_loss_space":
+            required_epoch = int(
+                getattr(cfg, "SOURCE_ARBITER_REQUIRED_RESUME_EPOCH", -1)
+            )
+            if saved_epoch != required_epoch:
+                raise RuntimeError(
+                    "EGSA-R2b resume checkpoint epoch mismatch: "
+                    f"{saved_epoch} != {required_epoch}."
+                )
+            if checkpoint.get("source_arbiter_version") != (
+                "egsa_r2b_signaware_directional_v1"
+            ):
+                raise RuntimeError(
+                    "EGSA-R2b same-mode resume requires matching router version."
+                )
+            if checkpoint.get("source_arbiter_utility_mode") != (
+                "directional_gradient_alignment"
+            ):
+                raise RuntimeError(
+                    "EGSA-R2b same-mode resume requires directional utility."
+                )
+            if int(checkpoint.get("source_arbiter_output_channels", -1)) != 2:
+                raise RuntimeError(
+                    "EGSA-R2b same-mode resume requires a two-channel router."
+                )
+            expected_bounds = {
+                "positive_residual_bound": float(
+                    getattr(cfg, "SOURCE_ARBITER_POS_RESIDUAL_BOUND", 1.5)
+                ),
+                "negative_residual_bound": float(
+                    getattr(cfg, "SOURCE_ARBITER_NEG_RESIDUAL_BOUND", 4.0)
+                ),
+            }
+            bad_bounds = {
+                name: checkpoint.get(name)
+                for name, expected in expected_bounds.items()
+                if checkpoint.get(name) is None
+                or abs(float(checkpoint[name]) - expected) > 1e-10
+            }
+            if bad_bounds:
+                raise RuntimeError(
+                    "EGSA-R2b resume residual-bound mismatch: "
+                    f"{bad_bounds}; expected={expected_bounds}."
+                )
+            if saved_epoch == 20 and phase != "pending_after_epoch_reset":
+                raise RuntimeError(
+                    "EGSA-R2b Long45 must resume the Stage20 pending-reset "
+                    f"checkpoint, got phase={phase!r}."
+                )
+            if saved_epoch == 20:
+                expected_stage_exp = (
+                    "dinov1_s8_dabepu_v11_egsa_r2b_signaware_dagp_"
+                    "uncgate_ndr_stage20_lrfloor_2e5"
+                )
+                saved_config = checkpoint.get("config", {})
+                saved_lifecycle = checkpoint.get(
+                    "source_arbiter_lifecycle", {}
+                )
+                if checkpoint.get("source_arbiter_stage") != "stage20":
+                    raise RuntimeError(
+                        "EGSA-R2b Long45 requires source_arbiter_stage='stage20'."
+                    )
+                if (
+                    not isinstance(saved_config, dict)
+                    or saved_config.get("EXP_NAME") != expected_stage_exp
+                ):
+                    raise RuntimeError(
+                        "EGSA-R2b Long45 requires the canonical Stage20 "
+                        f"experiment checkpoint: {expected_stage_exp!r}."
+                    )
+                required_active = (
+                    "source_temporal_memory_active",
+                    "route_memory_active",
+                    "utility_evaluator_active",
+                )
+                inactive = [
+                    name
+                    for name in required_active
+                    if not isinstance(saved_lifecycle, dict)
+                    or saved_lifecycle.get(name) is not True
+                ]
+                if inactive:
+                    raise RuntimeError(
+                        "EGSA-R2b pending-reset checkpoint has inactive "
+                        f"lifecycle state: {inactive}."
+                    )
+                if (
+                    checkpoint.get("route_trajectory_memory") is None
+                    or checkpoint.get("utility_evaluator") is None
+                    or checkpoint.get("source_temporal_memory") is None
+                ):
+                    raise RuntimeError(
+                        "EGSA-R2b pending-reset checkpoint is missing active "
+                        "route/evaluator/temporal state."
+                    )
+        return {
+            "saved_mode": saved_mode,
+            "target_mode": target_mode,
+            "is_r1_epoch6_fork": False,
+            "is_r2b_stage20_resume": (
+                target_mode == "sign_aware_pure_loss_space"
+                and saved_epoch == 20
+            ),
+            "temporal_memory_key": (
+                "source_temporal_memory"
+                if target_mode
+                in {"pure_loss_space", "sign_aware_pure_loss_space"}
+                else "ecst_temporal_memory"
+            ),
+        }
+
+    is_r1_epoch6_fork = (
+        target_mode
+        in {"pure_loss_space", "sign_aware_pure_loss_space"}
+        and saved_mode == "residual_over_ecst"
+        and saved_epoch == 6
+        and phase == "active_pre_reset"
+        and (
+            target_mode != "sign_aware_pure_loss_space"
+            or int(
+                getattr(cfg, "SOURCE_ARBITER_REQUIRED_RESUME_EPOCH", -1)
+            )
+            == 6
+        )
+    )
+    if not is_r1_epoch6_fork:
+        raise RuntimeError(
+            "Source-arbiter checkpoint mode mismatch: "
+            f"saved={saved_mode!r}, target={target_mode!r}, "
+            f"epoch={saved_epoch}, phase={phase!r}. The only cross-mode path "
+            "is the complete canonical EGSA-R1 epoch6 active_pre_reset "
+            "checkpoint."
+        )
+    config = checkpoint.get("config", {})
+    expected_exp = (
+        "dinov1_s8_dabepu_v11_ecst_egsa_r1_dagp_uncgate_ndr_"
+        "long45_lrfloor_2e5"
+    )
+    if not isinstance(config, dict) or config.get("EXP_NAME") != expected_exp:
+        raise RuntimeError(
+            "EGSA-R2 epoch6 fork requires the canonical EGSA-R1 config "
+            f"identity {expected_exp!r}."
+        )
+    required = {
+        "source_arbiter",
+        "source_arbiter_optimizer",
+        "utility_evaluator",
+        "route_trajectory_memory",
+        "ecst_temporal_memory",
+        "global_step",
+        "rng_state",
+        "train_loader_generator_state",
+        "checkpoint_phase",
+        "source_arbiter_lifecycle",
+    }
+    missing = sorted(required.difference(checkpoint))
+    if missing or checkpoint.get("ecst_temporal_memory") is None:
+        raise RuntimeError(
+            "EGSA-R2 epoch6 fork requires complete R1 dynamic state; "
+            f"missing={missing}, temporal_memory_present="
+            f"{checkpoint.get('ecst_temporal_memory') is not None}."
+        )
+    lifecycle = checkpoint["source_arbiter_lifecycle"]
+    required_active = (
+        "route_memory_active",
+        "utility_evaluator_active",
+        "ecst_memory_active",
+    )
+    if not isinstance(lifecycle, dict) or any(
+        lifecycle.get(name) is not True for name in required_active
+    ):
+        raise RuntimeError(
+            "EGSA-R2 epoch6 fork requires active R1 temporal/route/evaluator "
+            f"lifecycle markers, got {lifecycle!r}."
+        )
+    return {
+        "saved_mode": saved_mode,
+        "target_mode": target_mode,
+        "is_r1_epoch6_fork": True,
+        "is_r2b_stage20_resume": False,
+        "temporal_memory_key": "ecst_temporal_memory",
+    }
+
+
+def migrate_r1_router_to_sign_aware(source_arbiter, checkpoint):
+    saved_state = checkpoint.get("source_arbiter")
+    if not isinstance(saved_state, dict):
+        raise RuntimeError("EGSA-R2b epoch6 fork is missing the R1 router state.")
+    saved_head_weight = saved_state.get("head.weight")
+    saved_head_bias = saved_state.get("head.bias")
+    if (
+        not torch.is_tensor(saved_head_weight)
+        or not torch.is_tensor(saved_head_bias)
+        or float(saved_head_weight.abs().max().item()) != 0.0
+        or float(saved_head_bias.abs().max().item()) != 0.0
+    ):
+        raise RuntimeError(
+            "EGSA-R2b epoch6 fork requires the canonical zero R1 router head."
+        )
+    current_state = source_arbiter.state_dict()
+    body_keys = sorted(name for name in current_state if name.startswith("body."))
+    saved_body_keys = sorted(name for name in saved_state if name.startswith("body."))
+    if body_keys != saved_body_keys:
+        raise RuntimeError(
+            "EGSA-R2b/R1 router body keys differ; migration is unsafe."
+        )
+    migrated = dict(current_state)
+    for name in body_keys:
+        if tuple(saved_state[name].shape) != tuple(current_state[name].shape):
+            raise RuntimeError(
+                f"EGSA-R2b router body shape mismatch for {name}: "
+                f"{list(saved_state[name].shape)} != "
+                f"{list(current_state[name].shape)}."
+            )
+        migrated[name] = saved_state[name]
+    source_arbiter.load_state_dict(migrated, strict=True)
+    if (
+        float(source_arbiter.head.weight.detach().abs().max().item()) != 0.0
+        or float(source_arbiter.head.bias.detach().abs().max().item()) != 0.0
+    ):
+        raise RuntimeError("EGSA-R2b dual head was not zero after migration.")
+    optimizer_state = checkpoint.get("source_arbiter_optimizer", {})
+    if not isinstance(optimizer_state, dict) or optimizer_state.get("state"):
+        raise RuntimeError(
+            "EGSA-R2b epoch6 fork requires the R1 arbiter optimizer to have "
+            "no parameter state."
+        )
+
+
 def build_source_arbiter_checkpoint_extra(
     cfg,
     epoch,
@@ -6990,34 +11176,172 @@ def build_source_arbiter_checkpoint_extra(
 ):
     if not bool(getattr(cfg, "USE_SOURCE_ARBITER", False)):
         return None
+    mode = str(
+        getattr(cfg, "SOURCE_ARBITER_MODE", "residual_over_ecst")
+    ).lower()
     if int(epoch) == get_reset_epoch(cfg) and is_after_epoch_finetune_reset(cfg):
         phase = "pending_after_epoch_reset"
     elif int(epoch) > get_reset_epoch(cfg):
-        phase = "post_reset_inactive"
+        phase = (
+            "post_reset_frozen"
+            if mode == "sign_aware_pure_loss_space"
+            else "post_reset_inactive"
+        )
     else:
         phase = "active_pre_reset"
-    return {
+    if mode not in {
+        "residual_over_ecst",
+        "pure_loss_space",
+        "sign_aware_pure_loss_space",
+    }:
+        raise RuntimeError(
+            f"Cannot checkpoint unsupported source arbiter mode: {mode!r}."
+        )
+    lifecycle = {
+        "route_memory_active": route_memory is not None,
+        "utility_evaluator_active": utility_evaluator is not None,
+        "router_trainable": any(
+            parameter.requires_grad for parameter in source_arbiter.parameters()
+        ),
+    }
+    lifecycle[
+        (
+            "source_temporal_memory_active"
+            if mode
+            in {"pure_loss_space", "sign_aware_pure_loss_space"}
+            else "ecst_memory_active"
+        )
+    ] = ecst_memory is not None
+    result = {
         "source_arbiter": source_arbiter.state_dict(),
         "source_arbiter_optimizer": arbiter_optimizer.state_dict(),
-        "utility_evaluator": utility_evaluator.state_dict(),
+        "utility_evaluator": (
+            utility_evaluator.state_dict()
+            if utility_evaluator is not None
+            else None
+        ),
         "route_trajectory_memory": (
             route_memory.state_dict() if route_memory is not None else None
         ),
-        "ecst_temporal_memory": (
-            ecst_memory.state_dict() if ecst_memory is not None else None
+        "source_arbiter_mode": mode,
+        "teacher_source_weight_mode": (
+            "ones"
+            if mode in {"pure_loss_space", "sign_aware_pure_loss_space"}
+            else "ecst"
         ),
+        "ecst_weighting_used_for_training": mode == "residual_over_ecst",
         "global_step": int(global_step),
         "rng_state": capture_rng_state(),
         "train_loader_generator_state": train_loader_generator.get_state(),
         "checkpoint_phase": phase,
-        "source_arbiter_lifecycle": {
-            "route_memory_active": route_memory is not None,
-            "ecst_memory_active": ecst_memory is not None,
-            "utility_evaluator_active": int(epoch)
-            <= int(getattr(cfg, "SOURCE_ARBITER_MEMORY_UPDATE_END_EPOCH", 20)),
-        },
+        "source_arbiter_lifecycle": lifecycle,
         "source_arbiter_vis_state": dict(vis_state or {}),
     }
+    if mode == "sign_aware_pure_loss_space":
+        result.update(
+            {
+                "source_arbiter_version": str(
+                    getattr(cfg, "SOURCE_ARBITER_VERSION", "")
+                ),
+                "source_arbiter_utility_mode": str(
+                    getattr(cfg, "SOURCE_ARBITER_UTILITY_MODE", "")
+                ),
+                "source_arbiter_output_channels": 2,
+                "source_arbiter_positive_bound": float(
+                    getattr(cfg, "SOURCE_ARBITER_POS_RESIDUAL_BOUND", 1.5)
+                ),
+                "source_arbiter_negative_bound": float(
+                    getattr(cfg, "SOURCE_ARBITER_NEG_RESIDUAL_BOUND", 4.0)
+                ),
+                "positive_residual_bound": float(
+                    getattr(cfg, "SOURCE_ARBITER_POS_RESIDUAL_BOUND", 1.5)
+                ),
+                "negative_residual_bound": float(
+                    getattr(cfg, "SOURCE_ARBITER_NEG_RESIDUAL_BOUND", 4.0)
+                ),
+                "utility_mode": str(
+                    getattr(cfg, "SOURCE_ARBITER_UTILITY_MODE", "")
+                ),
+                "router_train_active": bool(
+                    get_arbiter_train_scale(epoch, cfg) > 0.0
+                ),
+                "router_apply_active": bool(
+                    get_arbiter_apply_scale(epoch, cfg) > 0.0
+                ),
+                "router_frozen": not any(
+                    parameter.requires_grad
+                    for parameter in source_arbiter.parameters()
+                ),
+                "source_arbiter_stage": str(
+                    getattr(cfg, "SOURCE_ARBITER_STAGE", "")
+                ),
+                "audit_concentration_override_enabled": bool(
+                    getattr(
+                        cfg,
+                        "SOURCE_ARBITER_AUDIT_CONCENTRATION_OVERRIDE",
+                        False,
+                    )
+                ),
+                "audit_allowed_failures": list(
+                    getattr(cfg, "SOURCE_ARBITER_AUDIT_ALLOWED_FAILURES", [])
+                ),
+                "source_arbiter_class_weights": {
+                    "positive": {
+                        "teacher": float(
+                            getattr(
+                                cfg,
+                                "SOURCE_ARBITER_POS_TEACHER_CLASS_WEIGHT",
+                                1.0,
+                            )
+                        ),
+                        "dabe": float(
+                            getattr(
+                                cfg,
+                                "SOURCE_ARBITER_POS_DABE_CLASS_WEIGHT",
+                                1.0,
+                            )
+                        ),
+                    },
+                    "negative": {
+                        "teacher": float(
+                            getattr(
+                                cfg,
+                                "SOURCE_ARBITER_NEG_TEACHER_CLASS_WEIGHT",
+                                1.0,
+                            )
+                        ),
+                        "dabe": float(
+                            getattr(
+                                cfg,
+                                "SOURCE_ARBITER_NEG_DABE_CLASS_WEIGHT",
+                                1.0,
+                            )
+                        ),
+                    },
+                },
+                "source_temporal_memory_lifecycle": (
+                    "active"
+                    if ecst_memory is not None
+                    else "released"
+                ),
+                "route_memory_lifecycle": (
+                    "active"
+                    if route_memory is not None
+                    else "released"
+                ),
+                "utility_evaluator_lifecycle": (
+                    "active"
+                    if utility_evaluator is not None
+                    else "released"
+                ),
+            }
+        )
+    memory_state = ecst_memory.state_dict() if ecst_memory is not None else None
+    if mode in {"pure_loss_space", "sign_aware_pure_loss_space"}:
+        result["source_temporal_memory"] = memory_state
+    else:
+        result["ecst_temporal_memory"] = memory_state
+    return result
 
 
 def _save_grayscale_map(path, tensor):
@@ -7029,6 +11353,121 @@ def _save_rgb_map(path, tensor):
     value = tensor.detach().float().cpu().clamp(0.0, 1.0)
     value = value.permute(1, 2, 0).numpy()
     Image.fromarray(np.rint(value * 255.0).astype(np.uint8), mode="RGB").save(path)
+
+
+def save_pssf_visuals(
+    visual_root,
+    epoch,
+    batch,
+    image_68,
+    p0_soft,
+    teacher_binary,
+    teacher_prob,
+    student_prob,
+    pssf_result,
+    selected_indices,
+):
+    selected = set(int(value) for value in selected_indices)
+    if not selected:
+        return
+    sample_indices = batch["sample_index"].tolist()
+    datasets = [str(value) for value in batch["dataset"]]
+    stems = [str(value) for value in batch["stem"]]
+    is_ppse_v2 = "proposal_68" in pssf_result and (
+        pssf_result.get("current_actor") == "pssf_actor"
+    )
+    if is_ppse_v2:
+        maps = [
+            p0_soft,
+            pssf_result["q_prev_68"],
+            teacher_binary,
+            pssf_result["retention_68"],
+            pssf_result["p0_write_weight_68"],
+            pssf_result["teacher_write_weight_68"],
+            pssf_result["proposal_68"],
+            pssf_result["q_current_68"],
+            student_prob,
+            teacher_prob,
+        ]
+    else:
+        maps = [
+            p0_soft,
+            pssf_result["q_prev_68"],
+            teacher_binary,
+            teacher_prob,
+            student_prob,
+            pssf_result["gain_68"],
+            pssf_result["q_current_68"],
+        ]
+    delayed_visuals = pssf_result.get("delayed_visuals")
+    if delayed_visuals is not None:
+        delayed_names = (
+            (
+                "retention_target_37",
+                "retention_abs_error_37",
+                "future_center_37",
+                "patch_future_37",
+                "scalar_future_37",
+            )
+            if is_ppse_v2
+            else (
+                "gain_target_37",
+                "gain_abs_error_37",
+                "future_center_37",
+                "patch_future_37",
+                "scalar_future_37",
+            )
+        )
+        for name in delayed_names:
+            maps.append(
+                F.interpolate(
+                    delayed_visuals[name].float(),
+                    size=(68, 68),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            )
+    for local_index, sample_index in enumerate(sample_indices):
+        if int(sample_index) not in selected:
+            continue
+        dataset_dir = (
+            str(datasets[local_index])
+            .replace("/", "_")
+            .replace("\\", "_")
+        )
+        stem_dir = (
+            str(stems[local_index])
+            .replace("/", "_")
+            .replace("\\", "_")
+        )
+        output_dir = Path(visual_root) / dataset_dir / stem_dir
+        ensure_dir(output_dir)
+        rgb = (
+            image_68[local_index]
+            .detach()
+            .float()
+            .cpu()
+            .clamp(0.0, 1.0)
+            .permute(1, 2, 0)
+            .numpy()
+        )
+        panels = [np.rint(rgb * 255.0).astype(np.uint8)]
+        for value in maps:
+            gray = (
+                value[local_index]
+                .detach()
+                .float()
+                .cpu()
+                .squeeze()
+                .clamp(0.0, 1.0)
+                .numpy()
+            )
+            gray = np.rint(gray * 255.0).astype(np.uint8)
+            panels.append(np.repeat(gray[..., None], 3, axis=2))
+        canvas = np.concatenate(panels, axis=1)
+        Image.fromarray(canvas, mode="RGB").save(
+            output_dir / f"epoch_{int(epoch):03d}.png"
+        )
 
 
 def update_source_arbiter_vis_selection(
@@ -7096,6 +11535,15 @@ def save_source_arbiter_gate_visuals(
     source_disagreement,
     utility_target,
     selected_indices,
+    teacher_source_weight=None,
+    raw_teacher_loss_map=None,
+    ecst_teacher_loss_map=None,
+    sign_router_output=None,
+    sign_gates=None,
+    region_masks=None,
+    teacher_binary=None,
+    sign_positive_bound=1.5,
+    sign_negative_bound=4.0,
 ):
     selected_set = set(int(value) for value in selected_indices)
     if not selected_set:
@@ -7111,24 +11559,103 @@ def save_source_arbiter_gate_visuals(
         if utility_target is not None
         else torch.full_like(teacher_prob, 0.5)
     )
-    maps = {
-        "02_dabe_target": dabe_target,
-        "03_dabe_weight": dabe_weight,
-        "04_teacher_prob": teacher_prob,
-        "05_ecst_map": ecst_map,
-        "06_dino_margin": 0.5 + 0.5 * torch.tanh(margin / 0.05),
-        "07_temporal_variance": (4.0 * temporal_variance).clamp(0.0, 1.0),
-        "08_student_prob": student_prob,
-        "09_gate_dabe": gate_dabe,
-        "10_gate_teacher": gate_teacher,
-        "11_gate_teacher_delta": (
+    def normalize_for_vis(value):
+        value = value.detach().float().clamp_min(0.0)
+        maximum = value.flatten(1).amax(dim=1).view(-1, 1, 1, 1)
+        return value / maximum.clamp_min(1e-8)
+
+    if sign_router_output is not None or sign_gates is not None:
+        if (
+            not isinstance(sign_router_output, dict)
+            or not isinstance(sign_gates, dict)
+            or region_masks is None
+            or teacher_binary is None
+        ):
+            raise RuntimeError(
+                "EGSA-R2b visualization requires router output, sign gates, "
+                "region masks, and teacher binary."
+            )
+        high_fg = (dabe_target >= 0.70) & (dabe_weight >= 0.70)
+        dangerous_negative = (teacher_binary < 0.5) & (
+            region_masks["fg_core"]
+            | high_fg
+            | region_masks["extent"]
+            | region_masks["unknown"]
+        )
+        utility_valid = (
+            utility_target.valid.float()
+            if utility_target is not None
+            else torch.zeros_like(teacher_prob)
+        )
+        positive_bound = max(float(sign_positive_bound), 1e-6)
+        negative_bound = max(float(sign_negative_bound), 1e-6)
+        maps = {
+            "02_dabe_target": dabe_target,
+            "03_dabe_weight": dabe_weight,
+            "04_teacher_prob": teacher_prob,
+            "05_student_prob": student_prob,
+            "06_temporal_variance": (
+                4.0 * temporal_variance
+            ).clamp(0.0, 1.0),
+            "07_dino_margin": 0.5
+            + 0.5 * torch.tanh(margin / 0.05),
+            "08_gate_teacher_positive": sign_gates[
+                "gate_teacher_positive"
+            ],
+            "09_gate_teacher_negative": sign_gates[
+                "gate_teacher_negative"
+            ],
+            "10_gate_teacher_applied": gate_teacher,
+            "11_gate_dabe": gate_dabe,
+            "12_residual_positive": (
+                0.5
+                + 0.5
+                * sign_router_output["residual_positive"]
+                / positive_bound
+            ).clamp(0.0, 1.0),
+            "13_residual_negative": (
+                0.5
+                + 0.5
+                * sign_router_output["residual_negative"]
+                / negative_bound
+            ).clamp(0.0, 1.0),
+            "14_dangerous_negative_conflict": dangerous_negative.float(),
+            "15_utility_preference": preference,
+            "16_utility_valid": utility_valid,
+            "17_final_prediction": student_prob,
+        }
+    else:
+        maps = {
+            "02_dabe_target": dabe_target,
+            "03_dabe_weight": dabe_weight,
+            "04_teacher_prob": teacher_prob,
+            "05_ecst_map": ecst_map,
+            "06_dino_margin": 0.5 + 0.5 * torch.tanh(margin / 0.05),
+            "07_temporal_variance": (4.0 * temporal_variance).clamp(0.0, 1.0),
+            "08_student_prob": student_prob,
+            "09_gate_dabe": gate_dabe,
+            "10_gate_teacher": gate_teacher,
+            "11_gate_teacher_delta": (
+                0.5 + 0.5 * (gate_teacher - float(teacher_prior))
+            ),
+            "12_source_disagreement": source_disagreement.abs(),
+            "13_future_consensus": consensus,
+            "14_utility_preference": preference,
+            "15_final_prediction": student_prob,
+        }
+        if teacher_source_weight is not None:
+            maps["16_teacher_source_weight"] = teacher_source_weight
+        maps["17_signed_correction"] = (
             0.5 + 0.5 * (gate_teacher - float(teacher_prior))
-        ),
-        "12_source_disagreement": source_disagreement.abs(),
-        "13_future_consensus": consensus,
-        "14_utility_preference": preference,
-        "15_final_prediction": student_prob,
-    }
+        ).clamp(0.0, 1.0)
+        if raw_teacher_loss_map is not None:
+            maps["18_raw_teacher_loss"] = normalize_for_vis(
+                raw_teacher_loss_map
+            )
+        if ecst_teacher_loss_map is not None:
+            maps["19_ecst_teacher_loss"] = normalize_for_vis(
+                ecst_teacher_loss_map
+            )
     for local_index, sample_index in enumerate(batch["sample_index"].tolist()):
         if int(sample_index) not in selected_set:
             continue
@@ -8938,6 +13465,7 @@ def main():
     parser.add_argument("--max_train_samples", type=int, default=-1)
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--max_epochs", type=int, default=None)
+    parser.add_argument("--stop_after_epoch", type=int, default=0)
     parser.add_argument("--debug_loader_only", action="store_true")
     parser.add_argument("--work_dir", default=None)
     parser.add_argument("--resume", default=None)
@@ -8949,14 +13477,95 @@ def main():
         raise ValueError("--max_samples must be -1 or a positive integer.")
     if args.max_epochs is not None and args.max_epochs < 1:
         raise ValueError("--max_epochs must be a positive integer.")
+    if args.stop_after_epoch < 0:
+        raise ValueError("--stop_after_epoch must be 0 or a positive integer.")
     if args.resume and args.debug_loader_only:
         raise ValueError("--resume cannot be combined with --debug_loader_only.")
 
     cfg = load_config(args.config)
+    pssf_enabled = validate_pssf_config(cfg)
+    ap_stcr_enabled = validate_ap_stcr_config(cfg)
+    teacher_routing_mode = validate_teacher_routing_config(cfg)
+    if pssf_enabled:
+        supervision_handover_mode = "disabled_by_pssf"
+        supervision_handover_gamma = 1.0
+    else:
+        (
+            supervision_handover_mode,
+            supervision_handover_gamma,
+        ) = validate_supervision_handover_config(cfg)
+    static_weight_mode = (
+        "disabled_by_pssf"
+        if pssf_enabled
+        else get_static_weight_mode(cfg)
+    )
+    static_weight_audit_enabled = bool(
+        not pssf_enabled
+        and not ap_stcr_enabled
+        and
+        hasattr(cfg, "STATIC_WEIGHT_MODE")
+        and bool(getattr(cfg, "USE_DABE_PU", False))
+        and bool(getattr(cfg, "USE_DABE_PU_DESPL_SCHEDULE", False))
+    )
+    if (
+        hasattr(cfg, "STATIC_WEIGHT_MODE")
+        and not static_weight_audit_enabled
+        and not pssf_enabled
+        and not ap_stcr_enabled
+    ):
+        raise RuntimeError(
+            "STATIC_WEIGHT_MODE is only supported by the DABE-PU DESPL-style "
+            "static-loss path."
+        )
     validate_esa_ber_config(cfg)
     validate_tepr_lite_config(cfg)
     validate_ecst_config(cfg)
     validate_source_arbiter_config(cfg)
+    r2b_target_audit = validate_r2b_target_audit(cfg)
+    if (
+        str(getattr(cfg, "SOURCE_ARBITER_MODE", "")).lower()
+        == "sign_aware_pure_loss_space"
+        and str(getattr(cfg, "SOURCE_ARBITER_STAGE", "")).lower() == "stage20"
+    ):
+        requested_end_epoch = int(
+            args.max_epochs
+            if args.max_epochs is not None
+            else getattr(cfg, "MAX_EPOCH", 20)
+        )
+        mini_run_max_epoch = int(
+            getattr(cfg, "SOURCE_ARBITER_TARGET_AUDIT_MINI_RUN_MAX_EPOCH", 8)
+        )
+        if requested_end_epoch > mini_run_max_epoch:
+            raise RuntimeError(
+                "EGSA-R2b Audit v2 authorizes only the epoch7-8 mini-run. "
+                f"Use --max_epochs {mini_run_max_epoch}; Stage20 remains "
+                "unauthorized pending manual acceptance."
+            )
+    if (
+        str(getattr(cfg, "SOURCE_ARBITER_MODE", "")).lower()
+        == "sign_aware_pure_loss_space"
+        and str(getattr(cfg, "SOURCE_ARBITER_STAGE", "")).lower() == "long45"
+        and (
+            r2b_target_audit is None
+            or not r2b_target_audit[
+                "stage45_exploratory_training_authorized"
+            ]
+        )
+    ):
+        raise RuntimeError(
+            "EGSA-R2b Long45 exploratory training is not authorized by the "
+            "full Audit v2 concentration-only override."
+        )
+    if (
+        str(getattr(cfg, "SOURCE_ARBITER_MODE", "")).lower()
+        == "sign_aware_pure_loss_space"
+        and not args.resume
+    ):
+        raise RuntimeError(
+            "EGSA-R2b is resume-only. Use the checkpoint epoch required by "
+            "SOURCE_ARBITER_REQUIRED_RESUME_EPOCH; the authorized exploratory "
+            "Long45 run requires the canonical R1 epoch_006.pth."
+        )
     if bool(getattr(cfg, "USE_QRA", False)) and bool(getattr(cfg, "USE_CCR", False)):
         raise RuntimeError("USE_QRA=True and USE_CCR=True cannot be combined.")
     if bool(getattr(cfg, "USE_DREPP", False)) and (
@@ -9007,10 +13616,21 @@ def main():
             "dabe_pu_balanced_v2",
             "dabe_pu_oem",
             "dabe_pu_despl_sched",
+            "pssf_state",
+            "ppse_v2_state",
         }:
             raise RuntimeError(
                 "USE_DABE_PU=True requires TEACHER_FUSION_MODE in "
-                "{'dabe_pu_conf', 'dabe_pu_balanced_v2', 'dabe_pu_oem', 'dabe_pu_despl_sched'}."
+                "{'dabe_pu_conf', 'dabe_pu_balanced_v2', 'dabe_pu_oem', "
+                "'dabe_pu_despl_sched', 'pssf_state', 'ppse_v2_state'}."
+            )
+        if (
+            str(getattr(cfg, "TEACHER_FUSION_MODE", "")).lower()
+            in {"pssf_state", "ppse_v2_state"}
+            and not pssf_enabled
+        ):
+            raise RuntimeError(
+                "PSSF/PPSE teacher fusion requires USE_PSSF=True."
             )
         if bool(getattr(cfg, "USE_TEACHER_SOFT_FULL_LOSS", False)):
             if str(getattr(cfg, "TEACHER_FUSION_MODE", "")).lower() != "dabe_pu_despl_sched":
@@ -9562,6 +14182,11 @@ def main():
 
     cfg.PSEUDO_CACHE_OVERRIDE = args.pseudo_cache_override
     max_epoch = int(args.max_epochs) if args.max_epochs is not None else int(cfg.MAX_EPOCH)
+    stop_after_epoch = validate_stop_after_epoch(
+        args.stop_after_epoch,
+        max_epoch,
+        start_epoch=1,
+    )
     reset_epoch = get_reset_epoch(cfg)
     reset_enabled = is_finetune_reset_enabled(cfg)
     default_pre_reset_epochs = reset_epoch - 1 if reset_enabled else max_epoch
@@ -9574,6 +14199,42 @@ def main():
         train_dir = Path(cfg.WORK_ROOT) / cfg.EXP_NAME / "debug_loader"
     else:
         train_dir = Path(cfg.WORK_ROOT) / cfg.EXP_NAME / "train"
+    if ap_stcr_enabled:
+        allowed_work_root = (
+            Path(__file__).resolve().parent.parent / "workdir"
+        ).resolve()
+        resolved_train_dir = train_dir.resolve()
+        if (
+            resolved_train_dir != allowed_work_root
+            and allowed_work_root not in resolved_train_dir.parents
+        ):
+            raise RuntimeError(
+                "AP-STCR outputs must stay inside "
+                f"{allowed_work_root}, got {resolved_train_dir}."
+            )
+    if pssf_enabled:
+        pssf_experiment_root = (
+            Path(cfg.WORK_ROOT) / str(cfg.EXP_NAME)
+        ).resolve()
+        resolved_train_dir = train_dir.resolve()
+        if (
+            resolved_train_dir != pssf_experiment_root
+            and pssf_experiment_root not in resolved_train_dir.parents
+        ):
+            raise RuntimeError(
+                "PSSF outputs must stay inside its experiment workdir: "
+                f"{resolved_train_dir} is outside {pssf_experiment_root}."
+            )
+        if (
+            int(sample_limit) >= 0
+            and not args.work_dir
+            and not args.debug_loader_only
+        ):
+            raise RuntimeError(
+                "Limited PSSF runs require an explicit --work_dir inside the "
+                "experiment workdir so they cannot overwrite the formal split "
+                "manifest or runtime state."
+            )
     ckpt_dir = train_dir / "ckpt"
     ensure_dir(ckpt_dir)
     write_yaml(train_dir / "config.yaml", config_to_dict(cfg))
@@ -9636,6 +14297,7 @@ def main():
             f"{bool(getattr(cfg, 'LR_FLOOR_APPLY_AFTER_FINETUNE_RESET', True))}"
         )
         logger.log(f"max_epoch = {max_epoch}")
+        logger.log(f"stop_after_epoch = {stop_after_epoch}")
         logger.log(f"SAVE_EVERY_EPOCH = {bool(getattr(cfg, 'SAVE_EVERY_EPOCH', False))}")
         logger.log(f"SAVE_INTERVAL = {int(getattr(cfg, 'SAVE_INTERVAL', 0))}")
         logger.log(f"max_samples = {sample_limit}")
@@ -9658,6 +14320,144 @@ def main():
         logger.log(f"finetune_reset_force_lr_floor = {bool(getattr(cfg, 'FINETUNE_RESET_FORCE_LR_FLOOR', False))}")
         logger.log(f"finetune_reset_lr = {float(getattr(cfg, 'FINETUNE_RESET_LR', getattr(cfg, 'LR_FLOOR', 0.0))):.8f}")
         logger.log(f"teacher_fusion_mode = {getattr(cfg, 'TEACHER_FUSION_MODE', 'default')}")
+        if hasattr(cfg, "SUPERVISION_HANDOVER_MODE") and not pssf_enabled:
+            logger.log(
+                f"SUPERVISION_HANDOVER_MODE = {supervision_handover_mode}"
+            )
+            logger.log(
+                "SUPERVISION_HANDOVER_GAMMA = "
+                f"{supervision_handover_gamma:.8f}"
+            )
+            for audit_epoch in supervision_handover_audit_epochs(cfg):
+                audit_static, audit_teacher = get_dabe_pu_despl_schedule(
+                    audit_epoch, cfg
+                )
+                logger.log(
+                    "[SupervisionHandover] "
+                    f"epoch={audit_epoch:03d} | "
+                    f"static_weight={audit_static:.9f} | "
+                    f"teacher_weight={audit_teacher:.9f}"
+                )
+        if static_weight_audit_enabled:
+            logger.log(f"STATIC_WEIGHT_MODE = {static_weight_mode}")
+            logger.log(
+                "STATIC_WEIGHT_PROTOCOL_FINGERPRINT = "
+                f"{static_weight_protocol_fingerprint(cfg)}"
+            )
+            logger.log(
+                "STATIC_WEIGHT_SINGLE_VARIABLE = target/static schedule/"
+                "DAGP/NDR unchanged; teacher routing audited independently"
+            )
+        if (
+            teacher_routing_mode != LEGACY_TEACHER_ROUTING_MODE
+            and not pssf_enabled
+            and not ap_stcr_enabled
+        ):
+            logger.log(f"TEACHER_ROUTING_MODE = {teacher_routing_mode}")
+            logger.log(f"USE_ECST = {bool(getattr(cfg, 'USE_ECST', False))}")
+            logger.log(
+                "TEACHER_ROUTING_PROTOCOL_FINGERPRINT = "
+                f"{teacher_routing_protocol_fingerprint(cfg)}"
+            )
+            if teacher_routing_mode == "none":
+                logger.log(
+                    "NO_ECST_SINGLE_VARIABLE = ECST teacher pixel weighting "
+                    "disabled; target/static schedule/EMA/reset/DAGP/NDR unchanged"
+                )
+        if ap_stcr_enabled:
+            logger.log("USE_AP_STCR = True")
+            logger.log(f"SUPERVISION_MODE = {getattr(cfg, 'SUPERVISION_MODE')}")
+            logger.log(
+                "AP-STCR supervision = one detached full-pixel mixed target; "
+                "legacy static/teacher loss groups and teacher route maps bypassed"
+            )
+            for name, value in sorted(dict(getattr(cfg, "AP_STCR")).items()):
+                logger.log(f"AP_STCR.{name} = {value}")
+            logger.log("AP_STCR training_gt_used = False")
+            logger.log("AP_STCR semantic_cache_storage = cpu_float16")
+            logger.log("AP_STCR temporal_history_storage = cpu_float16")
+            logger.log(
+                "AP_STCR protected path = DABE-PU v1.1 + DAGP-Safe + "
+                "NDR-v1 + EMA + Linear30 + epoch29 after-reset"
+            )
+        if pssf_enabled:
+            logger.log("USE_PSSF = True")
+            logger.log(
+                f"PSSF_VERSION = {getattr(cfg, 'PSSF_VERSION', '')}"
+            )
+            logger.log(
+                f"SUPERVISION_MODE = {getattr(cfg, 'SUPERVISION_MODE')}"
+            )
+            logger.log(
+                "TEACHER_FUSION_MODE = "
+                f"{getattr(cfg, 'TEACHER_FUSION_MODE')}"
+            )
+            logger.log(
+                "PSSF supervision bypass = static/teacher global schedule, "
+                "static weight map, ECST/RAST/ESA/TEPR/EGSA, teacher route map"
+            )
+            for field in (
+                "PSSF_PATCH_SIZE",
+                "PSSF_LOSS_SIZE",
+                "PSSF_HORIZON",
+                "PSSF_HISTORY_WINDOW",
+                "PSSF_INIT_GAIN",
+                "PSSF_FEATURE_PROJ_DIM",
+                "PSSF_HIDDEN_DIM",
+                "PSSF_GN_GROUPS",
+                "PSSF_STATE_CHANNELS",
+                "PSSF_LR",
+                "PSSF_WEIGHT_DECAY",
+                "PSSF_STATE_DTYPE",
+                "PSSF_HISTORY_DTYPE",
+                "PSSF_AUDIT_VAL_RATIO",
+                "PSSF_AUDIT_SPLIT_SEED",
+                "PSSF_KEEP_STATE_ACROSS_RESET",
+                "PSSF_CLEAR_HISTORY_AFTER_RESET",
+                "PSSF_RUNTIME_FILENAME",
+            ):
+                logger.log(f"{field} = {getattr(cfg, field)}")
+            if use_ppse_v2(cfg):
+                logger.log(
+                    "PPSE_V2_PROTOCOL = PSSF predicts horizon-level "
+                    "teacher-innovation retention; the retention-conditioned "
+                    "proposal combines the persistent DABE-PU prior and the "
+                    "current binary EMA-teacher observation; the supervision "
+                    "state moves toward this proposal with an inverse-horizon "
+                    "step; the learner is optimized online with delayed "
+                    "targets while a frozen epoch-level actor controls current "
+                    "state updates; no handcrafted static-teacher schedule is used."
+                )
+                for field in (
+                    "PPSE_VERSION",
+                    "PPSE_STATE_STEP_MODE",
+                    "PPSE_STATE_STEP",
+                    "PPSE_USE_PRIOR_ANCHOR",
+                    "PPSE_PRIOR_SOURCE",
+                    "PPSE_USE_ACTOR_LEARNER",
+                    "PPSE_ACTOR_SYNC_MODE",
+                    "PPSE_ACTOR_TRAINABLE",
+                    "PPSE_ACTOR_UPDATE_WITHIN_EPOCH",
+                    "PSSF_INIT_RETENTION",
+                    "PSSF_KEEP_LEARNER_ACROSS_RESET",
+                    "PSSF_KEEP_ACTOR_ACROSS_RESET",
+                    "PSSF_KEEP_OPTIMIZER_ACROSS_RESET",
+                ):
+                    logger.log(f"{field} = {getattr(cfg, field)}")
+                logger.log("legacy_PSSF_INIT_GAIN_ignored=True")
+                logger.log(
+                    "initial_teacher_write_weight = "
+                    f"{float(getattr(cfg, 'PPSE_STATE_STEP')) * float(getattr(cfg, 'PSSF_INIT_RETENTION')):.8f}"
+                )
+                logger.log("global_schedule_used=False")
+                logger.log("ecst_used=False")
+                logger.log("rast_used=False")
+                logger.log("esa_used=False")
+            logger.log(
+                "PSSF segmentation branches = final/coarse/base | "
+                "weights_pre_reset=1.0/0.5/0.5 | "
+                "weights_post_reset=1.0/0.5/0.3"
+            )
         logger.log(f"fusion_orig_decay_epochs = {int(getattr(cfg, 'FUSION_ORIG_DECAY_EPOCHS', 20))}")
         logger.log(f"fusion_hold_fixed_weight = {float(getattr(cfg, 'FUSION_HOLD_FIXED_WEIGHT', 0.05)):.6f}")
         logger.log(
@@ -10672,7 +15472,25 @@ def main():
             logger.log("pseudo final candidate = target_soft_68")
             logger.log("use_fixed_in_pseudo = False")
             logger.log("fixed_used_for_training = False")
-        if str(getattr(cfg, "P_INIT_MODE", "")) in {
+        if ap_stcr_enabled:
+            logger.log("pseudo final candidate = AP-STCR mixed_target_68")
+            logger.log(
+                "p_init_formula = Q68=(1-alpha*c68)*target_soft_68 + "
+                "alpha*c68*teacher_binary_68"
+            )
+            logger.log("static_weight_map_used_for_training = False")
+            logger.log("teacher_route_map_used_for_training = False")
+            logger.log("fixed_used_for_training = False")
+        elif pssf_enabled:
+            logger.log("pseudo final candidate = online PSSF Q state")
+            logger.log(
+                "p_init_formula = Q0=target_soft_68; "
+                "Qt=Q(t-1)+K*(teacher_binary-Q(t-1))"
+            )
+            logger.log("static_weight_map_used_for_training = False")
+            logger.log("teacher_route_map_used_for_training = False")
+            logger.log("fixed_used_for_training = False")
+        elif str(getattr(cfg, "P_INIT_MODE", "")) in {
             "dabe_pu_v11_desplsched",
             "dabe_pu_v11_desplsched_exactreset",
             "dabe_pu_v11_desplsched_A1_keepteacher_lowlr",
@@ -10717,14 +15535,31 @@ def main():
         use_gkd_lite = use_despl and is_gkd_enabled(cfg)
         use_gkd_v3 = use_gkd_lite and is_gkd_v3_enabled(cfg)
         teacher_fusion_mode = str(getattr(cfg, "TEACHER_FUSION_MODE", "default")).lower()
+        use_pssf_train = bool(pssf_enabled)
+        use_ap_stcr_train = bool(ap_stcr_enabled)
         use_dabe_oem = use_dabe_pu and (
             teacher_fusion_mode == "dabe_pu_oem" or bool(getattr(cfg, "USE_DABE_OEM", False))
         )
         use_dabe_pu_balanced_v2 = use_dabe_pu and teacher_fusion_mode == "dabe_pu_balanced_v2"
         use_dabe_pu_despl_sched = use_dabe_pu and teacher_fusion_mode == "dabe_pu_despl_sched"
-        use_ecst = bool(getattr(cfg, "USE_ECST", False)) and use_dabe_pu_despl_sched
+        if use_ap_stcr_train and not use_dabe_pu_despl_sched:
+            raise RuntimeError(
+                "AP-STCR requires the DABE-PU DESPL-style schedule entry."
+            )
+        use_ecst = teacher_routing_uses_ecst(cfg) and use_dabe_pu_despl_sched
         use_source_arbiter_train = (
             bool(getattr(cfg, "USE_SOURCE_ARBITER", False)) and use_ecst
+        )
+        source_arbiter_mode = str(
+            getattr(cfg, "SOURCE_ARBITER_MODE", "residual_over_ecst")
+        ).lower()
+        source_arbiter_identity = {
+            "residual_over_ecst": "EGSA-R1",
+            "pure_loss_space": "EGSA-R2",
+            "sign_aware_pure_loss_space": "EGSA-R2b",
+        }.get(source_arbiter_mode, "EGSA-Unsupported")
+        source_arbiter_ecst_audit_enabled = bool(
+            getattr(cfg, "SOURCE_ARBITER_ECST_AUDIT_ONLY", False)
         )
         use_tepr_lite = bool(getattr(cfg, "USE_TEPR_LITE", False)) and use_dabe_pu_despl_sched
         use_rast = bool(getattr(cfg, "USE_RAST", False)) and use_dabe_pu_despl_sched
@@ -11032,6 +15867,226 @@ def main():
         criterion = torch.nn.BCEWithLogitsLoss()
         criterion_none = torch.nn.BCEWithLogitsLoss(reduction="none")
         optimizer, scheduler = build_optimizer_scheduler(cfg, student)
+        ap_stcr = None
+        ap_stcr_protocol_fingerprint = None
+        ap_stcr_protocol_payload = None
+        ap_stcr_visual_root = None
+        if use_ap_stcr_train:
+            ap_stcr = AnchorPropagatedSemanticTemporalCorrection(
+                config=dict(getattr(cfg, "AP_STCR")),
+                sample_keys=train_dataset.keys,
+            )
+            (
+                ap_stcr_protocol_fingerprint,
+                ap_stcr_protocol_payload,
+            ) = build_ap_stcr_protocol_fingerprint(cfg, ap_stcr)
+            ap_stcr_visual_root = train_dir / "ap_stcr_vis"
+            if bool(getattr(cfg, "AP_STCR").get("export_visualization", True)):
+                ensure_dir(ap_stcr_visual_root)
+            semantic_state = ap_stcr.semantic_cache.state_dict()
+            history_state = ap_stcr.history_bank.state_dict()
+            semantic_bytes = sum(
+                value.numel() * value.element_size()
+                for value in semantic_state.values()
+                if torch.is_tensor(value)
+            )
+            history_bytes = sum(
+                value.numel() * value.element_size()
+                for value in history_state.values()
+                if torch.is_tensor(value)
+            )
+            logger.log(
+                "[AP-STCR Init] "
+                f"samples={len(train_dataset)} | "
+                f"manifest_hash={ap_stcr.manifest_hash} | "
+                f"protocol_fingerprint={ap_stcr_protocol_fingerprint} | "
+                f"semantic_cache_bytes={semantic_bytes} | "
+                f"history_bytes={history_bytes} | "
+                f"visual_root={ap_stcr_visual_root} | "
+                "learnable_parameters=0 | training_gt_used=False"
+            )
+        pssf = None
+        pssf_actor = None
+        pssf_optimizer = None
+        pssf_state_bank = None
+        pssf_history_bank = None
+        pssf_train_mask = None
+        pssf_audit_val_mask = None
+        pssf_split_manifest = None
+        pssf_protocol_fingerprint = None
+        pssf_protocol_payload = None
+        pssf_runtime_path = None
+        pssf_runtime_sha256 = None
+        pssf_epoch_csv_path = None
+        pssf_visual_root = None
+        pssf_resume_state = None
+        pssf_vis_indices = []
+        if use_pssf_train:
+            pssf_artifact_root = (
+                train_dir.parent if train_dir.name == "train" else train_dir
+            )
+            pssf_init_output = float(
+                getattr(cfg, "PSSF_INIT_RETENTION", 0.03)
+                if use_ppse_v2(cfg)
+                else getattr(cfg, "PSSF_INIT_GAIN", 0.01)
+            )
+            pssf = PredictiveSupervisionStateFilter(
+                feature_channels=int(in_channels),
+                feature_proj_dim=int(
+                    getattr(cfg, "PSSF_FEATURE_PROJ_DIM", 32)
+                ),
+                state_channels=int(
+                    getattr(cfg, "PSSF_STATE_CHANNELS", 9)
+                ),
+                hidden_dim=int(getattr(cfg, "PSSF_HIDDEN_DIM", 32)),
+                gn_groups=int(getattr(cfg, "PSSF_GN_GROUPS", 4)),
+                init_gain=pssf_init_output,
+                output_semantics=(
+                    "horizon_innovation_retention"
+                    if use_ppse_v2(cfg)
+                    else "single_step_gain"
+                ),
+            ).to(device)
+            if use_ppse_v2(cfg):
+                pssf_actor = PredictiveSupervisionStateFilter(
+                    feature_channels=int(in_channels),
+                    feature_proj_dim=int(
+                        getattr(cfg, "PSSF_FEATURE_PROJ_DIM", 32)
+                    ),
+                    state_channels=int(
+                        getattr(cfg, "PSSF_STATE_CHANNELS", 9)
+                    ),
+                    hidden_dim=int(
+                        getattr(cfg, "PSSF_HIDDEN_DIM", 32)
+                    ),
+                    gn_groups=int(getattr(cfg, "PSSF_GN_GROUPS", 4)),
+                    init_gain=pssf_init_output,
+                    output_semantics="horizon_innovation_retention",
+                ).to(device)
+                sync_ppse_v2_actor(pssf, pssf_actor, epoch=1)
+            pssf_optimizer = torch.optim.AdamW(
+                pssf.parameters(),
+                lr=float(getattr(cfg, "PSSF_LR", 1e-3)),
+                weight_decay=float(
+                    getattr(cfg, "PSSF_WEIGHT_DECAY", 1e-4)
+                ),
+            )
+            pssf_runtime = initialize_pssf_runtime_state(
+                cfg=cfg,
+                train_dataset=train_dataset,
+                artifact_root=pssf_artifact_root,
+                sample_limit=sample_limit,
+            )
+            pssf_state_bank = pssf_runtime["state_bank"]
+            pssf_history_bank = pssf_runtime["history_bank"]
+            pssf_train_mask = pssf_runtime["train_mask"]
+            pssf_audit_val_mask = pssf_runtime["audit_val_mask"]
+            pssf_split_manifest = pssf_runtime["split_manifest"]
+            (
+                pssf_protocol_fingerprint,
+                pssf_protocol_payload,
+            ) = build_pssf_protocol_fingerprint(
+                cfg,
+                args.config,
+                pssf,
+                pssf_state_bank,
+                pssf_split_manifest,
+                pssf_actor=pssf_actor,
+            )
+            pssf_runtime_path = (
+                train_dir
+                / str(
+                    getattr(
+                        cfg,
+                        "PSSF_RUNTIME_FILENAME",
+                        "pssf_runtime_latest.pt",
+                    )
+                )
+            )
+            pssf_epoch_csv_path = pssf_artifact_root / (
+                "ppse_v2_epoch_stats.csv"
+                if use_ppse_v2(cfg)
+                else "pssf_epoch_stats.csv"
+            )
+            pssf_visual_root = pssf_artifact_root / (
+                "ppse_v2_visualizations"
+                if use_ppse_v2(cfg)
+                else "pssf_visualizations"
+            )
+            if not args.resume and pssf_epoch_csv_path.is_file():
+                pssf_epoch_csv_path.unlink()
+            pssf_vis_indices = select_pssf_visual_indices(
+                keys=train_dataset.keys,
+                audit_val_mask=pssf_audit_val_mask,
+                seed=int(getattr(cfg, "PSSF_VIS_SEED", 2027)),
+                camo_count=int(getattr(cfg, "PSSF_VIS_CAMO_COUNT", 4)),
+                cod10k_count=int(
+                    getattr(cfg, "PSSF_VIS_COD10K_COUNT", 8)
+                ),
+                strict=int(sample_limit) < 0,
+            )
+            q_bytes = (
+                pssf_state_bank.q_state.numel()
+                * pssf_state_bank.q_state.element_size()
+            )
+            history_bytes = sum(
+                value.numel() * value.element_size()
+                for value in pssf_history_bank.maps.values()
+            )
+            history_bytes += (
+                pssf_history_bank.epoch_tag.numel()
+                * pssf_history_bank.epoch_tag.element_size()
+            )
+            history_bytes += (
+                pssf_history_bank.target_consumed.numel()
+                * pssf_history_bank.target_consumed.element_size()
+            )
+            logger.log(
+                "[PSSF Init] "
+                f"samples={len(train_dataset)} | "
+                f"train/audit_val={int(pssf_train_mask.sum())}/"
+                f"{int(pssf_audit_val_mask.sum())} | "
+                f"q_shape={list(pssf_state_bank.q_state.shape)} | "
+                f"history_slots={pssf_history_bank.num_slots} | "
+                f"q_bytes={q_bytes} | history_bytes={history_bytes} | "
+                f"params={sum(p.numel() for p in pssf.parameters())} | "
+                f"actor_params="
+                f"{sum(p.numel() for p in pssf_actor.parameters()) if pssf_actor is not None else 0} | "
+                f"protocol_fingerprint={pssf_protocol_fingerprint} | "
+                f"runtime={pssf_runtime_path}"
+            )
+            if not use_ppse_v2(cfg):
+                logger.log(
+                    "PSSF_ONLINE_PROTOCOL = DABE-PU initializes a persistent "
+                    "supervision state; a learned patch-wise gain writes binary "
+                    "EMA-teacher observations into the state; gain supervision "
+                    "is delayed future-innovation retention; no handcrafted "
+                    "static-teacher schedule is used."
+                )
+            logger.log(
+                "[PSSF Protocol] "
+                f"config_sha256="
+                f"{pssf_protocol_payload['config_file_sha256']} | "
+                f"source_config="
+                f"{pssf_protocol_payload['source_config_path']} | "
+                f"source_sha256="
+                f"{pssf_protocol_payload['source_config_sha256']} | "
+                f"resolved_config_sha256="
+                f"{pssf_protocol_payload['resolved_config_sha256']} | "
+                f"sample_manifest_sha256="
+                f"{pssf_state_bank.manifest_hash} | "
+                f"split_manifest_sha256="
+                f"{pssf_split_manifest['manifest_hash']}"
+            )
+            logger.log(
+                "[PSSF VisualSelection] "
+                f"seed={int(getattr(cfg, 'PSSF_VIS_SEED', 2027))} | "
+                f"indices={pssf_vis_indices} | "
+                f"all_from_audit_val="
+                f"{all(bool(pssf_audit_val_mask[index]) for index in pssf_vis_indices)} | "
+                f"formal_fixed_12={int(sample_limit) < 0} | "
+                f"root={pssf_visual_root}"
+            )
         source_arbiter = None
         arbiter_optimizer = None
         utility_evaluator = None
@@ -11039,25 +16094,89 @@ def main():
         source_arbiter_vis_state = {
             "selected_indices": [],
             "categories": {},
+            "r2b_monitor": {},
         }
         if use_source_arbiter_train:
-            source_arbiter = SourceArbiter(
-                input_channels=int(getattr(cfg, "SOURCE_ARBITER_INPUT_CHANNELS", 18)),
-                hidden_1=int(getattr(cfg, "SOURCE_ARBITER_HIDDEN_1", 32)),
-                hidden_2=int(getattr(cfg, "SOURCE_ARBITER_HIDDEN_2", 32)),
-                hidden_3=int(getattr(cfg, "SOURCE_ARBITER_HIDDEN_3", 16)),
-                dilation=int(getattr(cfg, "SOURCE_ARBITER_DILATION", 2)),
-                residual_bound=float(
-                    getattr(cfg, "SOURCE_ARBITER_RESIDUAL_BOUND", 1.5)
-                ),
-                zero_init_head=bool(
-                    getattr(cfg, "SOURCE_ARBITER_ZERO_INIT_HEAD", True)
-                ),
-            ).to(device)
+            if source_arbiter_mode == "sign_aware_pure_loss_space":
+                source_arbiter = SignAwareSourceArbiter(
+                    input_channels=int(
+                        getattr(cfg, "SOURCE_ARBITER_INPUT_CHANNELS", 18)
+                    ),
+                    hidden_1=int(
+                        getattr(cfg, "SOURCE_ARBITER_HIDDEN_1", 32)
+                    ),
+                    hidden_2=int(
+                        getattr(cfg, "SOURCE_ARBITER_HIDDEN_2", 32)
+                    ),
+                    hidden_3=int(
+                        getattr(cfg, "SOURCE_ARBITER_HIDDEN_3", 16)
+                    ),
+                    dilation=int(
+                        getattr(cfg, "SOURCE_ARBITER_DILATION", 2)
+                    ),
+                    positive_residual_bound=float(
+                        getattr(
+                            cfg,
+                            "SOURCE_ARBITER_POS_RESIDUAL_BOUND",
+                            1.5,
+                        )
+                    ),
+                    negative_residual_bound=float(
+                        getattr(
+                            cfg,
+                            "SOURCE_ARBITER_NEG_RESIDUAL_BOUND",
+                            4.0,
+                        )
+                    ),
+                    zero_init_head=bool(
+                        getattr(cfg, "SOURCE_ARBITER_ZERO_INIT_HEAD", True)
+                    ),
+                ).to(device)
+            else:
+                source_arbiter = SourceArbiter(
+                    input_channels=int(
+                        getattr(cfg, "SOURCE_ARBITER_INPUT_CHANNELS", 18)
+                    ),
+                    hidden_1=int(
+                        getattr(cfg, "SOURCE_ARBITER_HIDDEN_1", 32)
+                    ),
+                    hidden_2=int(
+                        getattr(cfg, "SOURCE_ARBITER_HIDDEN_2", 32)
+                    ),
+                    hidden_3=int(
+                        getattr(cfg, "SOURCE_ARBITER_HIDDEN_3", 16)
+                    ),
+                    dilation=int(
+                        getattr(cfg, "SOURCE_ARBITER_DILATION", 2)
+                    ),
+                    residual_bound=float(
+                        getattr(cfg, "SOURCE_ARBITER_RESIDUAL_BOUND", 1.5)
+                    ),
+                    zero_init_head=bool(
+                        getattr(cfg, "SOURCE_ARBITER_ZERO_INIT_HEAD", True)
+                    ),
+                ).to(device)
             router_params = source_arbiter_parameter_count(source_arbiter)
             if router_params >= 25000:
                 raise RuntimeError(
-                    f"EGSA-R1 router must have <25000 parameters, got {router_params}."
+                    f"{source_arbiter_identity} router must have <25000 "
+                    f"parameters, got {router_params}."
+                )
+            if (
+                source_arbiter_mode == "pure_loss_space"
+                and router_params != 19265
+            ):
+                raise RuntimeError(
+                    "EGSA-R2 router parameter count must remain exactly 19265, "
+                    f"got {router_params}."
+                )
+            if (
+                source_arbiter_mode == "sign_aware_pure_loss_space"
+                and router_params != 19282
+            ):
+                raise RuntimeError(
+                    "EGSA-R2b router parameter count must remain exactly "
+                    f"19282, got {router_params}."
                 )
             arbiter_optimizer = torch.optim.AdamW(
                 source_arbiter.parameters(),
@@ -11076,12 +16195,57 @@ def main():
             for parameter in utility_evaluator.parameters():
                 parameter.requires_grad_(False)
             logger.log(
-                "[EGSA-R1] initialized | "
+                f"[{source_arbiter_identity}] initialized | "
+                f"mode={source_arbiter_mode} | "
                 f"router_params={router_params} | "
                 f"arbiter_lr={float(getattr(cfg, 'SOURCE_ARBITER_LR', 1e-4)):.8f} | "
                 f"utility_ema_decay={float(getattr(cfg, 'SOURCE_ARBITER_UTILITY_EMA_DECAY', 0.999)):.6f} | "
                 "inference_overhead=0"
             )
+            if source_arbiter_mode == "pure_loss_space":
+                logger.log(
+                    "[EGSA-R2] teacher_source_weight_mode=ones | "
+                    "ecst_weighting_used_for_training=False | "
+                    "structured_evidence_used=True | "
+                    f"ecst_map_audit_only={source_arbiter_ecst_audit_enabled}"
+                )
+            elif source_arbiter_mode == "sign_aware_pure_loss_space":
+                logger.log(
+                    "[EGSA-R2b] teacher_source_weight_mode=ones | "
+                    "ecst_weighting_used_for_training=False | "
+                    "structured_evidence_used=True | "
+                    "router_heads=positive,negative | "
+                    f"train_scale_7_20=True | apply_scale_7_45=True | "
+                    f"target_audit={r2b_target_audit}"
+                )
+                logger.log(
+                    "[EGSA-R2b AuditOverride] "
+                    f"Audit strict pass = {r2b_target_audit['strict_pass']}"
+                )
+                logger.log(
+                    "[EGSA-R2b AuditOverride] "
+                    "Audit concentration-only override = "
+                    f"{r2b_target_audit['concentration_override_passed']}"
+                )
+                logger.log(
+                    "[EGSA-R2b AuditOverride] Unexpected failures = "
+                    f"{r2b_target_audit['unexpected_failures']}"
+                )
+                logger.log(
+                    "[EGSA-R2b AuditOverride] "
+                    "Stage45 exploratory training authorized = "
+                    f"{r2b_target_audit['stage45_exploratory_training_authorized']}"
+                )
+                logger.log(
+                    "[EGSA-R2b ClassWeights] fixed Audit v2 | "
+                    "positive teacher/dabe="
+                    f"{r2b_target_audit['class_weights']['positive']['teacher']:.10f}/"
+                    f"{r2b_target_audit['class_weights']['positive']['dabe']:.10f} | "
+                    "negative teacher/dabe="
+                    f"{r2b_target_audit['class_weights']['negative']['teacher']:.10f}/"
+                    f"{r2b_target_audit['class_weights']['negative']['dabe']:.10f} | "
+                    "per_batch_recompute=False | epoch_ema=False"
+                )
             for name in sorted(
                 key for key in dir(cfg) if key.startswith("SOURCE_ARBITER_")
             ):
@@ -11098,10 +16262,36 @@ def main():
         start_epoch = 1
         checkpoint = None
         resume_pending_after_reset = False
+        source_arbiter_resume_contract = None
         if args.resume:
             resume_path = Path(args.resume)
             if not resume_path.is_file():
                 raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+            if (
+                source_arbiter_mode == "sign_aware_pure_loss_space"
+                and int(
+                    getattr(
+                        cfg,
+                        "SOURCE_ARBITER_REQUIRED_RESUME_EPOCH",
+                        -1,
+                    )
+                )
+                == 6
+            ):
+                resume_sha = _sha256_file(resume_path)
+                expected_resume_sha = str(
+                    getattr(
+                        cfg,
+                        "SOURCE_ARBITER_TARGET_AUDIT_SOURCE_SHA256",
+                        "",
+                    )
+                ).lower()
+                if resume_sha != expected_resume_sha:
+                    raise RuntimeError(
+                        "EGSA-R2b run must fork from the audited canonical "
+                        "R1 epoch6 checkpoint: "
+                        f"{resume_sha} != {expected_resume_sha}."
+                    )
 
             checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
             required_keys = {
@@ -11127,31 +16317,100 @@ def main():
             teacher.load_state_dict(checkpoint["teacher"], strict=True)
             optimizer.load_state_dict(checkpoint["optimizer"])
             scheduler.load_state_dict(checkpoint["scheduler"])
+            if use_ap_stcr_train:
+                required_ap_stcr_keys = {
+                    "ap_stcr_runtime_state",
+                    "ap_stcr_protocol_fingerprint",
+                    "ap_stcr_manifest_hash",
+                    "checkpoint_phase",
+                    "global_step",
+                    "rng_state",
+                    "train_loader_generator_state",
+                }
+                missing_ap_stcr = sorted(
+                    required_ap_stcr_keys.difference(checkpoint)
+                )
+                if missing_ap_stcr:
+                    raise RuntimeError(
+                        "AP-STCR resume requires complete causal runtime state; "
+                        f"missing={missing_ap_stcr}."
+                    )
+                if (
+                    str(checkpoint["ap_stcr_protocol_fingerprint"])
+                    != str(ap_stcr_protocol_fingerprint)
+                ):
+                    raise RuntimeError(
+                        "AP-STCR resume protocol fingerprint mismatch: "
+                        f"{checkpoint['ap_stcr_protocol_fingerprint']} != "
+                        f"{ap_stcr_protocol_fingerprint}."
+                    )
+                if str(checkpoint["ap_stcr_manifest_hash"]) != str(
+                    ap_stcr.manifest_hash
+                ):
+                    raise RuntimeError(
+                        "AP-STCR resume manifest fingerprint mismatch."
+                    )
+                ap_stcr.load_state_dict(
+                    checkpoint["ap_stcr_runtime_state"]
+                )
+                restore_rng_state(checkpoint["rng_state"])
+                train_loader_generator.set_state(
+                    checkpoint["train_loader_generator_state"]
+                )
+            if use_pssf_train:
+                pssf_resume_state = load_pssf_resume_state(
+                    cfg=cfg,
+                    checkpoint=checkpoint,
+                    pssf=pssf,
+                    pssf_actor=pssf_actor,
+                    pssf_optimizer=pssf_optimizer,
+                    protocol_fingerprint=pssf_protocol_fingerprint,
+                    state_bank=pssf_state_bank,
+                    history_bank=pssf_history_bank,
+                    split_manifest=pssf_split_manifest,
+                    train_loader_generator=train_loader_generator,
+                )
             if use_source_arbiter_train:
+                source_arbiter_resume_contract = (
+                    validate_source_arbiter_resume_mode(cfg, checkpoint)
+                )
+                temporal_memory_key = source_arbiter_resume_contract[
+                    "temporal_memory_key"
+                ]
                 required_egsa_keys = {
                     "source_arbiter",
                     "source_arbiter_optimizer",
                     "utility_evaluator",
                     "route_trajectory_memory",
-                    "ecst_temporal_memory",
                     "global_step",
                     "rng_state",
                     "train_loader_generator_state",
                     "checkpoint_phase",
                     "source_arbiter_lifecycle",
+                    temporal_memory_key,
                 }
                 missing_egsa = sorted(required_egsa_keys.difference(checkpoint))
                 if missing_egsa:
                     raise RuntimeError(
-                        "EGSA-R1 resume checkpoint is missing dynamic state: "
+                        f"{source_arbiter_identity} resume checkpoint is missing "
+                        "dynamic state: "
                         f"{missing_egsa}. Active-stage resume cannot reinitialize it."
                     )
-                source_arbiter.load_state_dict(
-                    checkpoint["source_arbiter"], strict=True
-                )
-                arbiter_optimizer.load_state_dict(
-                    checkpoint["source_arbiter_optimizer"]
-                )
+                if (
+                    source_arbiter_mode == "sign_aware_pure_loss_space"
+                    and source_arbiter_resume_contract["is_r1_epoch6_fork"]
+                ):
+                    migrate_r1_router_to_sign_aware(
+                        source_arbiter,
+                        checkpoint,
+                    )
+                else:
+                    source_arbiter.load_state_dict(
+                        checkpoint["source_arbiter"], strict=True
+                    )
+                    arbiter_optimizer.load_state_dict(
+                        checkpoint["source_arbiter_optimizer"]
+                    )
                 utility_evaluator.load_state_dict(
                     checkpoint["utility_evaluator"], strict=True
                 )
@@ -11160,10 +16419,12 @@ def main():
                     "active_pre_reset",
                     "pending_after_epoch_reset",
                     "post_reset_inactive",
+                    "post_reset_frozen",
                 }
                 if checkpoint_phase not in valid_phases:
                     raise RuntimeError(
-                        "EGSA-R1 resume checkpoint has invalid phase: "
+                        f"{source_arbiter_identity} resume checkpoint has invalid "
+                        "phase: "
                         f"{checkpoint_phase!r}."
                     )
                 restore_rng_state(checkpoint["rng_state"])
@@ -11185,6 +16446,9 @@ def main():
                                 "categories", {}
                             ).items()
                         },
+                        "r2b_monitor": dict(
+                            saved_vis_state.get("r2b_monitor", {})
+                        ),
                     }
 
             best_metric = float(checkpoint.get("best_metric", best_metric))
@@ -11197,7 +16461,27 @@ def main():
                     f"with max_epoch={max_epoch}."
                 )
 
-            if "global_step" in checkpoint:
+            if use_ap_stcr_train:
+                global_step = int(checkpoint["global_step"])
+                global_step_source = "checkpoint"
+                expected_phase = ap_stcr_checkpoint_phase(cfg, saved_epoch)
+                checkpoint_phase = str(checkpoint["checkpoint_phase"])
+                if checkpoint_phase != expected_phase:
+                    raise RuntimeError(
+                        "AP-STCR resume phase/epoch mismatch: "
+                        f"{checkpoint_phase} != {expected_phase}."
+                    )
+                resume_pending_after_reset = (
+                    checkpoint_phase == "pending_after_epoch_reset"
+                )
+            elif use_pssf_train:
+                global_step = int(pssf_resume_state["global_step"])
+                global_step_source = "paired_pssf_runtime"
+                resume_pending_after_reset = (
+                    pssf_resume_state["phase"]
+                    == "pending_after_epoch_reset"
+                )
+            elif "global_step" in checkpoint:
                 global_step = int(checkpoint["global_step"])
                 global_step_source = "checkpoint"
             else:
@@ -11214,20 +16498,61 @@ def main():
                 "student_restored=True | teacher_restored=True | "
                 "optimizer_restored=True | scheduler_restored=True"
             )
+            if use_ap_stcr_train:
+                logger.log(
+                    "[AP-STCR Resume] "
+                    f"phase={checkpoint['checkpoint_phase']} | "
+                    "semantic_cache_restored=True | history_restored=True | "
+                    "rng_restored=True | dataloader_generator_restored=True | "
+                    f"pending_after_epoch_reset={resume_pending_after_reset}"
+                )
+            if use_pssf_train:
+                expected_phase = pssf_checkpoint_phase(cfg, saved_epoch)
+                if pssf_resume_state["phase"] != expected_phase:
+                    raise RuntimeError(
+                        "PSSF resume phase/epoch mismatch: "
+                        f"{pssf_resume_state['phase']} != {expected_phase}."
+                    )
+                resume_label = (
+                    "[PPSE-v2 Resume]"
+                    if use_ppse_v2(cfg)
+                    else "[PSSF Resume]"
+                )
+                logger.log(
+                    f"{resume_label} "
+                    f"runtime={pssf_resume_state['runtime_path']} | "
+                    f"runtime_sha256={pssf_resume_state['runtime_sha256']} | "
+                    f"phase={pssf_resume_state['phase']} | "
+                    "Q_restored=True | history_restored=True | "
+                    + (
+                        "learner_restored=True | actor_restored=True | "
+                        f"actor_sync_epoch={pssf_resume_state['actor_sync_epoch']} | "
+                        if use_ppse_v2(cfg)
+                        else "pssf_restored=True | "
+                    )
+                    + "pssf_optimizer_restored=True | "
+                    "rng_restored=True | dataloader_generator_restored=True"
+                )
             if use_source_arbiter_train:
                 expected_phase = (
                     "pending_after_epoch_reset"
                     if saved_epoch == get_reset_epoch(cfg)
                     and is_after_epoch_finetune_reset(cfg)
                     else (
-                        "post_reset_inactive"
+                        (
+                            "post_reset_frozen"
+                            if source_arbiter_mode
+                            == "sign_aware_pure_loss_space"
+                            else "post_reset_inactive"
+                        )
                         if saved_epoch > get_reset_epoch(cfg)
                         else "active_pre_reset"
                     )
                 )
                 if str(checkpoint["checkpoint_phase"]) != expected_phase:
                     raise RuntimeError(
-                        "EGSA-R1 resume checkpoint phase/epoch mismatch: "
+                        f"{source_arbiter_identity} resume checkpoint "
+                        "phase/epoch mismatch: "
                         f"epoch={saved_epoch}, phase={checkpoint['checkpoint_phase']}, "
                         f"expected={expected_phase}."
                     )
@@ -11236,12 +16561,53 @@ def main():
                     == "pending_after_epoch_reset"
                 )
                 logger.log(
-                    "[EGSA-R1 Resume] source_arbiter_restored=True | "
-                    "arbiter_optimizer_restored=True | "
+                    f"[{source_arbiter_identity} Resume] "
+                    "source_arbiter_restored=True | "
+                    "arbiter_optimizer_restored="
+                    f"{not source_arbiter_resume_contract['is_r1_epoch6_fork']} | "
                     "utility_evaluator_restored=True | rng_restored=True | "
                     "dataloader_generator_restored=True | "
+                    f"saved_mode={source_arbiter_resume_contract['saved_mode']} | "
+                    f"target_mode={source_arbiter_resume_contract['target_mode']} | "
                     f"checkpoint_phase={checkpoint['checkpoint_phase']}"
                 )
+                if source_arbiter_resume_contract["is_r1_epoch6_fork"]:
+                    fork_name = (
+                        "EGSA-R2b Fork"
+                        if source_arbiter_mode
+                        == "sign_aware_pure_loss_space"
+                        else "EGSA-R2 Fork"
+                    )
+                    logger.log(
+                        f"[{fork_name}] source=canonical_r1_epoch006 | "
+                        "saved_epoch=6 | start_epoch=7 | "
+                        "dynamic_state_complete=True | "
+                        "teacher_source_weight_mode_switch=ecst_to_ones | "
+                        "router_body_restored=True | "
+                        "dual_head_zero_initialized="
+                        f"{source_arbiter_mode == 'sign_aware_pure_loss_space'} | "
+                        "arbiter_optimizer_rebuilt=True"
+                    )
+
+        stop_after_epoch = validate_stop_after_epoch(
+            stop_after_epoch,
+            max_epoch,
+            start_epoch=start_epoch,
+        )
+        static_weight_audit_path = None
+        if static_weight_audit_enabled:
+            static_weight_audit_path = (
+                train_dir / "static_weight_audit.csv"
+                if args.work_dir
+                else Path(cfg.WORK_ROOT)
+                / cfg.EXP_NAME
+                / "static_weight_audit.csv"
+            )
+            if not args.resume and static_weight_audit_path.exists():
+                static_weight_audit_path.unlink()
+            logger.log(
+                f"STATIC_WEIGHT_AUDIT_CSV = {static_weight_audit_path}"
+            )
 
         lr_floor_activated_logged = False
         ecst_memory = None
@@ -11269,10 +16635,16 @@ def main():
                     dtype=str(getattr(cfg, "ECST_MEMORY_DTYPE", "float16")),
                 )
                 if resume_needs_active_memory:
-                    state = checkpoint.get("ecst_temporal_memory")
+                    temporal_memory_key = (
+                        source_arbiter_resume_contract["temporal_memory_key"]
+                        if source_arbiter_resume_contract is not None
+                        else "ecst_temporal_memory"
+                    )
+                    state = checkpoint.get(temporal_memory_key)
                     if state is None:
                         raise RuntimeError(
-                            "EGSA-R1 active resume is missing ecst_temporal_memory."
+                            f"{source_arbiter_identity} active resume is missing "
+                            f"{temporal_memory_key}."
                         )
                     ecst_memory.load_state_dict(state)
                 memory_bytes = (
@@ -11293,6 +16665,16 @@ def main():
                     f"start_epoch={start_epoch} | update_end={memory_update_end} | "
                     "memory_active=False"
                 )
+        elif (
+            teacher_routing_mode == "none"
+            and not use_pssf_train
+            and not use_ap_stcr_train
+        ):
+            logger.log(
+                "[TeacherRouting] mode=none | ECST temporal memory "
+                "initialized=False | evidence_builder_used=False | "
+                "dino_margin_used=False"
+            )
 
         if use_source_arbiter_train:
             route_update_end = int(
@@ -11314,7 +16696,8 @@ def main():
                     state = checkpoint.get("route_trajectory_memory")
                     if state is None:
                         raise RuntimeError(
-                            "EGSA-R1 active resume is missing route_trajectory_memory."
+                            f"{source_arbiter_identity} active resume is missing "
+                            "route_trajectory_memory."
                         )
                     route_memory.load_state_dict(state)
                 route_state = route_memory.state_dict()
@@ -11324,7 +16707,7 @@ def main():
                     if torch.is_tensor(value)
                 )
                 logger.log(
-                    "[EGSA-R1] route trajectory memory initialized | "
+                    f"[{source_arbiter_identity}] route trajectory memory initialized | "
                     f"num_samples={len(train_dataset)} | "
                     f"shape=[1,{int(cfg.LOSS_SIZE)},{int(cfg.LOSS_SIZE)}] | "
                     f"dtype={getattr(cfg, 'SOURCE_ARBITER_MEMORY_DTYPE', 'float16')} | "
@@ -11332,7 +16715,7 @@ def main():
                 )
             else:
                 logger.log(
-                    "[EGSA-R1] route trajectory memory inactive | "
+                    f"[{source_arbiter_identity}] route trajectory memory inactive | "
                     f"start_epoch={start_epoch} | update_end={route_update_end} | "
                     "memory_active=False"
                 )
@@ -11356,17 +16739,108 @@ def main():
                         lr_floor_activated_logged,
                     )
                 )
-                if ecst_memory is not None:
-                    ecst_memory.clear()
                 if route_memory is not None:
                     route_memory.clear()
-                ecst_memory = None
                 route_memory = None
-                logger.log(
-                    "[EGSA-R1 Resume] pending epoch20 after-reset applied | "
-                    "ECST memory cleared=True | route memory cleared=True | "
-                    "utility_evaluator_active=False"
+                if source_arbiter_mode == "sign_aware_pure_loss_space":
+                    if ecst_memory is None:
+                        raise RuntimeError(
+                            "EGSA-R2b Long45 resume must preserve the source "
+                            "temporal memory from Stage20."
+                        )
+                    utility_evaluator = None
+                    source_arbiter.eval()
+                    for parameter in source_arbiter.parameters():
+                        parameter.requires_grad_(False)
+                    logger.log(
+                        "[EGSA-R2b Resume] pending epoch20 after-reset applied "
+                        "exactly once | source_temporal_memory_preserved=True | "
+                        "route_memory_released=True | "
+                        "utility_evaluator_released=True | "
+                        "router_frozen=True"
+                    )
+                else:
+                    if ecst_memory is not None:
+                        ecst_memory.clear()
+                    ecst_memory = None
+                    logger.log(
+                        f"[{source_arbiter_identity} Resume] pending epoch20 "
+                        "after-reset applied | "
+                        "ECST memory cleared=True | route memory cleared=True | "
+                        "utility_evaluator_active=False"
+                    )
+
+        if use_pssf_train and resume_pending_after_reset:
+            if start_epoch != get_reset_epoch(cfg) + 1:
+                raise RuntimeError(
+                    "PSSF pending-after-reset runtime must resume exactly at "
+                    f"epoch {get_reset_epoch(cfg) + 1}, got {start_epoch}."
                 )
+            optimizer, scheduler, global_step, lr_floor_activated_logged = (
+                apply_finetune_reset(
+                    logger,
+                    cfg,
+                    get_reset_epoch(cfg),
+                    student,
+                    teacher,
+                    optimizer,
+                    scheduler,
+                    global_step,
+                    lr_floor_activated_logged,
+                )
+            )
+            pssf_history_bank.clear(next_epoch=start_epoch)
+            if use_ppse_v2(cfg):
+                logger.log(
+                    "[PPSE-v2 Reset] pending after-epoch reset replayed "
+                    "exactly once | "
+                    f"saved_epoch={get_reset_epoch(cfg)} | "
+                    f"next_epoch={start_epoch} | "
+                    "q_state_preserved=True | learner_preserved=True | "
+                    "actor_preserved=True | "
+                    "pssf_optimizer_preserved=True | "
+                    "history_cleared=True | "
+                    "cross_reset_target_used=False | "
+                    "prior_p0_available=True"
+                )
+            else:
+                logger.log(
+                    "[PSSF Reset] pending after-epoch reset replayed "
+                    "exactly once | "
+                    f"saved_epoch={get_reset_epoch(cfg)} | "
+                    f"next_epoch={start_epoch} | q_state_preserved=True | "
+                    "pssf_network_preserved=True | "
+                    "pssf_optimizer_preserved=True | history_cleared=True | "
+                    "cross_reset_targets_used=False"
+                )
+
+        if use_ap_stcr_train and resume_pending_after_reset:
+            if start_epoch != get_reset_epoch(cfg) + 1:
+                raise RuntimeError(
+                    "AP-STCR pending-after-reset checkpoint must resume exactly "
+                    f"at epoch {get_reset_epoch(cfg) + 1}, got {start_epoch}."
+                )
+            optimizer, scheduler, global_step, lr_floor_activated_logged = (
+                apply_finetune_reset(
+                    logger,
+                    cfg,
+                    get_reset_epoch(cfg),
+                    student,
+                    teacher,
+                    optimizer,
+                    scheduler,
+                    global_step,
+                    lr_floor_activated_logged,
+                )
+            )
+            ap_stcr.clear_temporal_history()
+            logger.log(
+                "[AP-STCR Reset] pending after-epoch reset replayed exactly "
+                f"once | saved_epoch={get_reset_epoch(cfg):03d} | "
+                f"next_epoch={start_epoch:03d} | "
+                "semantic_cache_preserved=True | history_cleared=True | "
+                "cross_reset_history_used=False"
+            )
 
         tepr_memory = None
         if use_tepr_lite:
@@ -11421,6 +16895,9 @@ def main():
         mvflip_first_batch_logged = False
         mvproto_first_batch_logged = False
         rast_first_batch_logged = False
+        static_weight_first_batch_logged = False
+        teacher_routing_first_batch_logged = False
+        ap_stcr_first_batch_logged_epoch = None
         ecst_first_batch_logged_epoch = None
         source_arbiter_first_batch_logged_epoch = None
         tepr_first_batch_logged_epoch = None
@@ -11434,6 +16911,14 @@ def main():
         tce_train_first_batch_logged = False
         lceg_train_first_batch_logged = False
         pa_dagp_first_active_batch_logged = False
+        pssf_first_batch_logged = False
+        pssf_first_delayed_batch_logged = False
+        pssf_patch_not_better_streak = 0
+        pssf_teacher_takeover_streak = 0
+        pssf_static_freeze_streak = 0
+        pssf_spatial_collapse_streak = 0
+        pssf_collapse_streak = 0
+        ppse_q_teacher_close_streak = 0
         pa_dagp_warning_streaks = {
             "positive_ratio": 0,
             "negative_ratio": 0,
@@ -11449,8 +16934,22 @@ def main():
         gkd_branch_v2_first_batch_path = train_dir / "gkd_branch_v2_first_batch.csv"
         gkd_branch_v3_csv_path = train_dir / "gkd_branch_v3_epoch.csv"
         gkd_branch_v3_first_batch_path = train_dir / "gkd_branch_v3_first_batch.csv"
+        r2b_paired_r1_areas = (
+            load_r2b_paired_r1_areas(cfg)
+            if source_arbiter_mode == "sign_aware_pure_loss_space"
+            else {}
+        )
+        if r2b_paired_r1_areas:
+            logger.log(
+                "[EGSA-R2b AreaMonitor] paired R1 areas loaded | "
+                f"epochs={len(r2b_paired_r1_areas)} | "
+                f"first/last={min(r2b_paired_r1_areas)}/"
+                f"{max(r2b_paired_r1_areas)} | "
+                f"log={getattr(cfg, 'SOURCE_ARBITER_PAIRED_R1_LOG', '')}"
+            )
 
         for epoch in range(start_epoch, max_epoch + 1):
+            ppse_actor_epoch_audit = None
             source_arbiter_epoch_start_time = (
                 time.perf_counter() if use_source_arbiter_train else None
             )
@@ -11473,20 +16972,45 @@ def main():
             set_model_epoch(teacher, epoch)
             student.train()
             teacher.eval()
+            if use_pssf_train:
+                pssf.train()
+                if use_ppse_v2(cfg):
+                    ppse_actor_epoch_audit = sync_ppse_v2_actor(
+                        pssf,
+                        pssf_actor,
+                        epoch,
+                    )
+                    if _pssf_module_has_grad(pssf_actor):
+                        raise RuntimeError(
+                            "[PPSE-v2 ERROR] actor_grad_present_at_epoch_start"
+                        )
+                pssf_history_bank.begin_epoch(epoch)
             if use_source_arbiter_train:
-                set_model_epoch(utility_evaluator, epoch)
-                utility_evaluator.eval()
-                if int(epoch) < int(
-                    getattr(cfg, "SOURCE_ARBITER_STOP_EPOCH", 21)
-                ):
+                if utility_evaluator is not None:
+                    set_model_epoch(utility_evaluator, epoch)
+                    utility_evaluator.eval()
+                if get_arbiter_train_scale(epoch, cfg) > 0.0:
+                    for parameter in source_arbiter.parameters():
+                        parameter.requires_grad_(True)
                     source_arbiter.train()
                 else:
                     source_arbiter.eval()
-            fixed_weight, teacher_weight, fusion_mode = get_fixed_teacher_weights(cfg, epoch)
-            effective_despl_weight = 1.0 if use_pure_despl else fixed_weight
-            effective_teacher_weight = 0.0 if use_pure_despl else teacher_weight
-            target_mode = "pure_despl" if use_pure_despl else fusion_mode
-            teacher_binary_used = False if use_pure_despl else bool(effective_teacher_weight > 0.0)
+            supervision_state = resolve_epoch_supervision_for_training(
+                cfg,
+                epoch,
+                use_pure_despl=use_pure_despl,
+            )
+            fixed_weight = supervision_state["fixed_weight"]
+            teacher_weight = supervision_state["teacher_weight"]
+            fusion_mode = supervision_state["fusion_mode"]
+            effective_despl_weight = supervision_state[
+                "effective_despl_weight"
+            ]
+            effective_teacher_weight = supervision_state[
+                "effective_teacher_weight"
+            ]
+            target_mode = supervision_state["target_mode"]
+            teacher_binary_used = supervision_state["teacher_binary_used"]
             total_loss = 0.0
             total_base_loss = 0.0
             total_anchor_loss = 0.0
@@ -11550,6 +17074,42 @@ def main():
             dabe_pu_teacher_fg_ratio_sum = 0.0
             dabe_pu_teacher_bg_ratio_sum = 0.0
             dabe_pu_stat_batches = 0
+            static_weight_epoch_accumulator = (
+                new_static_weight_audit_accumulator()
+                if static_weight_audit_enabled
+                else None
+            )
+            teacher_routing_epoch_accumulator = (
+                new_teacher_routing_accumulator()
+                if (
+                    teacher_routing_mode != LEGACY_TEACHER_ROUTING_MODE
+                    and not use_pssf_train
+                    and not use_ap_stcr_train
+                )
+                else None
+            )
+            ap_stcr_epoch_accumulator = (
+                new_ap_stcr_epoch_accumulator(
+                    histogram_bins=int(
+                        getattr(cfg, "AP_STCR").get(
+                            "statistics_histogram_bins", 1000
+                        )
+                    )
+                )
+                if use_ap_stcr_train
+                else None
+            )
+            ap_stcr_loss_final_sum = 0.0
+            ap_stcr_loss_coarse_sum = 0.0
+            ap_stcr_loss_base_sum = 0.0
+            ap_stcr_loss_group_sum = 0.0
+            pssf_epoch_accumulator = (
+                new_pssf_epoch_accumulator() if use_pssf_train else None
+            )
+            pssf_seg_final_sum = 0.0
+            pssf_seg_coarse_sum = 0.0
+            pssf_seg_base_sum = 0.0
+            pssf_seg_group_sum = 0.0
             dabe_pu_target_hard_area_sum = 0.0
             dabe_pu_v12_target_base_mean_sum = 0.0
             dabe_pu_v12_weight_base_mean_sum = 0.0
@@ -11576,6 +17136,11 @@ def main():
                 "fixed_brier_sum": 0.0,
                 "score_sum": 0.0,
                 "target_sum": 0.0,
+                "utility_teacher_count": 0,
+                "utility_dabe_count": 0,
+                "utility_tie_count": 0,
+                "utility_teacher_recall_correct": 0,
+                "utility_dabe_recall_correct": 0,
                 "positive_hist": [0] * 100,
                 "negative_hist": [0] * 100,
                 "calibration_count": [0] * 100,
@@ -12100,6 +17665,41 @@ def main():
             for iter_idx, batch in enumerate(train_loader):
                 if use_cssd_train:
                     optimizer.zero_grad(set_to_none=True)
+                if use_ap_stcr_train:
+                    leaked_gt_keys = sorted(
+                        key
+                        for key in batch
+                        if str(key).lower() in {
+                            "gt",
+                            "mask",
+                            "ground_truth",
+                            "gt_path",
+                            "mask_path",
+                        }
+                    )
+                    if leaked_gt_keys:
+                        raise RuntimeError(
+                            "AP-STCR training batch must not contain GT fields: "
+                            f"{leaked_gt_keys}."
+                        )
+                    required_ap_fields = {
+                        "sample_index",
+                        "dataset",
+                        "stem",
+                        "image_path",
+                        "feature",
+                        "pu_target_soft",
+                        "pu_target_soft_37",
+                        "pu_bg_anchor_37",
+                    }
+                    missing_ap_fields = sorted(
+                        required_ap_fields.difference(batch)
+                    )
+                    if missing_ap_fields:
+                        raise RuntimeError(
+                            "AP-STCR batch is missing required fields: "
+                            f"{missing_ap_fields}."
+                        )
                 egsa_sample_indices = None
                 egsa_old_route = None
                 egsa_temporal_prefetch = None
@@ -12111,12 +17711,14 @@ def main():
                     )
                     if leaked_gt_keys:
                         raise RuntimeError(
-                            "EGSA-R1 training batch must not contain GT fields: "
+                            f"{source_arbiter_identity} training batch must not "
+                            "contain GT fields: "
                             f"{leaked_gt_keys}."
                         )
                     if "sample_index" not in batch:
                         raise RuntimeError(
-                            "EGSA-R1 batch is missing stable sample_index."
+                            f"{source_arbiter_identity} batch is missing stable "
+                            "sample_index."
                         )
                     egsa_sample_indices = batch["sample_index"].long()
                     if (
@@ -12125,7 +17727,7 @@ def main():
                         != int(batch["feature"].shape[0])
                     ):
                         raise RuntimeError(
-                            "EGSA-R1 sample_index must be [B], got "
+                            f"{source_arbiter_identity} sample_index must be [B], got "
                             f"{list(egsa_sample_indices.shape)}."
                         )
                     if int(epoch) <= int(
@@ -12133,7 +17735,8 @@ def main():
                     ):
                         if route_memory is None or ecst_memory is None:
                             raise RuntimeError(
-                                "EGSA-R1 memories are unavailable inside the active "
+                                f"{source_arbiter_identity} memories are unavailable "
+                                "inside the active "
                                 "history window."
                             )
                         egsa_old_route = route_memory.fetch(
@@ -12149,27 +17752,79 @@ def main():
                 image_136 = make_image_136(cfg, batch, device)
                 pseudo_68 = F.interpolate(pseudo, size=(cfg.LOSS_SIZE, cfg.LOSS_SIZE), mode="bilinear").float()
                 pu_target_soft = None
+                pu_weight_map_raw = None
                 pu_weight_map = None
                 pu_static_target = None
                 pu_static_weight_map = None
+                static_weight_region_masks = None
                 pu_target_hard = None
                 pu_fg_core = None
                 pu_bg_core = None
                 if use_dabe_pu:
                     pu_target_soft = batch["pu_target_soft"].to(device, non_blocking=True).float()
-                    pu_weight_map = batch["pu_weight_map"].to(device, non_blocking=True).float()
                     hard_thresh = float(getattr(cfg, "DABE_PU_HARD_THRESH", 0.5))
                     pu_target_hard = (pu_target_soft > hard_thresh).float()
                     pu_static_target = pu_target_soft
-                    pu_static_weight_map = pu_weight_map
-                    if use_dabe_pu_despl_sched:
-                        pu_static_target, pu_static_weight_map, _ = build_dabe_pu_despl_static_target(
-                            cfg,
-                            pu_target_soft,
-                            pu_weight_map,
-                        )
-                    pu_fg_core = batch["pu_fg_core"].to(device, non_blocking=True).float()
-                    pu_bg_core = batch["pu_bg_core"].to(device, non_blocking=True).float()
+                    if not use_pssf_train:
+                        pu_weight_map_raw = batch["pu_weight_map"].to(
+                            device,
+                            non_blocking=True,
+                        ).float()
+                        # Compatibility alias: legacy branches and diagnostics still
+                        # consume the unmodified cache tensor.
+                        pu_weight_map = pu_weight_map_raw
+                        if use_ap_stcr_train:
+                            pu_static_target = pu_target_soft.detach()
+                            pu_static_weight_map = None
+                            batch_static_weight_mode = (
+                                "bypassed_by_ap_stcr"
+                            )
+                        elif use_dabe_pu_despl_sched:
+                            pu_static_target, _, _ = build_dabe_pu_despl_static_target(
+                                cfg,
+                                pu_target_soft,
+                                pu_weight_map_raw,
+                            )
+                        if not use_ap_stcr_train:
+                            pu_static_weight_map, batch_static_weight_mode = (
+                                build_effective_static_weight(
+                                    cfg=cfg,
+                                    batch=batch,
+                                    raw_weight_map=pu_weight_map_raw,
+                                    device=device,
+                                )
+                            )
+                            if tuple(pu_static_weight_map.shape) != tuple(
+                                pu_static_target.shape
+                            ):
+                                raise RuntimeError(
+                                    "Static target/weight shape mismatch: "
+                                    f"{list(pu_static_target.shape)} != "
+                                    f"{list(pu_static_weight_map.shape)}"
+                                )
+                            if pu_static_weight_map.requires_grad:
+                                raise RuntimeError(
+                                    "Effective static weight map must be detached"
+                                )
+                            if batch_static_weight_mode != static_weight_mode:
+                                raise RuntimeError(
+                                    "Static weight mode changed inside the batch: "
+                                    f"{batch_static_weight_mode} != {static_weight_mode}"
+                                )
+                            if static_weight_audit_enabled:
+                                static_weight_region_masks = (
+                                    build_static_weight_region_masks(
+                                        batch,
+                                        device,
+                                        expected_shape=pu_static_weight_map.shape,
+                                    )
+                                )
+                        pu_fg_core = batch["pu_fg_core"].to(
+                            device, non_blocking=True
+                        ).float()
+                        pu_bg_core = batch["pu_bg_core"].to(
+                            device, non_blocking=True
+                        ).float()
                 csd_bg_reliable_68 = None
                 if (
                     (use_csd_head(cfg) or use_csd_v1r_head(cfg))
@@ -12365,14 +18020,350 @@ def main():
                     )
                     teacher_logits = resize_logits_for_loss(extract_logits(teacher_out), cfg)
                     teacher_prob = teacher_logits.sigmoid()
-                    teacher_binary_thresh = 0.5 if use_dabe_pu_despl_sched else float(cfg.THRESHOLD)
-                    teacher_binary = (teacher_prob >= teacher_binary_thresh).float()
+                    if use_pssf_train:
+                        teacher_binary_thresh = 0.5
+                        teacher_binary = teacher_binary_observation(
+                            teacher_prob
+                        )
+                    elif use_ap_stcr_train:
+                        teacher_binary_thresh = float(
+                            getattr(cfg, "AP_STCR").get(
+                                "teacher_binary_threshold", 0.5
+                            )
+                        )
+                        teacher_binary = strict_teacher_binary(
+                            teacher_prob,
+                            threshold=teacher_binary_thresh,
+                        )
+                    else:
+                        teacher_binary_thresh = (
+                            0.5
+                            if use_dabe_pu_despl_sched
+                            else float(cfg.THRESHOLD)
+                        )
+                        teacher_binary = (
+                            teacher_prob >= teacher_binary_thresh
+                        ).float()
                     if use_dabe_pu_despl_sched and dabe_pu_despl_teacher_target_mode == "soft_prob":
                         teacher_full_target = teacher_prob.detach()
                     else:
                         teacher_full_target = teacher_binary
 
+                ap_stcr_batch_result = None
+                if use_ap_stcr_train:
+                    ap_sample_indices = batch["sample_index"].long()
+                    if (
+                        ap_sample_indices.ndim != 1
+                        or int(ap_sample_indices.shape[0])
+                        != int(student_logits.shape[0])
+                    ):
+                        raise RuntimeError(
+                            "AP-STCR sample_index must be [B], got "
+                            f"{list(ap_sample_indices.shape)}."
+                        )
+                    ap_fixed_37 = batch["pu_target_soft_37"].to(
+                        device, non_blocking=True
+                    ).float()
+                    ap_bg_anchor_37 = batch["pu_bg_anchor_37"].to(
+                        device, non_blocking=True
+                    ).float()
+                    _, ap_teacher_ratio = get_dabe_pu_despl_schedule(
+                        epoch, cfg
+                    )
+                    ap_stcr_batch_result = ap_stcr.build_batch(
+                        dino_features=model_input,
+                        fixed_pseudo_37=ap_fixed_37,
+                        fixed_pseudo_68=pu_target_soft,
+                        dabe_background_seed_37=ap_bg_anchor_37,
+                        teacher_soft_68=teacher_prob.detach(),
+                        teacher_binary_68=teacher_binary.detach(),
+                        global_teacher_ratio=ap_teacher_ratio,
+                        sample_indices=ap_sample_indices,
+                        datasets=batch["dataset"],
+                        stems=batch["stem"],
+                    )
+                    if (
+                        ap_stcr_first_batch_logged_epoch != int(epoch)
+                        and int(epoch)
+                        % max(
+                            1,
+                            int(
+                                getattr(cfg, "AP_STCR").get(
+                                    "log_interval_epoch", 1
+                                )
+                            ),
+                        )
+                        == 0
+                    ):
+                        ap_result = ap_stcr_batch_result
+                        logger.log(
+                            "[AP-STCR FirstBatch] "
+                            f"epoch={epoch:03d} | "
+                            f"feature_shape={list(model_input.shape)} | "
+                            f"target37/bg_anchor37="
+                            f"{list(ap_fixed_37.shape)}/"
+                            f"{list(ap_bg_anchor_37.shape)} | "
+                            f"target68={list(ap_result['mixed_target_68'].shape)} | "
+                            f"sample_index={ap_sample_indices.tolist()} | "
+                            f"alpha={float(ap_result['global_teacher_ratio']):.9f} | "
+                            "history_count min/mean/max="
+                            f"{int(ap_result['history_count'].min())}/"
+                            f"{float(ap_result['history_count'].float().mean()):.4f}/"
+                            f"{int(ap_result['history_count'].max())}"
+                        )
+                        logger.log(
+                            "[AP-STCR FirstBatch] "
+                            "fg/bg anchors mean="
+                            f"{float(ap_result['fg_anchor_mask_37'].float().flatten(1).sum(1).mean()):.4f}/"
+                            f"{float(ap_result['bg_anchor_mask_37'].float().flatten(1).sum(1).mean()):.4f} | "
+                            f"bg_sources={ap_result['bg_anchor_source']} | "
+                            "margin min/mean/max="
+                            f"{float(ap_result['semantic_margin_37'].min()):.6f}/"
+                            f"{float(ap_result['semantic_margin_37'].mean()):.6f}/"
+                            f"{float(ap_result['semantic_margin_37'].max()):.6f}"
+                        )
+                        logger.log(
+                            "[AP-STCR FirstBatch] "
+                            "semantic/temporal/acceptance mean="
+                            f"{float(ap_result['semantic_support_37'].mean()):.6f}/"
+                            f"{float(ap_result['temporal_support_37'].mean()):.6f}/"
+                            f"{float(ap_result['local_acceptance_37'].mean()):.6f} | "
+                            "effective teacher min/mean/max="
+                            f"{float(ap_result['effective_teacher_weight_68'].min()):.6f}/"
+                            f"{float(ap_result['effective_teacher_weight_68'].mean()):.6f}/"
+                            f"{float(ap_result['effective_teacher_weight_68'].max()):.6f} | "
+                            "fixed/teacher/mixed area="
+                            f"{float(pu_target_soft.mean()):.6f}/"
+                            f"{float(teacher_binary.mean()):.6f}/"
+                            f"{float(ap_result['mixed_target_68'].mean()):.6f} | "
+                            "training_gt_used=False"
+                        )
+                        ap_stcr_first_batch_logged_epoch = int(epoch)
+                    ap_visual_cfg = dict(getattr(cfg, "AP_STCR"))
+                    if (
+                        bool(ap_visual_cfg.get("export_visualization", True))
+                        and int(epoch)
+                        % max(
+                            1,
+                            int(
+                                ap_visual_cfg.get(
+                                    "visualization_interval", 1
+                                )
+                            ),
+                        )
+                        == 0
+                    ):
+                        selected_indices = {
+                            int(value)
+                            for value in ap_visual_cfg.get(
+                                "visualization_sample_indices", [0]
+                            )
+                        }
+                        for local_index, sample_index in enumerate(
+                            ap_sample_indices.tolist()
+                        ):
+                            if int(sample_index) not in selected_indices:
+                                continue
+                            diagnostic = build_ap_stcr_diagnostic_payload(
+                                epoch=epoch,
+                                local_index=local_index,
+                                batch=batch,
+                                image_68=image_68,
+                                student_prob_68=student_logits.sigmoid().detach(),
+                                result=ap_stcr_batch_result,
+                            )
+                            epoch_visual_dir = (
+                                ap_stcr_visual_root
+                                / f"epoch_{int(epoch):03d}"
+                            )
+                            ensure_dir(epoch_visual_dir)
+                            prefix = (
+                                f"{diagnostic['dataset']}__"
+                                f"{diagnostic['stem']}"
+                            )
+                            torch.save(
+                                diagnostic,
+                                epoch_visual_dir / f"{prefix}.pt",
+                            )
+                            render_ap_stcr_diagnostic(
+                                diagnostic,
+                                epoch_visual_dir / f"{prefix}.png",
+                            )
+
+                pssf_batch_result = None
+                pssf_q_target = None
+                if use_pssf_train:
+                    pssf_batch_result = run_pssf_batch(
+                        cfg=cfg,
+                        epoch=epoch,
+                        batch=batch,
+                        model_input=model_input,
+                        student_prob=student_logits.sigmoid().detach(),
+                        teacher_prob=teacher_prob.detach(),
+                        teacher_binary=teacher_binary.detach(),
+                        p0_soft=pu_target_soft.detach(),
+                        pssf=pssf,
+                        pssf_optimizer=pssf_optimizer,
+                        state_bank=pssf_state_bank,
+                        history_bank=pssf_history_bank,
+                        pssf_train_mask=pssf_train_mask,
+                        pssf_audit_val_mask=pssf_audit_val_mask,
+                        student=student,
+                        teacher=teacher,
+                        optimizer=optimizer,
+                        device=device,
+                        pssf_actor=pssf_actor,
+                    )
+                    pssf_q_target = pssf_batch_result[
+                        "q_current_68"
+                    ].detach()
+                    accumulate_pssf_epoch(
+                        pssf_epoch_accumulator,
+                        pssf_batch_result,
+                    )
+                    if int(epoch) == 1 or int(epoch) % max(
+                        1, int(getattr(cfg, "PSSF_VIS_INTERVAL", 5))
+                    ) == 0:
+                        save_pssf_visuals(
+                            visual_root=pssf_visual_root,
+                            epoch=epoch,
+                            batch=batch,
+                            image_68=image_68,
+                            p0_soft=pu_target_soft.detach(),
+                            teacher_binary=teacher_binary.detach(),
+                            teacher_prob=teacher_prob.detach(),
+                            student_prob=student_logits.sigmoid().detach(),
+                            pssf_result=pssf_batch_result,
+                            selected_indices=pssf_vis_indices,
+                        )
+                    if not pssf_first_batch_logged:
+                        gain_first = pssf_batch_result["gain_37"]
+                        gain_spatial_std = float(
+                            gain_first.float()
+                            .flatten(1)
+                            .std(dim=1, unbiased=False)
+                            .mean()
+                            .item()
+                        )
+                        q_prev_first = pssf_batch_result["q_prev_68"]
+                        first_batch_label = (
+                            "[PPSE-v2 FirstBatch]"
+                            if use_ppse_v2(cfg)
+                            else "[PSSF FirstBatch]"
+                        )
+                        logger.log(
+                            f"{first_batch_label} "
+                            f"supervision_mode={getattr(cfg, 'SUPERVISION_MODE')} | "
+                            f"pssf_version={getattr(cfg, 'PSSF_VERSION')} | "
+                            f"epoch={epoch:03d} | "
+                            f"horizon={int(getattr(cfg, 'PSSF_HORIZON', 3))} | "
+                            f"history_window={int(getattr(cfg, 'PSSF_HISTORY_WINDOW', 3))} | "
+                            f"sample_index={pssf_batch_result['indices'].tolist()} | "
+                            f"feature_shape={list(model_input.shape)} | "
+                            "state_channels=9 | "
+                            f"state_shape={pssf_batch_result['current_state_shape']} | "
+                            f"pssf_input_shape="
+                            f"{[int(model_input.shape[0]), 41, 37, 37]} | "
+                            f"output_shape={list(gain_first.shape)} | "
+                            "retention_or_gain_min/mean/max="
+                            f"{float(gain_first.min()):.8f}/"
+                            f"{float(gain_first.mean()):.8f}/"
+                            f"{float(gain_first.max()):.8f} | "
+                            f"spatial_std={gain_spatial_std:.8f} | "
+                            f"init_output_expected="
+                            f"{float(getattr(cfg, 'PSSF_INIT_RETENTION', 0.03) if use_ppse_v2(cfg) else getattr(cfg, 'PSSF_INIT_GAIN', 0.01)):.8f} | "
+                            f"q_prev_68_shape={list(q_prev_first.shape)} | "
+                            "q_prev_min/mean/max="
+                            f"{float(q_prev_first.min()):.6f}/"
+                            f"{float(q_prev_first.mean()):.6f}/"
+                            f"{float(q_prev_first.max()):.6f} | "
+                            "teacher_binary_68_min/mean/max="
+                            f"{float(teacher_binary.min()):.6f}/"
+                            f"{float(teacher_binary.mean()):.6f}/"
+                            f"{float(teacher_binary.max()):.6f} | "
+                            f"gain68_shape="
+                            f"{list(pssf_batch_result['gain_68'].shape)} | "
+                            f"q_current_68_shape={list(pssf_q_target.shape)} | "
+                            "q_current_min/mean/max="
+                            f"{float(pssf_q_target.min()):.6f}/"
+                            f"{float(pssf_q_target.mean()):.6f}/"
+                            f"{float(pssf_q_target.max()):.6f} | "
+                            "global_schedule_used=False | "
+                            "static_loss_used=False | teacher_loss_used=False | "
+                            "ecst_used=False | teacher_route_map_used=False"
+                        )
+                        if use_ppse_v2(cfg):
+                            logger.log(
+                                "[PPSE-v2 FirstBatch] "
+                                f"actor_sync_epoch={ppse_actor_epoch_audit['actor_sync_epoch']} | "
+                                f"actor_hash={ppse_actor_epoch_audit['actor_hash_start']} | "
+                                f"learner_hash={ppse_actor_epoch_audit['learner_hash_start']} | "
+                                f"retention_shape={list(pssf_batch_result['retention_37'].shape)} | "
+                                "retention_min/mean/max="
+                                f"{float(pssf_batch_result['retention_37'].min()):.8f}/"
+                                f"{float(pssf_batch_result['retention_37'].mean()):.8f}/"
+                                f"{float(pssf_batch_result['retention_37'].max()):.8f} | "
+                                f"expected_init_retention={float(getattr(cfg, 'PSSF_INIT_RETENTION')):.8f} | "
+                                f"state_memory_weight={float(pssf_batch_result['state_memory_weight']):.8f} | "
+                                "p0_write_weight_min/mean/max="
+                                f"{float(pssf_batch_result['p0_write_weight_68'].min()):.8f}/"
+                                f"{float(pssf_batch_result['p0_write_weight_68'].mean()):.8f}/"
+                                f"{float(pssf_batch_result['p0_write_weight_68'].max()):.8f} | "
+                                "teacher_write_weight_min/mean/max="
+                                f"{float(pssf_batch_result['teacher_write_weight_68'].min()):.8f}/"
+                                f"{float(pssf_batch_result['teacher_write_weight_68'].mean()):.8f}/"
+                                f"{float(pssf_batch_result['teacher_write_weight_68'].max()):.8f} | "
+                                f"coefficient_sum_error_max={float(pssf_batch_result['coefficient_sum_error_max']):.9g} | "
+                                f"p0_mean={float(pu_target_soft.mean()):.8f} | "
+                                f"q_prev_mean={float(q_prev_first.mean()):.8f} | "
+                                f"teacher_binary_mean={float(teacher_binary.mean()):.8f} | "
+                                f"proposal_mean={float(pssf_batch_result['proposal_68'].mean()):.8f} | "
+                                f"q_current_mean={float(pssf_q_target.mean()):.8f} | "
+                                f"q_to_p0_mae={float((pssf_q_target - pu_target_soft).abs().mean()):.8f} | "
+                                f"q_to_teacher_mae={float((pssf_q_target - teacher_binary).abs().mean()):.8f} | "
+                                f"proposal_to_p0_mae={float((pssf_batch_result['proposal_68'] - pu_target_soft).abs().mean()):.8f} | "
+                                f"proposal_to_teacher_mae={float((pssf_batch_result['proposal_68'] - teacher_binary).abs().mean()):.8f} | "
+                                f"actual_state_change_abs_mean={float((pssf_q_target - q_prev_first).abs().mean()):.8f} | "
+                                "global_schedule_used=False"
+                            )
+                        pssf_first_batch_logged = True
+                    if (
+                        pssf_batch_result["delayed_active"] > 0.0
+                        and not pssf_first_delayed_batch_logged
+                    ):
+                        logger.log(
+                            (
+                                "[PPSE Retention Target FirstBatch] "
+                                if use_ppse_v2(cfg)
+                                else "[PSSF Target FirstBatch] "
+                            )
+                            + f"epoch={epoch:03d} | "
+                            f"source_epoch={int(pssf_batch_result['source_epoch'])} | "
+                            + (
+                                "target_retention_mean train/val="
+                                if use_ppse_v2(cfg)
+                                else "target_gain_mean train/val="
+                            )
+                            + f"{pssf_batch_result['train_target_sum'] / max(pssf_batch_result['train_target_count'], 1):.6f}/"
+                            f"{pssf_batch_result['audit_val_target_sum'] / max(pssf_batch_result['audit_val_target_count'], 1):.6f} | "
+                            "innovation_weight_mean train/val="
+                            f"{pssf_batch_result['train_innovation_sum'] / max(pssf_batch_result['train_innovation_count'], 1):.6f}/"
+                            f"{pssf_batch_result['audit_val_innovation_sum'] / max(pssf_batch_result['audit_val_innovation_count'], 1):.6f} | "
+                            "weighted_mse train/val="
+                            f"{pssf_batch_result['train_weighted_sq_error_sum'] / max(pssf_batch_result['train_weight_sum'], 1e-12):.8f}/"
+                            f"{pssf_batch_result['audit_val_weighted_sq_error_sum'] / max(pssf_batch_result['audit_val_weight_sum'], 1e-12):.8f} | "
+                            "patch/scalar_future_mae train="
+                            f"{pssf_batch_result['train_patch_future_mae_sum'] / max(pssf_batch_result['train_images'], 1):.8f}/"
+                            f"{pssf_batch_result['train_scalar_future_mae_sum'] / max(pssf_batch_result['train_images'], 1):.8f} | "
+                            "patch/scalar_future_mae val="
+                            f"{pssf_batch_result['audit_val_patch_future_mae_sum'] / max(pssf_batch_result['audit_val_images'], 1):.8f}/"
+                            f"{pssf_batch_result['audit_val_scalar_future_mae_sum'] / max(pssf_batch_result['audit_val_images'], 1):.8f}"
+                        )
+                        pssf_first_delayed_batch_logged = True
+
                 teacher_route_map = None
+                ecst_map_audit = None
+                teacher_source_weight = None
                 teacher_routing_scale = 0.0
                 ecst_sample_indices = None
                 ecst_stats = None
@@ -12408,7 +18399,14 @@ def main():
                     "esa_post_reset_active": False,
                     "esa_post_reset_scale": 0.0,
                 }
-                if use_ecst:
+                if use_pssf_train or use_ap_stcr_train:
+                    teacher_routing_scale = 0.0
+                elif teacher_routing_mode == "none":
+                    teacher_route_map, _ = build_identity_teacher_route(
+                        teacher_prob.detach()
+                    )
+                    teacher_routing_scale = 0.0
+                elif use_ecst:
                     if "sample_index" not in batch:
                         raise RuntimeError("ECST batch is missing stable sample_index.")
                     ecst_sample_indices = batch["sample_index"].long()
@@ -12447,26 +18445,111 @@ def main():
                                     device,
                                 )
                             )
-                        ecst_result = build_ecst_teacher_weight_map(
-                            cfg=cfg,
-                            batch=batch,
-                            teacher_prob=teacher_prob.detach(),
-                            temporal_mean=temporal_mean,
-                            temporal_second=temporal_second,
-                            history_count=history_count,
-                            epoch=epoch,
-                            device=device,
-                            return_states=use_source_arbiter_train,
-                        )
-                        if use_source_arbiter_train:
-                            teacher_route_map, ecst_stats, ecst_states = ecst_result
+                        if (
+                            use_source_arbiter_train
+                            and source_arbiter_mode
+                            in {
+                                "pure_loss_space",
+                                "sign_aware_pure_loss_space",
+                            }
+                        ):
+                            ecst_states = build_ecst_evidence_states(
+                                cfg=cfg,
+                                batch=batch,
+                                teacher_prob=teacher_prob.detach(),
+                                temporal_mean=temporal_mean,
+                                temporal_second=temporal_second,
+                                history_count=history_count,
+                                device=device,
+                            )
+                            if source_arbiter_ecst_audit_enabled:
+                                with torch.no_grad():
+                                    (
+                                        ecst_map_audit,
+                                        ecst_stats,
+                                        ecst_states,
+                                    ) = build_ecst_teacher_weight_map_from_states(
+                                        cfg=cfg,
+                                        teacher_prob=teacher_prob.detach(),
+                                        history_count=history_count,
+                                        epoch=epoch,
+                                        device=device,
+                                        states=ecst_states,
+                                        return_states=True,
+                                    )
+                                teacher_route_map = ecst_map_audit
+                                ecst_stats["audit_available"] = True
+                            else:
+                                teacher_route_map = torch.ones_like(
+                                    teacher_prob,
+                                    dtype=torch.float32,
+                                )
+                                ecst_stats = make_ecst_evidence_only_stats(
+                                    cfg=cfg,
+                                    batch=batch,
+                                    teacher_prob=teacher_prob.detach(),
+                                    history_count=history_count,
+                                    epoch=epoch,
+                                    states=ecst_states,
+                                    device=device,
+                                )
                         else:
-                            teacher_route_map, ecst_stats = ecst_result
+                            ecst_result = build_ecst_teacher_weight_map(
+                                cfg=cfg,
+                                batch=batch,
+                                teacher_prob=teacher_prob.detach(),
+                                temporal_mean=temporal_mean,
+                                temporal_second=temporal_second,
+                                history_count=history_count,
+                                epoch=epoch,
+                                device=device,
+                                return_states=use_source_arbiter_train,
+                            )
+                            if use_source_arbiter_train:
+                                (
+                                    teacher_route_map,
+                                    ecst_stats,
+                                    ecst_states,
+                                ) = ecst_result
+                            else:
+                                teacher_route_map, ecst_stats = ecst_result
                         ecst_stats["memory_active"] = True
                     else:
                         teacher_route_map = torch.ones_like(teacher_prob, dtype=torch.float32)
+                        if (
+                            source_arbiter_mode == "pure_loss_space"
+                            and source_arbiter_ecst_audit_enabled
+                        ):
+                            ecst_map_audit = teacher_route_map
                         ecst_stats = make_ecst_inactive_stats(batch, teacher_prob, device)
                     teacher_routing_scale = float(ecst_stats["ecst_scale"])
+                    if use_source_arbiter_train:
+                        teacher_source_weight = build_teacher_source_weight(
+                            mode=source_arbiter_mode,
+                            teacher_prob=teacher_prob.detach(),
+                            ecst_weight_map=(
+                                teacher_route_map
+                                if source_arbiter_mode == "residual_over_ecst"
+                                else None
+                            ),
+                        )
+                        if source_arbiter_mode in {
+                            "pure_loss_space",
+                            "sign_aware_pure_loss_space",
+                        }:
+                            if teacher_source_weight.dtype != torch.float32:
+                                raise RuntimeError(
+                                    f"{source_arbiter_identity} teacher source "
+                                    "weight must be float32."
+                                )
+                            if not torch.equal(
+                                teacher_source_weight,
+                                torch.ones_like(teacher_source_weight),
+                            ):
+                                raise RuntimeError(
+                                    f"{source_arbiter_identity} teacher source "
+                                    "weight is not exactly one."
+                                )
                     if (
                         bool(getattr(cfg, "ECST_DEBUG_FIRST_BATCH", True))
                         and ecst_first_batch_logged_epoch != int(epoch)
@@ -12625,7 +18708,151 @@ def main():
                         )
                         esa_asym_first_batch_logged = True
 
+                if (
+                    teacher_routing_mode != LEGACY_TEACHER_ROUTING_MODE
+                    and not use_pssf_train
+                    and not use_ap_stcr_train
+                ):
+                    if teacher_route_map is None:
+                        raise RuntimeError(
+                            "Explicit teacher routing did not construct a route map"
+                        )
+                    memory_active = bool(
+                        teacher_routing_mode == "ecst" and ecst_memory is not None
+                    )
+                    accumulate_teacher_routing(
+                        teacher_routing_epoch_accumulator,
+                        teacher_route_map.detach(),
+                        memory_active=memory_active,
+                    )
+                    if not teacher_routing_first_batch_logged:
+                        (
+                            schedule_static_weight,
+                            schedule_teacher_weight,
+                        ) = get_dabe_pu_despl_schedule(epoch, cfg)
+                        static_target_unchanged = torch.equal(
+                            pu_static_target,
+                            pu_target_soft,
+                        )
+                        map_all_ones = torch.equal(
+                            teacher_route_map,
+                            torch.ones_like(teacher_route_map),
+                        )
+                        if teacher_routing_mode == "none" and (
+                            not map_all_ones
+                            or teacher_route_map.requires_grad
+                            or memory_active
+                        ):
+                            raise RuntimeError(
+                                "No-ECST first-batch routing invariant failed"
+                            )
+                        logger.log(
+                            "[TeacherRouting FirstBatch] "
+                            f"mode={teacher_routing_mode} | "
+                            f"USE_ECST={bool(getattr(cfg, 'USE_ECST', False))} | "
+                            f"ecst_memory_initialized={ecst_memory is not None} | "
+                            f"map_shape={list(teacher_route_map.shape)} | "
+                            "map_min/mean/max="
+                            f"{float(teacher_route_map.min().detach()):.6f}/"
+                            f"{float(teacher_route_map.mean().detach()):.6f}/"
+                            f"{float(teacher_route_map.max().detach()):.6f} | "
+                            f"map_all_ones={map_all_ones} | "
+                            f"teacher_target_mode={dabe_pu_despl_teacher_target_mode} | "
+                            f"static_weight_mode={static_weight_mode} | "
+                            f"static_target_unchanged={static_target_unchanged} | "
+                            "global_static/teacher="
+                            f"{schedule_static_weight:.6f}/"
+                            f"{schedule_teacher_weight:.6f}"
+                        )
+                        teacher_routing_first_batch_logged = True
+
+                if (
+                    static_weight_audit_enabled
+                    and not static_weight_first_batch_logged
+                ):
+                    if teacher_route_map is None:
+                        raise RuntimeError(
+                            "Static-weight audit requires the independently "
+                            "constructed teacher route map"
+                        )
+                    if tuple(teacher_route_map.shape) != tuple(
+                        pu_static_weight_map.shape
+                    ):
+                        raise RuntimeError(
+                            "Teacher route/static map shape mismatch: "
+                            f"{list(teacher_route_map.shape)} != "
+                            f"{list(pu_static_weight_map.shape)}"
+                        )
+                    if static_weight_mode == "cache":
+                        mode_valid = torch.allclose(
+                            pu_static_weight_map,
+                            pu_weight_map_raw,
+                            atol=0.0,
+                            rtol=0.0,
+                        )
+                    elif static_weight_mode == "ones":
+                        mode_valid = torch.allclose(
+                            pu_static_weight_map,
+                            torch.ones_like(pu_static_weight_map),
+                            atol=0.0,
+                            rtol=0.0,
+                        )
+                    else:
+                        expected_known = (
+                            batch["pu_unknown"]
+                            .to(device, non_blocking=True)
+                            .float()
+                            <= 0.5
+                        ).float()
+                        mode_valid = torch.equal(
+                            pu_static_weight_map,
+                            expected_known,
+                        )
+                    if not bool(mode_valid):
+                        raise RuntimeError(
+                            f"STATIC_WEIGHT_MODE={static_weight_mode!r} "
+                            "failed its first-batch invariant"
+                        )
+                    target_unchanged = torch.equal(
+                        pu_static_target,
+                        pu_target_soft,
+                    )
+                    if not target_unchanged:
+                        raise RuntimeError(
+                            "Static-weight ablation changed pu_static_target"
+                        )
+                    logger.log(
+                        "[StaticWeight FirstBatch] "
+                        f"mode={static_weight_mode} | "
+                        f"raw_shape={list(pu_weight_map_raw.shape)} | "
+                        "raw_min/mean/max="
+                        f"{float(pu_weight_map_raw.min().detach()):.6f}/"
+                        f"{float(pu_weight_map_raw.mean().detach()):.6f}/"
+                        f"{float(pu_weight_map_raw.max().detach()):.6f} | "
+                        f"effective_shape={list(pu_static_weight_map.shape)} | "
+                        "effective_min/mean/max="
+                        f"{float(pu_static_weight_map.min().detach()):.6f}/"
+                        f"{float(pu_static_weight_map.mean().detach()):.6f}/"
+                        f"{float(pu_static_weight_map.max().detach()):.6f} | "
+                        "effective_zero/low_le_010/full_ge_099="
+                        f"{float((pu_static_weight_map <= 1e-8).float().mean().detach()):.6f}/"
+                        f"{float((pu_static_weight_map <= 0.10).float().mean().detach()):.6f}/"
+                        f"{float((pu_static_weight_map >= 0.99).float().mean().detach()):.6f} | "
+                        "target_min/mean/max="
+                        f"{float(pu_static_target.min().detach()):.6f}/"
+                        f"{float(pu_static_target.mean().detach()):.6f}/"
+                        f"{float(pu_static_target.max().detach()):.6f} | "
+                        f"target_unchanged={target_unchanged} | "
+                        "teacher_route_map_directly_affected=False | "
+                        f"teacher_route_mean={float(teacher_route_map.mean().detach()):.6f}"
+                    )
+                    static_weight_first_batch_logged = True
+
                 source_arbiter_loss = student_logits.sum() * 0.0
+                source_arbiter_head_grad_stats = {
+                    "positive_head_gradient_norm": 0.0,
+                    "negative_head_gradient_norm": 0.0,
+                }
                 source_arbiter_loss_stats = {
                     "loss_utility": 0.0,
                     "loss_prior": 0.0,
@@ -12649,8 +18876,20 @@ def main():
                     "negative_total": 0,
                     "brier_sum": 0.0,
                     "prior_brier_sum": 0.0,
+                    "fixed_preference_correct": 0,
+                    "fixed_brier_sum": 0.0,
                     "score_sum": 0.0,
                     "target_sum": 0.0,
+                    "utility_teacher_count": 0,
+                    "utility_dabe_count": 0,
+                    "utility_tie_count": 0,
+                    "utility_teacher_recall_correct": 0,
+                    "utility_dabe_recall_correct": 0,
+                    "positive_hist": [0] * 100,
+                    "negative_hist": [0] * 100,
+                    "calibration_count": [0] * 100,
+                    "calibration_score_sum": [0.0] * 100,
+                    "calibration_target_sum": [0.0] * 100,
                 }
                 source_arbiter_gate_dabe = None
                 source_arbiter_gate_teacher = None
@@ -12661,9 +18900,12 @@ def main():
                 source_arbiter_evaluator_weak = None
                 source_arbiter_evaluator_flip = None
                 source_arbiter_influence = 0.0
+                source_arbiter_train_scale = 0.0
                 source_arbiter_prior = 0.0
                 source_arbiter_source_sum = 1.0
                 source_arbiter_gate_batch_stats = None
+                source_arbiter_shadow_batch_stats = {}
+                source_arbiter_router_output = None
                 current_evidence = None
                 if use_source_arbiter_train:
                     (
@@ -12677,19 +18919,30 @@ def main():
                         source_static_weight,
                         source_teacher_weight,
                     )
-                    source_arbiter_influence = get_arbiter_influence_scale(
-                        epoch, cfg
+                    source_arbiter_train_scale = get_arbiter_train_scale(
+                        epoch,
+                        cfg,
                     )
-                    if int(epoch) < int(
+                    source_arbiter_influence = get_arbiter_apply_scale(
+                        epoch,
+                        cfg,
+                    )
+                    evidence_active = (
+                        source_arbiter_mode
+                        == "sign_aware_pure_loss_space"
+                        and source_arbiter_influence > 0.0
+                    ) or int(epoch) < int(
                         getattr(cfg, "SOURCE_ARBITER_STOP_EPOCH", 21)
-                    ):
+                    )
+                    if evidence_active:
                         if (
                             ecst_states is None
                             or temporal_mean is None
                             or history_count is None
                         ):
                             raise RuntimeError(
-                                "EGSA-R1 requires active ECST evidence states before "
+                                f"{source_arbiter_identity} requires active ECST "
+                                "evidence states before "
                                 "the stop epoch."
                             )
                         source_arbiter_masks = ecst_states["masks"]
@@ -12733,7 +18986,101 @@ def main():
                                 )
                             ),
                         )
-                        if source_arbiter_influence > 0.0:
+                        if (
+                            source_arbiter_mode
+                            == "sign_aware_pure_loss_space"
+                        ):
+                            if source_arbiter_influence > 0.0:
+                                source_arbiter_router_output = source_arbiter(
+                                    current_evidence
+                                )
+                            else:
+                                zero = torch.zeros_like(teacher_prob)
+                                source_arbiter_router_output = {
+                                    "raw_positive": zero,
+                                    "raw_negative": zero,
+                                    "residual_positive": zero,
+                                    "residual_negative": zero,
+                                }
+                            sign_gates = compute_sign_aware_source_gates(
+                                router_output=source_arbiter_router_output,
+                                teacher_binary=teacher_binary.detach(),
+                                teacher_prior=source_arbiter_prior,
+                                teacher_prob=teacher_prob.detach(),
+                                dabe_soft_target=pu_static_target.detach(),
+                                influence_scale=source_arbiter_influence,
+                                eps=float(
+                                    getattr(
+                                        cfg,
+                                        "SOURCE_ARBITER_PRIOR_EPS",
+                                        1e-4,
+                                    )
+                                ),
+                                disagreement_denom=float(
+                                    getattr(
+                                        cfg,
+                                        "SOURCE_ARBITER_DISAGREEMENT_DENOM",
+                                        0.5,
+                                    )
+                                ),
+                            )
+                            source_arbiter_gate_dabe = sign_gates[
+                                "gate_dabe"
+                            ]
+                            source_arbiter_gate_teacher = sign_gates[
+                                "gate_teacher"
+                            ]
+                            source_arbiter_residual = torch.where(
+                                teacher_binary.detach() >= 0.5,
+                                source_arbiter_router_output[
+                                    "residual_positive"
+                                ],
+                                source_arbiter_router_output[
+                                    "residual_negative"
+                                ],
+                            )
+                            source_arbiter_gate_batch_stats = {
+                                **source_gate_stats(
+                                    source_arbiter_gate_dabe,
+                                    source_arbiter_gate_teacher,
+                                    source_arbiter_residual,
+                                    source_arbiter_prior,
+                                    source_arbiter_masks,
+                                    teacher_prob.detach(),
+                                    pu_static_target.detach(),
+                                    float(
+                                        getattr(
+                                            cfg,
+                                            "SOURCE_ARBITER_NEG_RESIDUAL_BOUND",
+                                            4.0,
+                                        )
+                                    ),
+                                ),
+                                **collect_sign_aware_stats(
+                                    gates=sign_gates,
+                                    router_output=source_arbiter_router_output,
+                                    teacher_prior=source_arbiter_prior,
+                                    masks=source_arbiter_masks,
+                                    teacher_binary=teacher_binary.detach(),
+                                    dabe_target=pu_static_target.detach(),
+                                    dabe_weight=pu_static_weight_map.detach(),
+                                    positive_bound=float(
+                                        getattr(
+                                            cfg,
+                                            "SOURCE_ARBITER_POS_RESIDUAL_BOUND",
+                                            1.5,
+                                        )
+                                    ),
+                                    negative_bound=float(
+                                        getattr(
+                                            cfg,
+                                            "SOURCE_ARBITER_NEG_RESIDUAL_BOUND",
+                                            4.0,
+                                        )
+                                    ),
+                                ),
+                            }
+                        elif source_arbiter_influence > 0.0:
                             source_arbiter_residual = source_arbiter(
                                 current_evidence
                             )
@@ -12801,21 +19148,26 @@ def main():
                             1.0 - source_arbiter_gate_teacher
                         )
 
-                    source_arbiter_gate_batch_stats = source_gate_stats(
-                        source_arbiter_gate_dabe,
-                        source_arbiter_gate_teacher,
-                        source_arbiter_residual,
-                        source_arbiter_prior,
-                        source_arbiter_masks,
-                        teacher_prob.detach(),
-                        pu_static_target.detach(),
-                        float(
-                            getattr(cfg, "SOURCE_ARBITER_RESIDUAL_BOUND", 1.5)
-                        ),
-                    )
+                    if source_arbiter_gate_batch_stats is None:
+                        source_arbiter_gate_batch_stats = source_gate_stats(
+                            source_arbiter_gate_dabe,
+                            source_arbiter_gate_teacher,
+                            source_arbiter_residual,
+                            source_arbiter_prior,
+                            source_arbiter_masks,
+                            teacher_prob.detach(),
+                            pu_static_target.detach(),
+                            float(
+                                getattr(
+                                    cfg,
+                                    "SOURCE_ARBITER_RESIDUAL_BOUND",
+                                    1.5,
+                                )
+                            ),
+                        )
 
                     utility_active = (
-                        source_arbiter_influence > 0.0
+                        source_arbiter_train_scale > 0.0
                         and int(epoch)
                         <= int(
                             getattr(
@@ -12831,9 +19183,10 @@ def main():
                         == 0
                     )
                     if utility_active:
-                        if egsa_old_route is None:
+                        if egsa_old_route is None or utility_evaluator is None:
                             raise RuntimeError(
-                                "EGSA-R1 utility stage requires old route state."
+                                f"{source_arbiter_identity} utility stage requires "
+                                "old route state and the utility evaluator."
                             )
                         hflip_model_input_egsa = make_hflip_model_input(
                             cfg, batch, device
@@ -12912,24 +19265,55 @@ def main():
                                 )
                             ),
                         )
-                        old_residual = source_arbiter(old_evidence)
-                        source_arbiter_utility_target = (
-                            build_delayed_utility_target(
-                                old_teacher_prob=egsa_old_route[
-                                    "teacher_prob"
-                                ],
-                                dabe_target=pu_static_target.detach(),
-                                evaluator_prob_weak=source_arbiter_evaluator_weak,
-                                evaluator_prob_flip=source_arbiter_evaluator_flip,
-                                old_history_count=egsa_old_route[
-                                    "history_count"
-                                ],
-                                old_epoch=egsa_old_route["epoch"],
-                                current_epoch=epoch,
-                                old_valid=egsa_old_route["valid"],
-                                cfg=cfg,
+                        old_router_value = source_arbiter(old_evidence)
+                        if (
+                            source_arbiter_mode
+                            == "sign_aware_pure_loss_space"
+                        ):
+                            source_arbiter_utility_target = (
+                                build_directional_utility_target(
+                                    old_teacher_prob=egsa_old_route[
+                                        "teacher_prob"
+                                    ],
+                                    old_student_prob=egsa_old_route[
+                                        "student_prob"
+                                    ],
+                                    evaluator_prob_weak=source_arbiter_evaluator_weak,
+                                    evaluator_prob_flip=source_arbiter_evaluator_flip,
+                                    old_history_count=egsa_old_route[
+                                        "history_count"
+                                    ],
+                                    old_epoch=egsa_old_route["epoch"],
+                                    current_epoch=epoch,
+                                    old_valid=egsa_old_route["valid"],
+                                    dabe_target=pu_static_target.detach(),
+                                    dabe_weight=pu_static_weight_map.detach(),
+                                    masks=source_arbiter_masks,
+                                    dino_margin=source_arbiter_margin,
+                                    prototype_valid=ecst_states[
+                                        "margin_stats"
+                                    ]["ecst_proto_valid"],
+                                    cfg=cfg,
+                                )
                             )
-                        )
+                        else:
+                            source_arbiter_utility_target = (
+                                build_delayed_utility_target(
+                                    old_teacher_prob=egsa_old_route[
+                                        "teacher_prob"
+                                    ],
+                                    dabe_target=pu_static_target.detach(),
+                                    evaluator_prob_weak=source_arbiter_evaluator_weak,
+                                    evaluator_prob_flip=source_arbiter_evaluator_flip,
+                                    old_history_count=egsa_old_route[
+                                        "history_count"
+                                    ],
+                                    old_epoch=egsa_old_route["epoch"],
+                                    current_epoch=epoch,
+                                    old_valid=egsa_old_route["valid"],
+                                    cfg=cfg,
+                                )
+                            )
                         validation_modulus = int(
                             getattr(
                                 cfg,
@@ -12948,27 +19332,56 @@ def main():
                         router_train_images = (
                             ~validation_images
                         ) & egsa_old_route["valid"]
-                        (
-                            source_arbiter_loss,
-                            source_arbiter_loss_stats,
-                        ) = compute_source_arbiter_loss(
-                            old_residual=old_residual,
-                            current_gate_teacher=source_arbiter_gate_teacher,
-                            teacher_prior=source_arbiter_prior,
-                            utility_target=source_arbiter_utility_target,
-                            dino_margin=source_arbiter_margin,
-                            train_image_mask=router_train_images,
-                            cfg=cfg,
-                        )
-                        source_arbiter_validation_stats = (
-                            compute_utility_validation_stats(
-                                old_residual,
-                                source_arbiter_utility_target,
-                                validation_images,
-                                teacher_prior=egsa_old_route["teacher_prior"],
-                                fixed_teacher_score=teacher_route_map,
+                        if (
+                            source_arbiter_mode
+                            == "sign_aware_pure_loss_space"
+                        ):
+                            (
+                                source_arbiter_loss,
+                                source_arbiter_loss_stats,
+                            ) = compute_sign_aware_arbiter_loss(
+                                old_router_output=old_router_value,
+                                current_gate_positive=sign_gates[
+                                    "gate_teacher_positive"
+                                ],
+                                current_gate_negative=sign_gates[
+                                    "gate_teacher_negative"
+                                ],
+                                teacher_prior=source_arbiter_prior,
+                                utility_target=source_arbiter_utility_target,
+                                dino_margin=source_arbiter_margin,
+                                train_image_mask=router_train_images,
+                                cfg=cfg,
+                                class_weights=r2b_target_audit["class_weights"],
                             )
-                        )
+                        else:
+                            (
+                                source_arbiter_loss,
+                                source_arbiter_loss_stats,
+                            ) = compute_source_arbiter_loss(
+                                old_residual=old_router_value,
+                                current_gate_teacher=source_arbiter_gate_teacher,
+                                teacher_prior=source_arbiter_prior,
+                                utility_target=source_arbiter_utility_target,
+                                dino_margin=source_arbiter_margin,
+                                train_image_mask=router_train_images,
+                                cfg=cfg,
+                            )
+                            source_arbiter_validation_stats = (
+                                compute_utility_validation_stats(
+                                    old_router_value,
+                                    source_arbiter_utility_target,
+                                    validation_images,
+                                    teacher_prior=egsa_old_route[
+                                        "teacher_prior"
+                                    ],
+                                    fixed_teacher_score=(
+                                        ecst_map_audit
+                                        if ecst_map_audit is not None
+                                        else teacher_source_weight
+                                    ),
+                                )
+                            )
                     if (
                         bool(
                             getattr(
@@ -12980,7 +19393,7 @@ def main():
                         and source_arbiter_first_batch_logged_epoch != int(epoch)
                     ):
                         logger.log(
-                            "[EGSA-R1 FirstBatch] "
+                            f"[{source_arbiter_identity} FirstBatch] "
                             f"epoch={epoch:03d} | "
                             f"sample_index={egsa_sample_indices.tolist()} | "
                             f"static_weight={source_static_weight:.8f} | "
@@ -12989,7 +19402,7 @@ def main():
                             f"influence_scale={source_arbiter_influence:.8f}"
                         )
                         logger.log(
-                            "[EGSA-R1 FirstBatch] shapes | "
+                            f"[{source_arbiter_identity} FirstBatch] shapes | "
                             f"evidence={list(current_evidence.shape) if current_evidence is not None else 'inactive'} | "
                             f"residual={list(source_arbiter_residual.shape)} | "
                             f"gate={list(source_arbiter_gate_teacher.shape)} | "
@@ -12997,13 +19410,44 @@ def main():
                             f"image_hflip_68={list(batch['image_hflip_68'].shape)}"
                         )
                         logger.log(
-                            "[EGSA-R1 FirstBatch] gate | "
+                            f"[{source_arbiter_identity} FirstBatch] gate | "
                             f"teacher_mean={source_arbiter_gate_batch_stats['gate_teacher_mean']:.8f} | "
                             f"dabe_mean={source_arbiter_gate_batch_stats['gate_dabe_mean']:.8f} | "
                             f"residual_mean={source_arbiter_gate_batch_stats['residual_mean']:.8f} | "
                             f"residual_abs={source_arbiter_gate_batch_stats['residual_abs_mean']:.8f} | "
                             f"saturation={source_arbiter_gate_batch_stats['residual_saturation_ratio']:.8f}"
                         )
+                        if source_arbiter_mode == "pure_loss_space":
+                            logger.log(
+                                "[EGSA-R2 FirstBatch] teacher_source_weight | "
+                                f"shape={list(teacher_source_weight.shape)} | "
+                                f"min/mean/max="
+                                f"{float(teacher_source_weight.min()):.8f}/"
+                                f"{float(teacher_source_weight.mean()):.8f}/"
+                                f"{float(teacher_source_weight.max()):.8f} | "
+                                "ecst_weighting_used_for_training=False"
+                            )
+                        elif (
+                            source_arbiter_mode
+                            == "sign_aware_pure_loss_space"
+                        ):
+                            logger.log(
+                                "[EGSA-R2b FirstBatch] scales | "
+                                f"train={source_arbiter_train_scale:.8f} | "
+                                f"apply={source_arbiter_influence:.8f} | "
+                                "teacher_source_weight=ones | "
+                                "ecst_weighting_used_for_training=False"
+                            )
+                            logger.log(
+                                "[EGSA-R2b FirstBatch] sign gates | "
+                                "positive/negative/applied="
+                                f"{source_arbiter_gate_batch_stats.get('gate_teacher_positive_mean', 0.0):.8f}/"
+                                f"{source_arbiter_gate_batch_stats.get('gate_teacher_negative_mean', 0.0):.8f}/"
+                                f"{source_arbiter_gate_batch_stats.get('gate_teacher_mean', 0.0):.8f} | "
+                                "residual_abs positive/negative="
+                                f"{source_arbiter_gate_batch_stats.get('residual_positive_abs_mean', 0.0):.8f}/"
+                                f"{source_arbiter_gate_batch_stats.get('residual_negative_abs_mean', 0.0):.8f}"
+                            )
                         old_valid_ratio = (
                             float(egsa_old_route["valid"].float().mean().item())
                             if egsa_old_route is not None
@@ -13020,13 +19464,45 @@ def main():
                             else 0.0
                         )
                         logger.log(
-                            "[EGSA-R1 FirstBatch] utility | "
+                            f"[{source_arbiter_identity} FirstBatch] utility | "
                             f"old_valid_ratio={old_valid_ratio:.8f} | "
                             f"old_history_mean={old_history_mean:.4f} | "
                             f"valid_pixel_ratio={source_arbiter_loss_stats['utility_valid_ratio']:.8f} | "
                             f"utility_loss={source_arbiter_loss_stats['loss_utility']:.8f} | "
                             f"total_router_loss={source_arbiter_loss_stats['loss_total']:.8f}"
                         )
+                        if (
+                            source_arbiter_mode
+                            == "sign_aware_pure_loss_space"
+                        ):
+                            logger.log(
+                                "[EGSA-R2b FirstBatch] directional utility | "
+                                "positive valid/teacher/dabe="
+                                f"{int(source_arbiter_loss_stats.get('positive_branch_valid_pixels', 0))}/"
+                                f"{int(source_arbiter_loss_stats.get('positive_branch_teacher_preferred_count', 0))}/"
+                                f"{int(source_arbiter_loss_stats.get('positive_branch_dabe_preferred_count', 0))} | "
+                                "negative valid/teacher/dabe="
+                                f"{int(source_arbiter_loss_stats.get('negative_branch_valid_pixels', 0))}/"
+                                f"{int(source_arbiter_loss_stats.get('negative_branch_teacher_preferred_count', 0))}/"
+                                f"{int(source_arbiter_loss_stats.get('negative_branch_dabe_preferred_count', 0))}"
+                            )
+                            empty_branches = [
+                                name
+                                for name in ("positive", "negative")
+                                if int(
+                                    source_arbiter_loss_stats.get(
+                                        f"{name}_branch_valid_pixels",
+                                        0,
+                                    )
+                                )
+                                == 0
+                            ]
+                            if utility_active and empty_branches:
+                                logger.log(
+                                    "[EGSA-R2b FirstBatch][WARNING] empty "
+                                    "directional utility branch; the other "
+                                    f"branch remains active: {empty_branches}"
+                                )
                         source_arbiter_first_batch_logged_epoch = int(epoch)
                     if (
                         bool(
@@ -13053,6 +19529,54 @@ def main():
                                 pu_static_target.detach(),
                                 vis_count,
                             )
+                        vis_raw_teacher_loss_map = None
+                        vis_ecst_teacher_loss_map = None
+                        if source_arbiter_mode == "pure_loss_space":
+                            if ecst_map_audit is None:
+                                raise RuntimeError(
+                                    "EGSA-R2 visualization requires ECST audit map."
+                                )
+                            with torch.no_grad():
+                                vis_raw = apply_loss_space_arbitration(
+                                    logits=student_logits.detach(),
+                                    dabe_target=pu_static_target.detach(),
+                                    dabe_weight=pu_static_weight_map.detach(),
+                                    teacher_target=teacher_full_target.detach(),
+                                    teacher_weight=teacher_source_weight.detach(),
+                                    gate_dabe=source_arbiter_gate_dabe.detach(),
+                                    gate_teacher=source_arbiter_gate_teacher.detach(),
+                                    source_sum=source_arbiter_source_sum,
+                                    eps=float(
+                                        getattr(
+                                            cfg,
+                                            "DABE_PU_WEIGHTED_BCE_EPS",
+                                            1e-6,
+                                        )
+                                    ),
+                                )
+                                vis_ecst = apply_loss_space_arbitration(
+                                    logits=student_logits.detach(),
+                                    dabe_target=pu_static_target.detach(),
+                                    dabe_weight=pu_static_weight_map.detach(),
+                                    teacher_target=teacher_full_target.detach(),
+                                    teacher_weight=ecst_map_audit.detach(),
+                                    gate_dabe=source_arbiter_gate_dabe.detach(),
+                                    gate_teacher=source_arbiter_gate_teacher.detach(),
+                                    source_sum=source_arbiter_source_sum,
+                                    eps=float(
+                                        getattr(
+                                            cfg,
+                                            "DABE_PU_WEIGHTED_BCE_EPS",
+                                            1e-6,
+                                        )
+                                    ),
+                                )
+                            vis_raw_teacher_loss_map = vis_raw[
+                                "teacher_loss_map"
+                            ]
+                            vis_ecst_teacher_loss_map = vis_ecst[
+                                "teacher_loss_map"
+                            ]
                         save_source_arbiter_gate_visuals(
                             train_dir=train_dir,
                             epoch=epoch,
@@ -13076,6 +19600,37 @@ def main():
                             selected_indices=source_arbiter_vis_state[
                                 "selected_indices"
                             ],
+                            teacher_source_weight=teacher_source_weight,
+                            raw_teacher_loss_map=vis_raw_teacher_loss_map,
+                            ecst_teacher_loss_map=vis_ecst_teacher_loss_map,
+                            sign_router_output=(
+                                source_arbiter_router_output
+                                if source_arbiter_mode
+                                == "sign_aware_pure_loss_space"
+                                else None
+                            ),
+                            sign_gates=(
+                                sign_gates
+                                if source_arbiter_mode
+                                == "sign_aware_pure_loss_space"
+                                else None
+                            ),
+                            region_masks=source_arbiter_masks,
+                            teacher_binary=teacher_binary.detach(),
+                            sign_positive_bound=float(
+                                getattr(
+                                    cfg,
+                                    "SOURCE_ARBITER_POS_RESIDUAL_BOUND",
+                                    1.5,
+                                )
+                            ),
+                            sign_negative_bound=float(
+                                getattr(
+                                    cfg,
+                                    "SOURCE_ARBITER_NEG_RESIDUAL_BOUND",
+                                    4.0,
+                                )
+                            ),
                         )
 
                 tce_teacher_map_final = None
@@ -13242,7 +19797,19 @@ def main():
                     fixed_target = (1.0 - blend) * pseudo_68 + blend * qra_fused
 
                 late_override_ratio = 0.0
-                if use_drepp:
+                if use_ap_stcr_train:
+                    if ap_stcr_batch_result is None:
+                        raise RuntimeError(
+                            "AP-STCR supervision target is unavailable."
+                        )
+                    mixed_target = ap_stcr_batch_result["mixed_target_68"]
+                elif use_pssf_train:
+                    if pssf_q_target is None:
+                        raise RuntimeError(
+                            "PSSF supervision target is unavailable."
+                        )
+                    mixed_target = pssf_q_target
+                elif use_drepp:
                     core_fg = batch["drepp_core_fg"].to(device, non_blocking=True).bool()
                     core_bg = batch["drepp_core_bg"].to(device, non_blocking=True).bool()
                     uncertain = batch["drepp_uncertain"].to(device, non_blocking=True).bool()
@@ -13348,6 +19915,8 @@ def main():
                 loss_oem_seed_group = zero_loss
                 loss_oem_dyn_pos = zero_loss
                 loss_oem_dyn_bg = zero_loss
+                pssf_seg_result = None
+                ap_stcr_seg_result = None
                 oem_seed_final_stats = {
                     "loss_seed_fg": 0.0,
                     "loss_seed_fg_fallback": 0.0,
@@ -13374,7 +19943,13 @@ def main():
                     "teacher_prob_37_bg_seed_mean": 0.0,
                     "teacher_prob_37_extent_mean": 0.0,
                 }
-                if use_dabe_pu and not use_dabe_pu_balanced_v2 and not use_dabe_oem and not use_dabe_pu_despl_sched:
+                if (
+                    use_dabe_pu
+                    and not use_pssf_train
+                    and not use_dabe_pu_balanced_v2
+                    and not use_dabe_oem
+                    and not use_dabe_pu_despl_sched
+                ):
                     pu_teacher_target, pu_teacher_weight_map, pu_teacher_stats = build_dabe_pu_teacher_conf_target_weight(
                         cfg,
                         teacher_prob.detach(),
@@ -13383,6 +19958,15 @@ def main():
                     )
                 if use_dabe_pu_despl_sched:
                     teacher_binary_area = float(teacher_binary.detach().mean().item())
+                    pu_teacher_stats = {
+                        "teacher_conf_ratio": 1.0,
+                        "teacher_fg_ratio": teacher_binary_area,
+                        "teacher_bg_ratio": 1.0 - teacher_binary_area,
+                    }
+                if use_pssf_train or use_ap_stcr_train:
+                    teacher_binary_area = float(
+                        teacher_binary.detach().mean().item()
+                    )
                     pu_teacher_stats = {
                         "teacher_conf_ratio": 1.0,
                         "teacher_fg_ratio": teacher_binary_area,
@@ -13498,7 +20082,35 @@ def main():
                                 )
                         gkd_first_batch_logged = True
                 else:
-                    if use_dabe_oem:
+                    if use_ap_stcr_train:
+                        ap_stcr_seg_result = (
+                            build_ap_stcr_segmentation_group(
+                                cfg=cfg,
+                                epoch=epoch,
+                                student_out=student_out,
+                                student_logits=student_logits,
+                                mixed_target=mixed_target,
+                            )
+                        )
+                        loss_final_bce = ap_stcr_seg_result["loss_final"]
+                        loss_tversky = zero_loss
+                        loss_base = ap_stcr_seg_result["loss"]
+                        (
+                            pu_static_loss_weight,
+                            pu_teacher_loss_weight,
+                        ) = get_dabe_pu_despl_schedule(epoch, cfg)
+                    elif use_pssf_train:
+                        pssf_seg_result = build_pssf_segmentation_group(
+                            cfg=cfg,
+                            epoch=epoch,
+                            student_out=student_out,
+                            student_logits=student_logits,
+                            q_target=pssf_q_target,
+                        )
+                        loss_final_bce = pssf_seg_result["loss_final"]
+                        loss_tversky = zero_loss
+                        loss_base = pssf_seg_result["loss"]
+                    elif use_dabe_oem:
                         loss_oem_seed_final, oem_seed_final_stats = build_dabe_oem_seed_loss(
                             student_logits,
                             batch,
@@ -13562,7 +20174,19 @@ def main():
                             pu_static_weight_map,
                             eps=eps,
                         )
-                        if lceg_teacher_map_final is not None and bool(getattr(cfg, "LCEG_APPLY_TO_FINAL", True)):
+                        if use_source_arbiter_train:
+                            if teacher_source_weight is None:
+                                raise RuntimeError(
+                                    f"{source_arbiter_identity} teacher source "
+                                    "weight is unavailable."
+                                )
+                            loss_pu_teacher_final = weighted_bce_with_logits(
+                                student_logits,
+                                teacher_full_target,
+                                teacher_source_weight,
+                                eps=eps,
+                            )
+                        elif lceg_teacher_map_final is not None and bool(getattr(cfg, "LCEG_APPLY_TO_FINAL", True)):
                             loss_pu_teacher_final = lceg_teacher_bce_with_logits(
                                 student_logits,
                                 teacher_full_target,
@@ -13772,7 +20396,27 @@ def main():
                             )
                         )
                     )
-                    if use_dabe_oem:
+                    if use_ap_stcr_train:
+                        if ap_stcr_seg_result is None:
+                            raise RuntimeError(
+                                "AP-STCR segmentation group was not constructed."
+                            )
+                        loss = ap_stcr_seg_result["loss"]
+                        loss_ndr_coarse_aux = ap_stcr_seg_result[
+                            "loss_coarse"
+                        ]
+                        loss_aux_base = ap_stcr_seg_result["loss_base"]
+                    elif use_pssf_train:
+                        if pssf_seg_result is None:
+                            raise RuntimeError(
+                                "PSSF segmentation group was not constructed."
+                            )
+                        loss = pssf_seg_result["loss"]
+                        loss_ndr_coarse_aux = pssf_seg_result[
+                            "loss_coarse"
+                        ]
+                        loss_aux_base = pssf_seg_result["loss_base"]
+                    elif use_dabe_oem:
                         lambda_dyn_pos, lambda_dyn_bg = get_dabe_oem_schedule(epoch, cfg)
                         seed_terms = [loss_oem_seed_final]
                         seed_weights = [1.0]
@@ -13915,10 +20559,11 @@ def main():
                             if (
                                 source_arbiter_gate_dabe is None
                                 or source_arbiter_gate_teacher is None
-                                or teacher_route_map is None
+                                or teacher_source_weight is None
                             ):
                                 raise RuntimeError(
-                                    "EGSA-R1 gates or ECST teacher map are unavailable."
+                                    f"{source_arbiter_identity} gates or teacher "
+                                    "source weight are unavailable."
                                 )
                             eps = float(
                                 getattr(cfg, "DABE_PU_WEIGHTED_BCE_EPS", 1e-6)
@@ -13929,12 +20574,14 @@ def main():
                             ) = get_dabe_pu_despl_schedule(epoch, cfg)
                             branch_results = []
                             branch_weights = []
+                            branch_logits = []
+                            branch_names = []
                             final_result = apply_loss_space_arbitration(
                                 logits=student_logits,
                                 dabe_target=pu_static_target,
                                 dabe_weight=pu_static_weight_map,
                                 teacher_target=teacher_full_target,
-                                teacher_weight=teacher_route_map,
+                                teacher_weight=teacher_source_weight,
                                 gate_dabe=source_arbiter_gate_dabe,
                                 gate_teacher=source_arbiter_gate_teacher,
                                 source_sum=source_arbiter_source_sum,
@@ -13942,6 +20589,8 @@ def main():
                             )
                             branch_results.append(final_result)
                             branch_weights.append(1.0)
+                            branch_logits.append(student_logits)
+                            branch_names.append("final")
                             loss_pu_static_final = final_result["loss_dabe"]
                             loss_pu_teacher_final = final_result["loss_teacher"]
                             loss_final_bce = loss_pu_static_final
@@ -13956,7 +20605,7 @@ def main():
                                     dabe_target=pu_static_target,
                                     dabe_weight=pu_static_weight_map,
                                     teacher_target=teacher_full_target,
-                                    teacher_weight=teacher_route_map,
+                                    teacher_weight=teacher_source_weight,
                                     gate_dabe=source_arbiter_gate_dabe,
                                     gate_teacher=source_arbiter_gate_teacher,
                                     source_sum=source_arbiter_source_sum,
@@ -13964,6 +20613,8 @@ def main():
                                 )
                                 branch_results.append(coarse_result)
                                 branch_weights.append(decoder_coarse_aux_lambda)
+                                branch_logits.append(coarse_logits)
+                                branch_names.append("coarse")
                                 loss_pu_static_coarse = coarse_result["loss_dabe"]
                                 loss_pu_teacher_coarse = coarse_result[
                                     "loss_teacher"
@@ -13993,7 +20644,7 @@ def main():
                                     dabe_target=pu_static_target,
                                     dabe_weight=pu_static_weight_map,
                                     teacher_target=teacher_full_target,
-                                    teacher_weight=teacher_route_map,
+                                    teacher_weight=teacher_source_weight,
                                     gate_dabe=source_arbiter_gate_dabe,
                                     gate_teacher=source_arbiter_gate_teacher,
                                     source_sum=source_arbiter_source_sum,
@@ -14001,6 +20652,8 @@ def main():
                                 )
                                 branch_results.append(base_result)
                                 branch_weights.append(aux_lambda)
+                                branch_logits.append(base_logits)
+                                branch_names.append("base")
                                 loss_pu_static_base = base_result["loss_dabe"]
                                 loss_pu_teacher_base = base_result["loss_teacher"]
                                 loss_aux_base = base_result["loss"]
@@ -14026,6 +20679,45 @@ def main():
                                     branch_weights, branch_results
                                 )
                             ) / branch_weight_sum
+                            if (
+                                source_arbiter_mode == "pure_loss_space"
+                                and bool(
+                                    getattr(
+                                        cfg,
+                                        "SOURCE_ARBITER_COMPUTE_R1_SHADOW_LOSS",
+                                        True,
+                                    )
+                                )
+                            ):
+                                if ecst_map_audit is None:
+                                    raise RuntimeError(
+                                        "EGSA-R2 R1 shadow requires the no-grad "
+                                        "ECST audit map."
+                                    )
+                                with torch.no_grad():
+                                    shadow_results = [
+                                        apply_loss_space_arbitration(
+                                            logits=branch_logit.detach(),
+                                            dabe_target=pu_static_target.detach(),
+                                            dabe_weight=pu_static_weight_map.detach(),
+                                            teacher_target=teacher_full_target.detach(),
+                                            teacher_weight=ecst_map_audit.detach(),
+                                            gate_dabe=source_arbiter_gate_dabe.detach(),
+                                            gate_teacher=source_arbiter_gate_teacher.detach(),
+                                            source_sum=source_arbiter_source_sum,
+                                            eps=eps,
+                                        )
+                                        for branch_logit in branch_logits
+                                    ]
+                                    source_arbiter_shadow_batch_stats = (
+                                        compute_r1_shadow_stats(
+                                            branch_results,
+                                            shadow_results,
+                                            branch_weights,
+                                            source_arbiter_masks,
+                                            branch_names=branch_names,
+                                        )
+                                    )
                             loss_base = final_result["loss"]
                         elif use_cssd_train:
                             normal_group_parts = compute_cssd_original_group_loss(
@@ -15170,6 +21862,72 @@ def main():
                         esa_ber_first_active_batch_logged = True
 
                 if not bool(torch.isfinite(loss).item()):
+                    if (
+                        source_arbiter_mode
+                        == "sign_aware_pure_loss_space"
+                        and bool(
+                            getattr(
+                                cfg,
+                                "SOURCE_ARBITER_USE_EXPLORATORY_STAGE45_STOP_RULES",
+                                False,
+                            )
+                        )
+                    ):
+                        stop_checkpoint = ckpt_dir / f"epoch_{epoch:03d}.pth"
+                        save_checkpoint(
+                            stop_checkpoint,
+                            epoch,
+                            cfg,
+                            student,
+                            teacher,
+                            optimizer,
+                            scheduler,
+                            best_metric,
+                            best_epoch,
+                            extra_state=build_source_arbiter_checkpoint_extra(
+                                cfg,
+                                epoch,
+                                global_step,
+                                source_arbiter,
+                                arbiter_optimizer,
+                                utility_evaluator,
+                                route_memory,
+                                ecst_memory,
+                                train_loader_generator,
+                                source_arbiter_vis_state,
+                            ),
+                        )
+                        stop_status = {
+                            "schema_version": "egsa_r2b_clean_stop_v1",
+                            "stopped": True,
+                            "epoch": int(epoch),
+                            "iteration": int(iter_idx),
+                            "reasons": ["nan_or_inf"],
+                            "details": {
+                                "loss": float(loss.detach().cpu()),
+                                "gate_stats": dict(
+                                    source_arbiter_gate_batch_stats or {}
+                                ),
+                            },
+                            "checkpoint": str(stop_checkpoint.resolve()),
+                            "reset_executed_after_stop": False,
+                        }
+                        stop_path = train_dir / "egsa_r2b_stop_status.json"
+                        stop_path.write_text(
+                            json.dumps(
+                                stop_status,
+                                indent=2,
+                                sort_keys=True,
+                            ),
+                            encoding="utf-8",
+                        )
+                        logger.log(
+                            "[EGSA-R2b CleanStop] NaN/Inf detected before "
+                            "backward; current finite pre-update state saved | "
+                            f"epoch={epoch:03d} | iter={iter_idx} | "
+                            f"checkpoint={stop_checkpoint} | status={stop_path}"
+                        )
+                        return
                     raise RuntimeError(
                         f"Training loss is NaN/Inf at epoch={epoch}, iter={iter_idx}; "
                         f"cssd_scale={cssd_scale_epoch:.8f}."
@@ -15218,16 +21976,65 @@ def main():
                     optimizer.zero_grad(set_to_none=True)
                 if use_source_arbiter_train:
                     arbiter_optimizer.zero_grad(set_to_none=True)
+                if use_pssf_train:
+                    _pssf_assert_no_grad(
+                        pssf, "PSSF before segmentation backward"
+                    )
+                    if use_ppse_v2(cfg):
+                        _pssf_assert_no_grad(
+                            pssf_actor,
+                            "PPSE-v2 actor before segmentation backward",
+                        )
                 loss.backward()
+                if use_pssf_train:
+                    _pssf_assert_no_grad(
+                        pssf, "PSSF after segmentation backward"
+                    )
+                    if use_ppse_v2(cfg):
+                        _pssf_assert_no_grad(
+                            pssf_actor,
+                            "PPSE-v2 actor after segmentation backward",
+                        )
                 if (
                     use_source_arbiter_train
-                    and source_arbiter_influence > 0.0
+                    and source_arbiter_train_scale > 0.0
+                    and utility_active
                 ):
                     source_arbiter_loss.backward()
+                    if (
+                        source_arbiter_mode
+                        == "sign_aware_pure_loss_space"
+                    ):
+                        head = source_arbiter.head
+                        for branch_index, branch_name in enumerate(
+                            ("positive", "negative")
+                        ):
+                            squared_norm = 0.0
+                            if head.weight.grad is not None:
+                                squared_norm += float(
+                                    head.weight.grad[branch_index]
+                                    .detach()
+                                    .float()
+                                    .square()
+                                    .sum()
+                                    .item()
+                                )
+                            if head.bias.grad is not None:
+                                squared_norm += float(
+                                    head.bias.grad[branch_index]
+                                    .detach()
+                                    .float()
+                                    .square()
+                                    .item()
+                                )
+                            source_arbiter_head_grad_stats[
+                                f"{branch_name}_head_gradient_norm"
+                            ] = math.sqrt(max(squared_norm, 0.0))
                 optimizer.step()
                 if (
                     use_source_arbiter_train
-                    and source_arbiter_influence > 0.0
+                    and source_arbiter_train_scale > 0.0
+                    and utility_active
                 ):
                     torch.nn.utils.clip_grad_norm_(
                         source_arbiter.parameters(),
@@ -15250,61 +22057,151 @@ def main():
                             lr_floor_activated_logged = True
                 # teacher pseudo 已在本轮 EMA 更新前生成，避免当前 student 更新泄漏进 target。
                 update_ema(student, teacher, global_step, ema_weight=float(cfg.EMA_WEIGHT))
-                if use_source_arbiter_train and int(epoch) <= int(
-                    getattr(cfg, "SOURCE_ARBITER_MEMORY_UPDATE_END_EPOCH", 20)
-                ):
-                    update_slow_evaluator(
-                        utility_evaluator,
-                        student,
-                        decay=float(
-                            getattr(
-                                cfg,
-                                "SOURCE_ARBITER_UTILITY_EMA_DECAY",
-                                0.999,
-                            )
-                        ),
-                    )
-                    if (
-                        ecst_memory is None
-                        or route_memory is None
-                        or egsa_sample_indices is None
-                        or temporal_mean is None
-                        or history_count is None
-                        or ecst_states is None
-                    ):
+                if use_ap_stcr_train:
+                    if ap_stcr_batch_result is None:
                         raise RuntimeError(
-                            "EGSA-R1 memory update state is incomplete."
+                            "AP-STCR batch state is unavailable at history update."
                         )
-                    with torch.no_grad():
-                        ecst_memory.update(
-                            indices=egsa_sample_indices,
-                            teacher_prob=teacher_prob.detach(),
-                            rho=float(getattr(cfg, "ECST_TEMPORAL_RHO", 0.90)),
+                    ap_stcr.update_history(
+                        sample_indices=ap_stcr_batch_result[
+                            "sample_indices"
+                        ],
+                        datasets=ap_stcr_batch_result["datasets"],
+                        stems=ap_stcr_batch_result["stems"],
+                        teacher_soft_37=ap_stcr_batch_result[
+                            "teacher_soft_37"
+                        ],
+                        epoch=epoch,
+                    )
+                if use_source_arbiter_train:
+                    route_update_active = int(epoch) <= int(
+                        getattr(
+                            cfg,
+                            "SOURCE_ARBITER_MEMORY_UPDATE_END_EPOCH",
+                            20,
                         )
-                        route_memory.update(
-                            indices=egsa_sample_indices,
-                            teacher_prob=teacher_prob.detach(),
-                            student_prob=student_logits.sigmoid().detach(),
-                            temporal_mean=temporal_mean.detach(),
-                            temporal_variance=ecst_states["variance"].detach(),
-                            history_count=history_count.detach(),
-                            teacher_prior=torch.full(
-                                (int(teacher_prob.shape[0]),),
-                                float(source_arbiter_prior),
-                                device=teacher_prob.device,
-                                dtype=teacher_prob.dtype,
+                    )
+                    temporal_update_active = int(epoch) <= int(
+                        getattr(cfg, "ECST_MEMORY_UPDATE_END_EPOCH", 20)
+                    )
+                    if temporal_update_active:
+                        if (
+                            ecst_memory is None
+                            or egsa_sample_indices is None
+                            or temporal_mean is None
+                            or history_count is None
+                            or ecst_states is None
+                        ):
+                            raise RuntimeError(
+                                f"{source_arbiter_identity} temporal memory "
+                                "update state is incomplete."
+                            )
+                        with torch.no_grad():
+                            ecst_memory.update(
+                                indices=egsa_sample_indices,
+                                teacher_prob=teacher_prob.detach(),
+                                rho=float(
+                                    getattr(
+                                        cfg,
+                                        "ECST_TEMPORAL_RHO",
+                                        0.90,
+                                    )
+                                ),
+                            )
+                    if route_update_active:
+                        if utility_evaluator is None or route_memory is None:
+                            raise RuntimeError(
+                                f"{source_arbiter_identity} route/evaluator "
+                                "state was released inside its update window."
+                            )
+                        update_slow_evaluator(
+                            utility_evaluator,
+                            student,
+                            decay=float(
+                                getattr(
+                                    cfg,
+                                    "SOURCE_ARBITER_UTILITY_EMA_DECAY",
+                                    0.999,
+                                )
                             ),
-                            epoch=epoch,
                         )
+                        with torch.no_grad():
+                            route_memory.update(
+                                indices=egsa_sample_indices,
+                                teacher_prob=teacher_prob.detach(),
+                                student_prob=student_logits.sigmoid().detach(),
+                                temporal_mean=temporal_mean.detach(),
+                                temporal_variance=ecst_states[
+                                    "variance"
+                                ].detach(),
+                                history_count=history_count.detach(),
+                                teacher_prior=torch.full(
+                                    (int(teacher_prob.shape[0]),),
+                                    float(source_arbiter_prior),
+                                    device=teacher_prob.device,
+                                    dtype=teacher_prob.dtype,
+                                ),
+                                epoch=epoch,
+                            )
                 global_step += 1
 
                 total_loss += float(loss.item())
+                if use_ap_stcr_train:
+                    if (
+                        ap_stcr_seg_result is None
+                        or ap_stcr_epoch_accumulator is None
+                    ):
+                        raise RuntimeError(
+                            "AP-STCR epoch aggregation state is unavailable."
+                        )
+                    ap_stcr_loss_final_sum += float(
+                        ap_stcr_seg_result["loss_final"].detach().item()
+                    )
+                    ap_stcr_loss_coarse_sum += float(
+                        ap_stcr_seg_result["loss_coarse"].detach().item()
+                    )
+                    ap_stcr_loss_base_sum += float(
+                        ap_stcr_seg_result["loss_base"].detach().item()
+                    )
+                    ap_stcr_loss_group_sum += float(
+                        ap_stcr_seg_result["loss"].detach().item()
+                    )
+                    accumulate_ap_stcr_epoch(
+                        ap_stcr_epoch_accumulator,
+                        ap_stcr_batch_result,
+                        student_logits.sigmoid().detach(),
+                    )
+                if use_pssf_train:
+                    pssf_seg_final_sum += float(
+                        pssf_seg_result["loss_final"].detach().item()
+                    )
+                    pssf_seg_coarse_sum += float(
+                        pssf_seg_result["loss_coarse"].detach().item()
+                    )
+                    pssf_seg_base_sum += float(
+                        pssf_seg_result["loss_base"].detach().item()
+                    )
+                    pssf_seg_group_sum += float(
+                        pssf_seg_result["loss"].detach().item()
+                    )
                 if use_source_arbiter_train:
                     source_values = {
                         "influence_scale": source_arbiter_influence,
+                        "train_scale": source_arbiter_train_scale,
                         "teacher_prior": source_arbiter_prior,
+                        "teacher_source_weight_min": float(
+                            teacher_source_weight.min().detach()
+                        ),
+                        "teacher_source_weight_mean": float(
+                            teacher_source_weight.mean().detach()
+                        ),
+                        "teacher_source_weight_max": float(
+                            teacher_source_weight.max().detach()
+                        ),
                         **source_arbiter_gate_batch_stats,
                         **source_arbiter_loss_stats,
+                        **source_arbiter_head_grad_stats,
+                        **source_arbiter_shadow_batch_stats,
                     }
                     for name, value in source_values.items():
                         source_arbiter_epoch_sums[name] = (
@@ -15409,7 +22306,13 @@ def main():
                     dabe_aware_stat_batches += 1
                 if use_dabe_pu:
                     dabe_pu_target_mean_sum += float(pu_target_soft.detach().mean().item())
-                    dabe_pu_weight_mean_sum += float(pu_weight_map.detach().mean().item())
+                    dabe_pu_weight_mean_sum += float(
+                        (
+                            batch["pu_weight_map"].float().mean()
+                            if use_pssf_train
+                            else pu_weight_map.detach().mean()
+                        ).item()
+                    )
                     dabe_pu_target_hard_area_sum += float(pu_target_hard.detach().mean().item())
                     dabe_pu_fg_core_mean_sum += float(batch["pu_fg_core"].float().mean().item())
                     dabe_pu_fg_fallback_mean_sum += float(batch["pu_fg_fallback"].float().mean().item())
@@ -15427,6 +22330,24 @@ def main():
                     dabe_pu_teacher_conf_ratio_sum += float(pu_teacher_stats["teacher_conf_ratio"])
                     dabe_pu_teacher_fg_ratio_sum += float(pu_teacher_stats["teacher_fg_ratio"])
                     dabe_pu_teacher_bg_ratio_sum += float(pu_teacher_stats["teacher_bg_ratio"])
+                    if static_weight_audit_enabled:
+                        if (
+                            static_weight_epoch_accumulator is None
+                            or static_weight_region_masks is None
+                        ):
+                            raise RuntimeError(
+                                "Static-weight epoch audit state is unavailable"
+                            )
+                        accumulate_static_weight_audit(
+                            accumulator=static_weight_epoch_accumulator,
+                            raw_weight_map=pu_weight_map_raw,
+                            effective_weight_map=pu_static_weight_map,
+                            static_target=pu_static_target,
+                            student_logits=student_logits,
+                            teacher_prob=teacher_prob,
+                            region_masks=static_weight_region_masks,
+                            static_weight=pu_static_loss_weight,
+                        )
                     if str(getattr(cfg, "DABE_PU_VERSION", "")).lower() == "pu_v12_shape_complete":
                         dabe_pu_v12_target_base_mean_sum += float(batch["pu_target_base"].float().mean().item())
                         dabe_pu_v12_weight_base_mean_sum += float(batch["pu_weight_base"].float().mean().item())
@@ -16044,18 +22965,74 @@ def main():
                     drepp_boundary_band_area_sum += float(batch["drepp_boundary_band_area"].sum().item())
                     drepp_fixed_local_ratio_sum += float(batch["drepp_fixed_local_ratio"].sum().item())
 
+            if use_pssf_train:
+                pssf_history_bank.end_epoch(epoch)
+                if use_ppse_v2(cfg):
+                    if ppse_actor_epoch_audit is None:
+                        raise RuntimeError(
+                            "PPSE-v2 actor epoch audit was not initialized."
+                        )
+                    ppse_actor_epoch_audit["actor_hash_end"] = (
+                        pssf_module_state_hash(pssf_actor)
+                    )
+                    ppse_actor_epoch_audit["learner_hash_end"] = (
+                        pssf_module_state_hash(pssf)
+                    )
+                    ppse_actor_epoch_audit["actor_unchanged"] = (
+                        ppse_actor_epoch_audit["actor_hash_end"]
+                        == ppse_actor_epoch_audit["actor_hash_start"]
+                    )
+                    ppse_actor_epoch_audit["learner_updated"] = (
+                        ppse_actor_epoch_audit["learner_hash_end"]
+                        != ppse_actor_epoch_audit["learner_hash_start"]
+                    )
+                    if not ppse_actor_epoch_audit["actor_unchanged"]:
+                        raise RuntimeError(
+                            "[PPSE-v2 ERROR] "
+                            "actor_parameters_changed_within_epoch"
+                        )
+                    if _pssf_module_has_grad(pssf_actor):
+                        raise RuntimeError(
+                            "[PPSE-v2 ERROR] actor_grad_present"
+                        )
             avg_loss = total_loss / max(num_batches, 1)
-            logger.log(
-                f"[Train] Epoch {epoch:03d}/{max_epoch:03d} | "
-                f"avg_train_loss={avg_loss:.6f} | lr={current_lr(optimizer):.8f} | "
-                f"teacher_fusion_mode={fusion_mode} | "
-                f"fixed_weight={effective_despl_weight:.2f} | "
-                f"teacher_weight={effective_teacher_weight:.2f} | "
-                f"schedule_fixed_weight={fixed_weight:.2f} | "
-                f"schedule_teacher_weight={teacher_weight:.2f} | "
-                f"dabe_weight={effective_despl_weight:.2f} | "
-                f"schedule_dabe_weight={fixed_weight:.2f}"
-            )
+            if use_ap_stcr_train:
+                schedule_static, schedule_teacher = (
+                    get_dabe_pu_despl_schedule(epoch, cfg)
+                )
+                logger.log(
+                    f"[Train] Epoch {epoch:03d}/{max_epoch:03d} | "
+                    f"avg_train_loss={avg_loss:.6f} | "
+                    f"lr={current_lr(optimizer):.8f} | "
+                    "supervision_mode=ap_stcr | "
+                    f"schedule_static_weight={schedule_static:.9f} | "
+                    f"schedule_teacher_weight={schedule_teacher:.9f} | "
+                    "legacy_static_loss_used=False | "
+                    "legacy_teacher_loss_used=False | "
+                    "teacher_route_used=False"
+                )
+            elif use_pssf_train:
+                logger.log(
+                    f"[Train] Epoch {epoch:03d}/{max_epoch:03d} | "
+                    f"avg_train_loss={avg_loss:.6f} | "
+                    f"lr={current_lr(optimizer):.8f} | "
+                    "teacher_fusion_mode="
+                    f"{getattr(cfg, 'TEACHER_FUSION_MODE')} | "
+                    "global_handover_bypassed=True | "
+                    "static_weight_used=False | teacher_route_used=False"
+                )
+            else:
+                logger.log(
+                    f"[Train] Epoch {epoch:03d}/{max_epoch:03d} | "
+                    f"avg_train_loss={avg_loss:.6f} | lr={current_lr(optimizer):.8f} | "
+                    f"teacher_fusion_mode={fusion_mode} | "
+                    f"fixed_weight={effective_despl_weight:.2f} | "
+                    f"teacher_weight={effective_teacher_weight:.2f} | "
+                    f"schedule_fixed_weight={fixed_weight:.2f} | "
+                    f"schedule_teacher_weight={teacher_weight:.2f} | "
+                    f"dabe_weight={effective_despl_weight:.2f} | "
+                    f"schedule_dabe_weight={fixed_weight:.2f}"
+                )
             stat_batches = max(num_batches, 1)
             logger.log(
                 f"[PredArea] epoch={epoch:03d} | "
@@ -16065,6 +23042,432 @@ def main():
                 f"teacher_pred_area_mean={teacher_pred_area_sum / stat_batches:.6f} | "
                 f"mixed_target_area_mean={mixed_target_area_sum / stat_batches:.6f}"
             )
+            if use_ap_stcr_train:
+                if ap_stcr_epoch_accumulator is None:
+                    raise RuntimeError(
+                        "AP-STCR epoch accumulator was not initialized."
+                    )
+                ap_stcr_epoch_row = finalize_ap_stcr_epoch(
+                    ap_stcr_epoch_accumulator
+                )
+                logger.log(
+                    f"[AP-STCR] epoch={epoch:03d} | "
+                    f"phase={ap_stcr_checkpoint_phase(cfg, epoch)} | "
+                    f"global_teacher_ratio="
+                    f"{ap_stcr_epoch_row['global_teacher_ratio']:.9f} | "
+                    "fg/bg_anchor_count_mean="
+                    f"{ap_stcr_epoch_row['fg_anchor_count_mean']:.4f}/"
+                    f"{ap_stcr_epoch_row['bg_anchor_count_mean']:.4f} | "
+                    f"bg_anchor_source={ap_stcr_epoch_row['bg_anchor_source']} | "
+                    "semantic_margin mean/std="
+                    f"{ap_stcr_epoch_row['semantic_margin_mean']:.6f}/"
+                    f"{ap_stcr_epoch_row['semantic_margin_std']:.6f} | "
+                    "history_valid_ratio="
+                    f"{ap_stcr_epoch_row['history_valid_ratio']:.6f}"
+                )
+                logger.log(
+                    f"[AP-STCR] epoch={epoch:03d} | "
+                    "semantic_support p10/p50/p90="
+                    f"{ap_stcr_epoch_row['semantic_support_p10']:.6f}/"
+                    f"{ap_stcr_epoch_row['semantic_support_p50']:.6f}/"
+                    f"{ap_stcr_epoch_row['semantic_support_p90']:.6f} | "
+                    "temporal_support p10/p50/p90="
+                    f"{ap_stcr_epoch_row['temporal_support_p10']:.6f}/"
+                    f"{ap_stcr_epoch_row['temporal_support_p50']:.6f}/"
+                    f"{ap_stcr_epoch_row['temporal_support_p90']:.6f} | "
+                    "acceptance p10/p50/p90="
+                    f"{ap_stcr_epoch_row['local_acceptance_p10']:.6f}/"
+                    f"{ap_stcr_epoch_row['local_acceptance_p50']:.6f}/"
+                    f"{ap_stcr_epoch_row['local_acceptance_p90']:.6f}"
+                )
+                logger.log(
+                    f"[AP-STCR] epoch={epoch:03d} | "
+                    "effective_teacher_weight mean/std="
+                    f"{ap_stcr_epoch_row['effective_teacher_weight_mean']:.6f}/"
+                    f"{ap_stcr_epoch_row['effective_teacher_weight_std']:.6f} | "
+                    "teacher_correction_abs/accepted_abs="
+                    f"{ap_stcr_epoch_row['teacher_correction_abs_mean']:.6f}/"
+                    f"{ap_stcr_epoch_row['accepted_correction_abs_mean']:.6f} | "
+                    "fixed/teacher/target/student_area="
+                    f"{ap_stcr_epoch_row['fixed_area_mean']:.6f}/"
+                    f"{ap_stcr_epoch_row['teacher_area_mean']:.6f}/"
+                    f"{ap_stcr_epoch_row['target_area_mean']:.6f}/"
+                    f"{ap_stcr_epoch_row['student_area_mean']:.6f} | "
+                    "teacher_fixed_disagreement_ratio="
+                    f"{ap_stcr_epoch_row['teacher_fixed_disagreement_ratio']:.6f}"
+                )
+                logger.log(
+                    f"[AP-STCR] epoch={epoch:03d} | "
+                    "semantic_support agree/disagree="
+                    f"{ap_stcr_epoch_row['semantic_support_agree_mean']:.6f}/"
+                    f"{ap_stcr_epoch_row['semantic_support_disagree_mean']:.6f} | "
+                    "temporal_support agree/disagree="
+                    f"{ap_stcr_epoch_row['temporal_support_agree_mean']:.6f}/"
+                    f"{ap_stcr_epoch_row['temporal_support_disagree_mean']:.6f} | "
+                    "effective_teacher agree/disagree="
+                    f"{ap_stcr_epoch_row['effective_teacher_weight_agree_mean']:.6f}/"
+                    f"{ap_stcr_epoch_row['effective_teacher_weight_disagree_mean']:.6f} | "
+                    "loss final/coarse/base/group="
+                    f"{ap_stcr_loss_final_sum / stat_batches:.8f}/"
+                    f"{ap_stcr_loss_coarse_sum / stat_batches:.8f}/"
+                    f"{ap_stcr_loss_base_sum / stat_batches:.8f}/"
+                    f"{ap_stcr_loss_group_sum / stat_batches:.8f}"
+                )
+            if use_pssf_train:
+                pssf_epoch_row = finalize_pssf_epoch(
+                    pssf_epoch_accumulator
+                )
+                pssf_epoch_row["phase"] = pssf_checkpoint_phase(cfg, epoch)
+                pssf_epoch_row["cross_reset_target_used"] = False
+                pssf_epoch_row["history_active"] = bool(
+                    pssf_epoch_row["delayed_batch_ratio"] > 0.0
+                )
+                if use_ppse_v2(cfg):
+                    pssf_epoch_row.update(ppse_actor_epoch_audit)
+                    pssf_epoch_row["actor_grad_present"] = False
+                    pssf_epoch_row["learner_grad_present"] = bool(
+                        pssf_epoch_row["delayed_batch_ratio"] > 0.0
+                    )
+                    pssf_epoch_row["actor_used_for_current_state"] = True
+                    pssf_epoch_row[
+                        "learner_used_for_delayed_loss"
+                    ] = True
+                    if (
+                        pssf_epoch_row["teacher_write_weight_max"]
+                        > 0.333334
+                    ):
+                        raise RuntimeError(
+                            "[PPSE-v2 ERROR] teacher_write_weight_exceeds_limit"
+                        )
+                    if (
+                        pssf_epoch_row["coefficient_sum_error_max"]
+                        >= 1e-6
+                    ):
+                        raise RuntimeError(
+                            "[PPSE-v2 ERROR] "
+                            "state_coefficients_do_not_sum_to_one"
+                        )
+                pssf_segmentation_stats = {
+                    "loss_final": pssf_seg_final_sum / stat_batches,
+                    "loss_coarse": pssf_seg_coarse_sum / stat_batches,
+                    "loss_base": pssf_seg_base_sum / stat_batches,
+                    "loss_group": pssf_seg_group_sum / stat_batches,
+                    "coarse_weight": 0.5,
+                    "base_weight": (
+                        0.5
+                        if is_before_finetune_reset(cfg, epoch)
+                        else 0.3
+                    ),
+                }
+                delayed_source_epoch = (
+                    f"{epoch - int(getattr(cfg, 'PSSF_HORIZON', 3)):03d}"
+                    if pssf_epoch_row["delayed_batch_ratio"] > 0.0
+                    else "none"
+                )
+                pssf_output_log_label = (
+                    "[PPSE Retention]"
+                    if use_ppse_v2(cfg)
+                    else "[PSSF Gain]"
+                )
+                pssf_target_log_label = (
+                    "[PPSE Retention Target]"
+                    if use_ppse_v2(cfg)
+                    else "[PSSF Target]"
+                )
+                pssf_patch_log_label = (
+                    "[PPSE PatchVsScalar]"
+                    if use_ppse_v2(cfg)
+                    else "[PSSF PatchVsScalar]"
+                )
+                pssf_target_stat_name = (
+                    "target_retention"
+                    if use_ppse_v2(cfg)
+                    else "target_gain"
+                )
+                logger.log(
+                    f"{pssf_output_log_label} epoch={epoch:03d} | "
+                    "retention_or_gain_min/mean/p10/p50/p90/max/"
+                    "global_std/spatial_std="
+                    f"{pssf_epoch_row['gain_min']:.6f}/"
+                    f"{pssf_epoch_row['gain_mean']:.6f}/"
+                    f"{pssf_epoch_row['gain_p10']:.6f}/"
+                    f"{pssf_epoch_row['gain_p50']:.6f}/"
+                    f"{pssf_epoch_row['gain_p90']:.6f}/"
+                    f"{pssf_epoch_row['gain_max']:.6f}/"
+                    f"{pssf_epoch_row['gain_global_std']:.6f}/"
+                    f"{pssf_epoch_row['gain_spatial_std']:.6f} | "
+                    "above/below_image_mean_ratio="
+                    f"{pssf_epoch_row['gain_above_image_mean_ratio']:.6f}/"
+                    f"{pssf_epoch_row['gain_below_image_mean_ratio']:.6f} | "
+                    "actual_write/innovation_abs_mean="
+                    f"{pssf_epoch_row['actual_write_abs_mean']:.6f}/"
+                    f"{pssf_epoch_row['innovation_abs_mean']:.6f} | "
+                    "Q_soft/Q_binary/P0_soft/P0_binary="
+                    f"{pssf_epoch_row['q_soft_mean']:.6f}/"
+                    f"{pssf_epoch_row['q_binary_area']:.6f}/"
+                    f"{pssf_epoch_row['p0_soft_mean']:.6f}/"
+                    f"{pssf_epoch_row['p0_binary_area']:.6f} | "
+                    "student/teacher_area="
+                    f"{pssf_epoch_row['student_pred_area']:.6f}/"
+                    f"{pssf_epoch_row['teacher_pred_area']:.6f} | "
+                    f"temporal_var_mean="
+                    f"{pssf_epoch_row['temporal_var_mean']:.8f}"
+                )
+                logger.log(
+                    f"{pssf_target_log_label} source_epoch="
+                    f"{delayed_source_epoch} | "
+                    f"current_epoch={epoch:03d} | split=train | "
+                    f"history_phase={pssf_epoch_row['history_phase']} | "
+                    f"delayed_batch_ratio="
+                    f"{pssf_epoch_row['delayed_batch_ratio']:.6f} | "
+                    f"{pssf_target_stat_name}_mean/std="
+                    f"{pssf_epoch_row['target_gain_mean_train']:.6f}/"
+                    f"{pssf_epoch_row['target_gain_std_train']:.6f} | "
+                    f"{pssf_target_stat_name}_le005/mid/ge095="
+                    f"{pssf_epoch_row['target_gain_le_005_ratio_train']:.6f}/"
+                    f"{pssf_epoch_row['target_gain_mid_ratio_train']:.6f}/"
+                    f"{pssf_epoch_row['target_gain_ge_095_ratio_train']:.6f} | "
+                    "wmse/wmae="
+                    f"{pssf_epoch_row['gain_wmse_train']:.8f}/"
+                    f"{pssf_epoch_row['gain_wmae_train']:.8f} | "
+                    "pearson/spearman="
+                    f"{pssf_epoch_row['pearson_train']:.6f}/"
+                    f"{pssf_epoch_row['spearman_train']:.6f} | "
+                    "innovation="
+                    f"{pssf_epoch_row['innovation_weight_mean_train']:.6f}"
+                )
+                logger.log(
+                    f"{pssf_target_log_label} source_epoch="
+                    f"{delayed_source_epoch} | "
+                    f"current_epoch={epoch:03d} | split=audit_val | "
+                    f"history_phase={pssf_epoch_row['history_phase']} | "
+                    f"delayed_batch_ratio="
+                    f"{pssf_epoch_row['delayed_batch_ratio']:.6f} | "
+                    f"{pssf_target_stat_name}_mean/std="
+                    f"{pssf_epoch_row['target_gain_mean_val']:.6f}/"
+                    f"{pssf_epoch_row['target_gain_std_val']:.6f} | "
+                    f"{pssf_target_stat_name}_le005/mid/ge095="
+                    f"{pssf_epoch_row['target_gain_le_005_ratio_val']:.6f}/"
+                    f"{pssf_epoch_row['target_gain_mid_ratio_val']:.6f}/"
+                    f"{pssf_epoch_row['target_gain_ge_095_ratio_val']:.6f} | "
+                    "wmse/wmae="
+                    f"{pssf_epoch_row['gain_wmse_val']:.8f}/"
+                    f"{pssf_epoch_row['gain_wmae_val']:.8f} | "
+                    "pearson/spearman="
+                    f"{pssf_epoch_row['pearson_val']:.6f}/"
+                    f"{pssf_epoch_row['spearman_val']:.6f} | "
+                    "innovation="
+                    f"{pssf_epoch_row['innovation_weight_mean_val']:.6f}"
+                )
+                logger.log(
+                    f"{pssf_patch_log_label} epoch={epoch:03d} | "
+                    "future_mae_patch/scalar train="
+                    f"{pssf_epoch_row['future_mae_patch_train']:.8f}/"
+                    f"{pssf_epoch_row['future_mae_scalar_train']:.8f} | "
+                    "future_mae_patch/scalar val="
+                    f"{pssf_epoch_row['future_mae_patch_val']:.8f}/"
+                    f"{pssf_epoch_row['future_mae_scalar_val']:.8f} | "
+                    "relative_improvement train/val="
+                    f"{pssf_epoch_row['patch_vs_scalar_improvement_train']:.6f}/"
+                    f"{pssf_epoch_row['patch_vs_scalar_improvement_val']:.6f} | "
+                    "patch_better train/val="
+                    f"{pssf_epoch_row['patch_better_ratio_train']:.6f}/"
+                    f"{pssf_epoch_row['patch_better_ratio_val']:.6f} | "
+                    "scalar_better train/val="
+                    f"{pssf_epoch_row['scalar_better_ratio_train']:.6f}/"
+                    f"{pssf_epoch_row['scalar_better_ratio_val']:.6f}"
+                )
+                logger.log(
+                    (
+                        f"[PPSE-v2 Segmentation] epoch={epoch:03d} | "
+                        if use_ppse_v2(cfg)
+                        else f"[PSSF Segmentation] epoch={epoch:03d} | "
+                    )
+                    + (
+                        "target=soft_Q_ppse_v2 | "
+                        if use_ppse_v2(cfg)
+                        else "target=soft_Q | "
+                    )
+                    + "teacher_observation=strict_gt_0.5 | "
+                    "loss_final/coarse/base/group="
+                    f"{pssf_segmentation_stats['loss_final']:.8f}/"
+                    f"{pssf_segmentation_stats['loss_coarse']:.8f}/"
+                    f"{pssf_segmentation_stats['loss_base']:.8f}/"
+                    f"{pssf_segmentation_stats['loss_group']:.8f} | "
+                    "weights="
+                    f"1.0/{pssf_segmentation_stats['coarse_weight']:.1f}/"
+                    f"{pssf_segmentation_stats['base_weight']:.1f}"
+                )
+                if use_ppse_v2(cfg):
+                    logger.log(
+                        f"[PPSE Retention] epoch={epoch:03d} | "
+                        f"actor_sync_epoch={pssf_epoch_row['actor_sync_epoch']} | "
+                        f"actor_hash_start={pssf_epoch_row['actor_hash_start']} | "
+                        f"actor_hash_end={pssf_epoch_row['actor_hash_end']} | "
+                        f"learner_hash_start={pssf_epoch_row['learner_hash_start']} | "
+                        f"learner_hash_end={pssf_epoch_row['learner_hash_end']} | "
+                        "retention_min/mean/p10/p50/p90/max/global_std/spatial_std="
+                        f"{pssf_epoch_row['retention_min']:.6f}/"
+                        f"{pssf_epoch_row['retention_mean']:.6f}/"
+                        f"{pssf_epoch_row['retention_p10']:.6f}/"
+                        f"{pssf_epoch_row['retention_p50']:.6f}/"
+                        f"{pssf_epoch_row['retention_p90']:.6f}/"
+                        f"{pssf_epoch_row['retention_max']:.6f}/"
+                        f"{pssf_epoch_row['retention_global_std']:.6f}/"
+                        f"{pssf_epoch_row['retention_spatial_std']:.6f} | "
+                        f"state_memory_weight={pssf_epoch_row['state_memory_weight']:.8f} | "
+                        "p0_write_weight_mean/p10/p90="
+                        f"{pssf_epoch_row['p0_write_weight_mean']:.8f}/"
+                        f"{pssf_epoch_row['p0_write_weight_p10']:.8f}/"
+                        f"{pssf_epoch_row['p0_write_weight_p90']:.8f} | "
+                        "teacher_write_weight_mean/p10/p90/max="
+                        f"{pssf_epoch_row['teacher_write_weight_mean']:.8f}/"
+                        f"{pssf_epoch_row['teacher_write_weight_p10']:.8f}/"
+                        f"{pssf_epoch_row['teacher_write_weight_p90']:.8f}/"
+                        f"{pssf_epoch_row['teacher_write_weight_max']:.8f} | "
+                        "p0_soft/proposal_soft/q_soft="
+                        f"{pssf_epoch_row['p0_soft_mean']:.6f}/"
+                        f"{pssf_epoch_row['proposal_soft_mean']:.6f}/"
+                        f"{pssf_epoch_row['q_soft_mean']:.6f} | "
+                        "p0/proposal/q/teacher/student_binary_area="
+                        f"{pssf_epoch_row['p0_binary_area']:.6f}/"
+                        f"{pssf_epoch_row['proposal_binary_area']:.6f}/"
+                        f"{pssf_epoch_row['q_binary_area']:.6f}/"
+                        f"{pssf_epoch_row['teacher_pred_area']:.6f}/"
+                        f"{pssf_epoch_row['student_pred_area']:.6f} | "
+                        "q_to_p0/q_to_teacher/proposal_to_p0/proposal_to_teacher="
+                        f"{pssf_epoch_row['q_to_p0_mae']:.8f}/"
+                        f"{pssf_epoch_row['q_to_teacher_mae']:.8f}/"
+                        f"{pssf_epoch_row['proposal_to_p0_mae']:.8f}/"
+                        f"{pssf_epoch_row['proposal_to_teacher_mae']:.8f} | "
+                        "state_change/teacher_innovation/prior_correction="
+                        f"{pssf_epoch_row['actual_state_change_abs_mean']:.8f}/"
+                        f"{pssf_epoch_row['teacher_innovation_abs_mean']:.8f}/"
+                        f"{pssf_epoch_row['prior_correction_abs_mean']:.8f}"
+                    )
+                    logger.log(
+                        f"[PPSE ActorLearner] epoch={epoch:03d} | "
+                        "synced_at_epoch_start=True | "
+                        f"actor_hash_start={pssf_epoch_row['actor_hash_start']} | "
+                        f"actor_hash_end={pssf_epoch_row['actor_hash_end']} | "
+                        f"learner_hash_start={pssf_epoch_row['learner_hash_start']} | "
+                        f"learner_hash_end={pssf_epoch_row['learner_hash_end']} | "
+                        f"actor_unchanged_within_epoch={pssf_epoch_row['actor_unchanged']} | "
+                        f"learner_updated_within_epoch={pssf_epoch_row['learner_updated']} | "
+                        "actor_used_for_current_state=True | "
+                        "learner_used_for_delayed_loss=True | "
+                        "actor_grad_present=False | "
+                        f"learner_grad_present={pssf_epoch_row['learner_grad_present']}"
+                    )
+                append_pssf_epoch_csv(
+                    pssf_epoch_csv_path,
+                    epoch,
+                    pssf_epoch_row,
+                    pssf_segmentation_stats,
+                )
+                if (
+                    pssf_epoch_row["delayed_batch_ratio"] > 0.0
+                    and pssf_epoch_row["patch_better_ratio_val"] < 0.5
+                ):
+                    pssf_patch_not_better_streak += 1
+                else:
+                    pssf_patch_not_better_streak = 0
+                if (
+                    pssf_patch_not_better_streak
+                    == int(
+                        getattr(
+                            cfg,
+                            "PSSF_PATCH_NOT_BETTER_PATIENCE",
+                            5,
+                        )
+                    )
+                ):
+                    logger.log(
+                        "[PSSF WARNING] patch_predictor_not_better_than_scalar | "
+                        "no automatic parameter change applied."
+                    )
+                takeover = (
+                    pssf_epoch_row["gain_mean"]
+                    > float(
+                        getattr(cfg, "PSSF_TEACHER_TAKEOVER_GAIN", 0.98)
+                    )
+                    and pssf_epoch_row["gain_spatial_std"]
+                    < float(
+                        getattr(cfg, "PSSF_SPATIAL_COLLAPSE_STD", 1e-3)
+                    )
+                )
+                pssf_teacher_takeover_streak = (
+                    pssf_teacher_takeover_streak + 1 if takeover else 0
+                )
+                if pssf_teacher_takeover_streak == int(
+                    getattr(cfg, "PSSF_GAIN_COLLAPSE_PATIENCE", 3)
+                ):
+                    logger.log(
+                        "[PPSE-v2 WARNING] retention_collapsed_to_one"
+                        if use_ppse_v2(cfg)
+                        else "[PSSF WARNING] collapsed_to_teacher"
+                    )
+                frozen = pssf_epoch_row["gain_mean"] < float(
+                    getattr(cfg, "PSSF_STATIC_FREEZE_GAIN", 0.005)
+                )
+                pssf_static_freeze_streak = (
+                    pssf_static_freeze_streak + 1 if frozen else 0
+                )
+                if pssf_static_freeze_streak == int(
+                    getattr(cfg, "PSSF_GAIN_COLLAPSE_PATIENCE", 3)
+                ):
+                    logger.log("[PSSF WARNING] supervision_state_frozen")
+                spatial_collapse = pssf_epoch_row[
+                    "gain_spatial_std"
+                ] < float(
+                    getattr(cfg, "PSSF_SPATIAL_COLLAPSE_STD", 1e-3)
+                )
+                pssf_spatial_collapse_streak = (
+                    pssf_spatial_collapse_streak + 1
+                    if spatial_collapse
+                    else 0
+                )
+                if pssf_spatial_collapse_streak == int(
+                    getattr(cfg, "PSSF_SPATIAL_COLLAPSE_PATIENCE", 5)
+                ):
+                    logger.log(
+                        (
+                            "[PPSE-v2 WARNING] "
+                            "retention_degenerated_to_scalar"
+                            if use_ppse_v2(cfg)
+                            else "[PSSF WARNING] "
+                            "patch_gain_degenerated_to_scalar"
+                        )
+                    )
+                if use_ppse_v2(cfg):
+                    q_too_close = (
+                        int(epoch) <= 10
+                        and pssf_epoch_row["q_to_teacher_mae"] < 0.005
+                    )
+                    ppse_q_teacher_close_streak = (
+                        ppse_q_teacher_close_streak + 1
+                        if q_too_close
+                        else 0
+                    )
+                    if ppse_q_teacher_close_streak == 3:
+                        logger.log(
+                            "[PPSE-v2 WARNING] "
+                            "supervision_state_too_close_to_teacher_early"
+                        )
+                student_area = student_pred_area_sum / stat_batches
+                if student_area < float(
+                    getattr(cfg, "PSSF_SEG_COLLAPSE_AREA", 0.01)
+                ):
+                    pssf_collapse_streak += 1
+                else:
+                    pssf_collapse_streak = 0
+                if pssf_collapse_streak == int(
+                    getattr(cfg, "PSSF_SEG_COLLAPSE_PATIENCE", 3)
+                ):
+                    logger.log(
+                        "[PSSF WARNING] segmentation_foreground_collapse | "
+                        "training is not automatically changed."
+                    )
             if use_cacd(cfg) and cacd_stat_batches > 0:
                 cb = float(cacd_stat_batches)
                 aux_avg = {name: value / cb for name, value in cacd_aux_sums.items()}
@@ -16228,7 +23631,9 @@ def main():
                 )
             if use_dabe_pu:
                 stat_batches = max(dabe_pu_stat_batches, 1)
-                if use_dabe_oem:
+                if use_pssf_train:
+                    static_weight_log, teacher_weight_log = 0.0, 0.0
+                elif use_dabe_oem:
                     static_weight_log, teacher_weight_log = 1.0, 0.0
                 elif use_dabe_pu_balanced_v2:
                     static_weight_log, teacher_weight_log = get_dabe_pu_balanced_v2_schedule(epoch, cfg)
@@ -16236,6 +23641,70 @@ def main():
                     static_weight_log, teacher_weight_log = get_dabe_pu_despl_schedule(epoch, cfg)
                 else:
                     static_weight_log, teacher_weight_log = get_dabe_pu_schedule(epoch, cfg)
+                if static_weight_audit_enabled:
+                    if (
+                        static_weight_epoch_accumulator is None
+                        or static_weight_audit_path is None
+                    ):
+                        raise RuntimeError(
+                            "Static-weight audit output state is unavailable"
+                        )
+                    static_weight_row = finalize_static_weight_audit(
+                        accumulator=static_weight_epoch_accumulator,
+                        epoch=epoch,
+                        mode=static_weight_mode,
+                        global_static_weight=static_weight_log,
+                        global_teacher_weight=teacher_weight_log,
+                    )
+                    write_csv_row(
+                        static_weight_audit_path,
+                        list(static_weight_row),
+                        static_weight_row,
+                    )
+                    logger.log(
+                        f"[StaticWeight] epoch={epoch:03d} | "
+                        f"mode={static_weight_mode} | "
+                        f"global_static/teacher={static_weight_log:.6f}/"
+                        f"{teacher_weight_log:.6f} | "
+                        "raw/effective_mean="
+                        f"{static_weight_row['raw_weight_mean']:.6f}/"
+                        f"{static_weight_row['effective_weight_mean']:.6f} | "
+                        "effective_zero/full="
+                        f"{static_weight_row['effective_zero_ratio']:.6f}/"
+                        f"{static_weight_row['effective_full_ratio']:.6f} | "
+                        "student/teacher_prob="
+                        f"{static_weight_row['student_prob_mean']:.6f}/"
+                        f"{static_weight_row['teacher_prob_mean']:.6f} | "
+                        "student/teacher_area="
+                        f"{static_weight_row['student_pred_area']:.6f}/"
+                        f"{static_weight_row['teacher_pred_area']:.6f} | "
+                        "student_prob_fg/bg/extent/unknown="
+                        f"{static_weight_row['student_prob_fg_core']:.6f}/"
+                        f"{static_weight_row['student_prob_bg_core']:.6f}/"
+                        f"{static_weight_row['student_prob_extent']:.6f}/"
+                        f"{static_weight_row['student_prob_unknown']:.6f} | "
+                        "teacher_prob_fg/bg/extent/unknown="
+                        f"{static_weight_row['teacher_prob_fg_core']:.6f}/"
+                        f"{static_weight_row['teacher_prob_bg_core']:.6f}/"
+                        f"{static_weight_row['teacher_prob_extent']:.6f}/"
+                        f"{static_weight_row['teacher_prob_unknown']:.6f} | "
+                        "weight_mass_fg/fallback/bg/extent/unknown/other="
+                        f"{static_weight_row['fg_core_weight_mass']:.6f}/"
+                        f"{static_weight_row['fg_fallback_weight_mass']:.6f}/"
+                        f"{static_weight_row['bg_core_weight_mass']:.6f}/"
+                        f"{static_weight_row['extent_weight_mass']:.6f}/"
+                        f"{static_weight_row['unknown_weight_mass']:.6f}/"
+                        f"{static_weight_row['other_weight_mass']:.6f} | "
+                        "gradmass_fg/fallback/bg/extent/unknown/other="
+                        f"{static_weight_row['fg_core_gradmass']:.6f}/"
+                        f"{static_weight_row['fg_fallback_gradmass']:.6f}/"
+                        f"{static_weight_row['bg_core_gradmass']:.6f}/"
+                        f"{static_weight_row['extent_gradmass']:.6f}/"
+                        f"{static_weight_row['unknown_gradmass']:.6f}/"
+                        f"{static_weight_row['other_gradmass']:.6f} | "
+                        "static_gradient_active="
+                        f"{static_weight_row['static_gradient_active']}"
+                    )
                 logger.log(
                     f"[DABE-PU] epoch={epoch:03d} | "
                     "use_dabe_pu=True | "
@@ -16264,7 +23733,31 @@ def main():
                     "fixed_used_for_training=False"
                 )
                 if use_dabe_pu_despl_sched:
-                    if str(getattr(cfg, "DABE_PU_VERSION", "")).lower() == "pu_v12_shape_complete":
+                    if use_ap_stcr_train:
+                        logger.log(
+                            f"[DABE-PU-DesplSched] epoch={epoch:03d} | "
+                            "supervision_target=ap_stcr_mixed_target_68 | "
+                            "static_target_mode=soft | "
+                            "teacher_target_mode=binary_strict_gt | "
+                            f"schedule_static_weight={static_weight_log:.9f} | "
+                            f"schedule_teacher_weight={teacher_weight_log:.9f} | "
+                            f"is_global_teacher_only="
+                            f"{bool(static_weight_log <= 1e-8 and teacher_weight_log >= 1.0 - 1e-8)} | "
+                            "legacy_static_group_used=False | "
+                            "legacy_teacher_group_used=False | "
+                            f"target_soft_mean="
+                            f"{dabe_pu_target_mean_sum / stat_batches:.6f} | "
+                            f"teacher_binary_area_mean="
+                            f"{teacher_pred_area_sum / stat_batches:.6f} | "
+                            f"mixed_target_area_mean="
+                            f"{mixed_target_area_sum / stat_batches:.6f} | "
+                            "loss_ap_final/coarse/base/group="
+                            f"{ap_stcr_loss_final_sum / stat_batches:.8f}/"
+                            f"{ap_stcr_loss_coarse_sum / stat_batches:.8f}/"
+                            f"{ap_stcr_loss_base_sum / stat_batches:.8f}/"
+                            f"{ap_stcr_loss_group_sum / stat_batches:.8f}"
+                        )
+                    elif str(getattr(cfg, "DABE_PU_VERSION", "")).lower() == "pu_v12_shape_complete":
                         logger.log(
                             f"[DABE-PU++] epoch={epoch:03d} | "
                             f"target_v12_mean={dabe_pu_target_mean_sum / stat_batches:.6f} | "
@@ -16281,31 +23774,68 @@ def main():
                             f"extent_ratio={dabe_pu_extent_mean_sum / stat_batches:.6f} | "
                             f"unknown_ratio={dabe_pu_unknown_mean_sum / stat_batches:.6f}"
                         )
+                    if not use_ap_stcr_train:
+                        logger.log(
+                            f"[DABE-PU-DesplSched] epoch={epoch:03d} | "
+                            f"static_target_mode={dabe_pu_despl_static_target_mode} | "
+                            f"teacher_target_mode={dabe_pu_despl_teacher_target_mode} | "
+                            f"static_weight={static_weight_log:.2f} | "
+                            f"teacher_weight={teacher_weight_log:.2f} | "
+                            f"is_teacher_only={bool(static_weight_log <= 1e-8 and teacher_weight_log >= 1.0 - 1e-8)} | "
+                            f"target_soft_mean={dabe_pu_target_mean_sum / stat_batches:.6f} | "
+                            f"target_hard_area_mean={dabe_pu_target_hard_area_sum / stat_batches:.6f} | "
+                            f"weight_map_mean={dabe_pu_weight_mean_sum / stat_batches:.6f} | "
+                            f"teacher_prob_mean={teacher_prob_mean_sum / max(num_batches, 1):.6f} | "
+                            f"teacher_prob_min={(teacher_prob_min if teacher_prob_min is not None else 0.0):.6f} | "
+                            f"teacher_prob_max={(teacher_prob_max if teacher_prob_max is not None else 0.0):.6f} | "
+                            f"teacher_soft_target_mean={teacher_soft_target_mean_sum / max(num_batches, 1):.6f} | "
+                            f"teacher_binary_area_mean={teacher_pred_area_sum / max(num_batches, 1):.6f} | "
+                            f"teacher_binary_area_mean_for_debug_only={teacher_pred_area_sum / max(num_batches, 1):.6f} | "
+                            f"loss_static_final={dabe_pu_static_final_loss_sum / stat_batches:.6f} | "
+                            f"loss_static_coarse={dabe_pu_static_coarse_loss_sum / stat_batches:.6f} | "
+                            f"loss_static_base={dabe_pu_static_base_loss_sum / stat_batches:.6f} | "
+                            f"loss_static_group={dabe_pu_static_group_loss_sum / stat_batches:.6f} | "
+                            f"loss_teacher_final={dabe_pu_teacher_final_loss_sum / stat_batches:.6f} | "
+                            f"loss_teacher_coarse={dabe_pu_teacher_coarse_loss_sum / stat_batches:.6f} | "
+                            f"loss_teacher_base={dabe_pu_teacher_base_loss_sum / stat_batches:.6f} | "
+                            f"loss_teacher_group={dabe_pu_teacher_group_loss_sum / stat_batches:.6f} | "
+                            f"loss_total={total_loss / max(num_batches, 1):.6f}"
+                        )
+                if (
+                    teacher_routing_mode != LEGACY_TEACHER_ROUTING_MODE
+                    and not use_pssf_train
+                    and not use_ap_stcr_train
+                ):
+                    teacher_routing_row = finalize_teacher_routing(
+                        teacher_routing_epoch_accumulator
+                    )
+                    if teacher_routing_mode == "none":
+                        if (
+                            teacher_routing_row["map_min"] != 1.0
+                            or teacher_routing_row["map_mean"] != 1.0
+                            or teacher_routing_row["map_max"] != 1.0
+                            or teacher_routing_row["memory_active"]
+                        ):
+                            raise RuntimeError(
+                                "No-ECST epoch routing invariant failed: "
+                                f"{teacher_routing_row}"
+                            )
                     logger.log(
-                        f"[DABE-PU-DesplSched] epoch={epoch:03d} | "
-                        f"static_target_mode={dabe_pu_despl_static_target_mode} | "
-                        f"teacher_target_mode={dabe_pu_despl_teacher_target_mode} | "
-                        f"static_weight={static_weight_log:.2f} | "
-                        f"teacher_weight={teacher_weight_log:.2f} | "
-                        f"is_teacher_only={bool(static_weight_log <= 1e-8 and teacher_weight_log >= 1.0 - 1e-8)} | "
-                        f"target_soft_mean={dabe_pu_target_mean_sum / stat_batches:.6f} | "
-                        f"target_hard_area_mean={dabe_pu_target_hard_area_sum / stat_batches:.6f} | "
-                        f"weight_map_mean={dabe_pu_weight_mean_sum / stat_batches:.6f} | "
-                        f"teacher_prob_mean={teacher_prob_mean_sum / max(num_batches, 1):.6f} | "
-                        f"teacher_prob_min={(teacher_prob_min if teacher_prob_min is not None else 0.0):.6f} | "
-                        f"teacher_prob_max={(teacher_prob_max if teacher_prob_max is not None else 0.0):.6f} | "
-                        f"teacher_soft_target_mean={teacher_soft_target_mean_sum / max(num_batches, 1):.6f} | "
-                        f"teacher_binary_area_mean={teacher_pred_area_sum / max(num_batches, 1):.6f} | "
-                        f"teacher_binary_area_mean_for_debug_only={teacher_pred_area_sum / max(num_batches, 1):.6f} | "
-                        f"loss_static_final={dabe_pu_static_final_loss_sum / stat_batches:.6f} | "
-                        f"loss_static_coarse={dabe_pu_static_coarse_loss_sum / stat_batches:.6f} | "
-                        f"loss_static_base={dabe_pu_static_base_loss_sum / stat_batches:.6f} | "
-                        f"loss_static_group={dabe_pu_static_group_loss_sum / stat_batches:.6f} | "
-                        f"loss_teacher_final={dabe_pu_teacher_final_loss_sum / stat_batches:.6f} | "
-                        f"loss_teacher_coarse={dabe_pu_teacher_coarse_loss_sum / stat_batches:.6f} | "
-                        f"loss_teacher_base={dabe_pu_teacher_base_loss_sum / stat_batches:.6f} | "
-                        f"loss_teacher_group={dabe_pu_teacher_group_loss_sum / stat_batches:.6f} | "
-                        f"loss_total={total_loss / max(num_batches, 1):.6f}"
+                        f"[TeacherRouting] epoch={epoch:03d} | "
+                        f"mode={teacher_routing_mode} | "
+                        "map_min/mean/max="
+                        f"{teacher_routing_row['map_min']:.6f}/"
+                        f"{teacher_routing_row['map_mean']:.6f}/"
+                        f"{teacher_routing_row['map_max']:.6f} | "
+                        f"memory_active={teacher_routing_row['memory_active']} | "
+                        "memory_active_ratio="
+                        f"{teacher_routing_row['memory_active_ratio']:.6f} | "
+                        f"schedule_static_weight={static_weight_log:.6f} | "
+                        f"schedule_teacher_weight={teacher_weight_log:.6f} | "
+                        "loss_teacher_final/coarse/base="
+                        f"{dabe_pu_teacher_final_loss_sum / stat_batches:.6f}/"
+                        f"{dabe_pu_teacher_coarse_loss_sum / stat_batches:.6f}/"
+                        f"{dabe_pu_teacher_base_loss_sum / stat_batches:.6f}"
                     )
                 if use_ecst:
                     ecst_batches = max(int(ecst_epoch_accumulator["batches"]), 1)
@@ -17428,8 +24958,36 @@ def main():
                         "calibration_target_sum"
                     ],
                 )
+                utility_teacher_count = int(
+                    source_arbiter_validation_sums["utility_teacher_count"]
+                )
+                utility_dabe_count = int(
+                    source_arbiter_validation_sums["utility_dabe_count"]
+                )
+                utility_tie_count = int(
+                    source_arbiter_validation_sums["utility_tie_count"]
+                )
+                utility_class_total = max(
+                    utility_teacher_count
+                    + utility_dabe_count
+                    + utility_tie_count,
+                    1,
+                )
+                utility_teacher_recall = (
+                    source_arbiter_validation_sums[
+                        "utility_teacher_recall_correct"
+                    ]
+                    / max(utility_teacher_count, 1)
+                )
+                utility_dabe_recall = (
+                    source_arbiter_validation_sums[
+                        "utility_dabe_recall_correct"
+                    ]
+                    / max(utility_dabe_count, 1)
+                )
                 logger.log(
-                    f"[EGSA-R1] epoch={epoch:03d} | "
+                    f"[{source_arbiter_identity}] epoch={epoch:03d} | "
+                    f"mode={source_arbiter_mode} | "
                     f"influence={avg.get('influence_scale', 0.0):.8f} | "
                     f"teacher_prior={avg.get('teacher_prior', 0.0):.8f} | "
                     f"g_teacher_mean/std={avg.get('gate_teacher_mean', 0.0):.8f}/"
@@ -17448,7 +25006,7 @@ def main():
                     f"{avg.get('loss_total', 0.0):.8f}"
                 )
                 logger.log(
-                    f"[EGSA-R1 Regions] epoch={epoch:03d} | "
+                    f"[{source_arbiter_identity} Regions] epoch={epoch:03d} | "
                     f"gT fg/bg/extent/unknown/other="
                     f"{avg.get('gate_teacher_fg_core', 0.0):.6f}/"
                     f"{avg.get('gate_teacher_bg_core', 0.0):.6f}/"
@@ -17466,13 +25024,205 @@ def main():
                     f"{avg.get('gate_teacher_extent_teacher_bg', 0.0):.6f}"
                 )
                 logger.log(
-                    f"[EGSA-R1 Bidirectional] epoch={epoch:03d} | "
+                    f"[{source_arbiter_identity} Bidirectional] epoch={epoch:03d} | "
                     f"above_prior={avg.get('gate_teacher_above_prior_ratio', 0.0):.8f} | "
                     f"below_prior={avg.get('gate_teacher_below_prior_ratio', 0.0):.8f} | "
                     f"near_prior={avg.get('gate_teacher_near_prior_ratio', 0.0):.8f}"
                 )
+                if source_arbiter_mode == "pure_loss_space":
+                    logger.log(
+                        f"[EGSA-R2 TeacherSource] epoch={epoch:03d} | "
+                        "mode=ones | ecst_used_for_training=False | "
+                        f"min/mean/max="
+                        f"{avg.get('teacher_source_weight_min', 1.0):.8f}/"
+                        f"{avg.get('teacher_source_weight_mean', 1.0):.8f}/"
+                        f"{avg.get('teacher_source_weight_max', 1.0):.8f}"
+                    )
+                    logger.log(
+                        f"[EGSA-R2 Correction] epoch={epoch:03d} | "
+                        f"mean/std/abs/zero="
+                        f"{avg.get('correction_mean', 0.0):.8f}/"
+                        f"{avg.get('correction_std', 0.0):.8f}/"
+                        f"{avg.get('correction_abs_mean', 0.0):.8f}/"
+                        f"{avg.get('correction_zero_ratio', 0.0):.8f} | "
+                        f"pos_ge_02/05/10="
+                        f"{avg.get('correction_pos_ge_02_ratio', 0.0):.8f}/"
+                        f"{avg.get('correction_pos_ge_05_ratio', 0.0):.8f}/"
+                        f"{avg.get('correction_pos_ge_10_ratio', 0.0):.8f} | "
+                        f"neg_le_02/05/10="
+                        f"{avg.get('correction_neg_le_02_ratio', 0.0):.8f}/"
+                        f"{avg.get('correction_neg_le_05_ratio', 0.0):.8f}/"
+                        f"{avg.get('correction_neg_le_10_ratio', 0.0):.8f}"
+                    )
+                    logger.log(
+                        f"[EGSA-R2 RegionCorrection] epoch={epoch:03d} | "
+                        f"fg/bg/extent/unknown/other="
+                        f"{avg.get('correction_fg_core', 0.0):.8f}/"
+                        f"{avg.get('correction_bg_core', 0.0):.8f}/"
+                        f"{avg.get('correction_extent', 0.0):.8f}/"
+                        f"{avg.get('correction_unknown', 0.0):.8f}/"
+                        f"{avg.get('correction_other', 0.0):.8f} | "
+                        f"fg/bg_conflict="
+                        f"{avg.get('correction_fg_core_conflict', 0.0):.8f}/"
+                        f"{avg.get('correction_bg_core_conflict', 0.0):.8f} | "
+                        f"extent_teacher_fg/bg="
+                        f"{avg.get('correction_extent_teacher_fg', 0.0):.8f}/"
+                        f"{avg.get('correction_extent_teacher_bg', 0.0):.8f}"
+                    )
+                    logger.log(
+                        f"[EGSA-R2 Shadow] epoch={epoch:03d} | "
+                        f"raw/ecst_teacher/delta="
+                        f"{avg.get('shadow_raw_teacher_group', 0.0):.8f}/"
+                        f"{avg.get('shadow_ecst_teacher_group', 0.0):.8f}/"
+                        f"{avg.get('shadow_teacher_group_delta', 0.0):.8f} | "
+                        f"raw/ecst_total/delta="
+                        f"{avg.get('shadow_raw_total_group', 0.0):.8f}/"
+                        f"{avg.get('shadow_ecst_total_group', 0.0):.8f}/"
+                        f"{avg.get('shadow_total_group_delta', 0.0):.8f} | "
+                        f"teacher_map_abs_delta="
+                        f"{avg.get('shadow_teacher_map_abs_delta', 0.0):.8f}"
+                    )
+                    logger.log(
+                        f"[EGSA-R2 ShadowRegions] epoch={epoch:03d} | "
+                        f"teacher_delta fg/bg/extent/unknown/other="
+                        f"{avg.get('shadow_fg_core_teacher_delta', 0.0):.8f}/"
+                        f"{avg.get('shadow_bg_core_teacher_delta', 0.0):.8f}/"
+                        f"{avg.get('shadow_extent_teacher_delta', 0.0):.8f}/"
+                        f"{avg.get('shadow_unknown_teacher_delta', 0.0):.8f}/"
+                        f"{avg.get('shadow_other_teacher_delta', 0.0):.8f}"
+                    )
+                    logger.log(
+                        f"[EGSA-R2 ShadowBranches] epoch={epoch:03d} | "
+                        f"final raw/ecst/delta="
+                        f"{avg.get('shadow_final_raw_teacher', 0.0):.8f}/"
+                        f"{avg.get('shadow_final_ecst_teacher', 0.0):.8f}/"
+                        f"{avg.get('shadow_final_teacher_delta', 0.0):.8f} | "
+                        f"coarse raw/ecst/delta="
+                        f"{avg.get('shadow_coarse_raw_teacher', 0.0):.8f}/"
+                        f"{avg.get('shadow_coarse_ecst_teacher', 0.0):.8f}/"
+                        f"{avg.get('shadow_coarse_teacher_delta', 0.0):.8f} | "
+                        f"base raw/ecst/delta="
+                        f"{avg.get('shadow_base_raw_teacher', 0.0):.8f}/"
+                        f"{avg.get('shadow_base_ecst_teacher', 0.0):.8f}/"
+                        f"{avg.get('shadow_base_teacher_delta', 0.0):.8f}"
+                    )
+                if (
+                    source_arbiter_mode
+                    == "sign_aware_pure_loss_space"
+                ):
+                    positive_valid_total = float(
+                        source_arbiter_epoch_sums.get(
+                            "positive_branch_valid_pixels", 0.0
+                        )
+                    )
+                    negative_valid_total = float(
+                        source_arbiter_epoch_sums.get(
+                            "negative_branch_valid_pixels", 0.0
+                        )
+                    )
+                    positive_teacher_total = float(
+                        source_arbiter_epoch_sums.get(
+                            "positive_branch_teacher_preferred_count", 0.0
+                        )
+                    )
+                    positive_dabe_total = float(
+                        source_arbiter_epoch_sums.get(
+                            "positive_branch_dabe_preferred_count", 0.0
+                        )
+                    )
+                    negative_teacher_total = float(
+                        source_arbiter_epoch_sums.get(
+                            "negative_branch_teacher_preferred_count", 0.0
+                        )
+                    )
+                    negative_dabe_total = float(
+                        source_arbiter_epoch_sums.get(
+                            "negative_branch_dabe_preferred_count", 0.0
+                        )
+                    )
+                    logger.log(
+                        f"[EGSA-R2b SignGate] epoch={epoch:03d} | "
+                        f"train/apply={avg.get('train_scale', 0.0):.8f}/"
+                        f"{avg.get('influence_scale', 0.0):.8f} | "
+                        "gT positive/negative/applied="
+                        f"{avg.get('gate_teacher_positive_mean', 0.0):.8f}/"
+                        f"{avg.get('gate_teacher_negative_mean', 0.0):.8f}/"
+                        f"{avg.get('gate_teacher_mean', 0.0):.8f} | "
+                        "residual positive mean/std="
+                        f"{avg.get('residual_positive_mean', 0.0):.8f}/"
+                        f"{avg.get('residual_positive_std', 0.0):.8f} | "
+                        "negative mean/std="
+                        f"{avg.get('residual_negative_mean', 0.0):.8f}/"
+                        f"{avg.get('residual_negative_std', 0.0):.8f} | "
+                        "saturation positive/negative="
+                        f"{avg.get('residual_positive_saturation_ratio', 0.0):.8f}/"
+                        f"{avg.get('residual_negative_saturation_ratio', 0.0):.8f}"
+                    )
+                    logger.log(
+                        f"[EGSA-R2b Gradients] epoch={epoch:03d} | "
+                        "positive/negative_head_gradient_norm="
+                        f"{avg.get('positive_head_gradient_norm', 0.0):.8f}/"
+                        f"{avg.get('negative_head_gradient_norm', 0.0):.8f} | "
+                        "class_weight positive teacher/dabe="
+                        f"{r2b_target_audit['class_weights']['positive']['teacher']:.10f}/"
+                        f"{r2b_target_audit['class_weights']['positive']['dabe']:.10f} | "
+                        "negative teacher/dabe="
+                        f"{r2b_target_audit['class_weights']['negative']['teacher']:.10f}/"
+                        f"{r2b_target_audit['class_weights']['negative']['dabe']:.10f}"
+                    )
+                    logger.log(
+                        f"[EGSA-R2b Areas] epoch={epoch:03d} | "
+                        "student_pred_area="
+                        f"{student_pred_area_sum / max(num_batches, 1):.8f} | "
+                        "teacher_pred_area="
+                        f"{teacher_pred_area_sum / max(num_batches, 1):.8f} | "
+                        "DABE_hard_area="
+                        f"{dabe_pu_target_hard_area_sum / max(dabe_pu_stat_batches, 1):.8f}"
+                    )
+                    logger.log(
+                        f"[EGSA-R2b DangerousConflict] epoch={epoch:03d} | "
+                        "negative gate teacher-bg fg-core/high-fg/extent/unknown="
+                        f"{avg.get('gate_negative_teacher_bg_fg_core', 0.0):.8f}/"
+                        f"{avg.get('gate_negative_teacher_bg_high_fg', 0.0):.8f}/"
+                        f"{avg.get('gate_negative_extent_teacher_bg', 0.0):.8f}/"
+                        f"{avg.get('gate_negative_unknown_teacher_bg', 0.0):.8f} | "
+                        "positive gate teacher-fg bg-core/inflation/completion="
+                        f"{avg.get('gate_positive_teacher_fg_bg_core', 0.0):.8f}/"
+                        f"{avg.get('gate_positive_teacher_fg_inflation', 0.0):.8f}/"
+                        f"{avg.get('gate_positive_teacher_fg_completion', 0.0):.8f}"
+                    )
+                    logger.log(
+                        f"[EGSA-R2b DirectionalUtility] epoch={epoch:03d} | "
+                        "positive valid/teacher/dabe="
+                        f"{avg.get('positive_branch_valid_pixels', 0.0):.2f}/"
+                        f"{avg.get('positive_branch_teacher_preferred_count', 0.0):.2f}/"
+                        f"{avg.get('positive_branch_dabe_preferred_count', 0.0):.2f} | "
+                        "negative valid/teacher/dabe="
+                        f"{avg.get('negative_branch_valid_pixels', 0.0):.2f}/"
+                        f"{avg.get('negative_branch_teacher_preferred_count', 0.0):.2f}/"
+                        f"{avg.get('negative_branch_dabe_preferred_count', 0.0):.2f} | "
+                        "preference ratio positive teacher/dabe="
+                        f"{positive_teacher_total / max(positive_valid_total, 1.0):.8f}/"
+                        f"{positive_dabe_total / max(positive_valid_total, 1.0):.8f} | "
+                        "negative teacher/dabe="
+                        f"{negative_teacher_total / max(negative_valid_total, 1.0):.8f}/"
+                        f"{negative_dabe_total / max(negative_valid_total, 1.0):.8f} | "
+                        "auc positive/negative="
+                        f"{avg.get('positive_branch_auc', 0.5):.8f}/"
+                        f"{avg.get('negative_branch_auc', 0.5):.8f} | "
+                        "brier positive/negative="
+                        f"{avg.get('positive_branch_brier', 0.0):.8f}/"
+                        f"{avg.get('negative_branch_brier', 0.0):.8f} | "
+                        "teacher_recall positive/negative="
+                        f"{avg.get('positive_branch_teacher_recall', 0.0):.8f}/"
+                        f"{avg.get('negative_branch_teacher_recall', 0.0):.8f} | "
+                        "dabe_recall positive/negative="
+                        f"{avg.get('positive_branch_dabe_recall', 0.0):.8f}/"
+                        f"{avg.get('negative_branch_dabe_recall', 0.0):.8f}"
+                    )
                 logger.log(
-                    f"[EGSA-R1 UtilityValidation] epoch={epoch:03d} | "
+                    f"[{source_arbiter_identity} UtilityValidation] "
+                    f"epoch={epoch:03d} | "
                     f"valid_pixels={int(source_arbiter_validation_sums['valid_pixels'])} | "
                     f"preference_accuracy={preference_accuracy:.8f} | "
                     f"balanced_accuracy={balanced_accuracy:.8f} | "
@@ -17482,8 +25232,114 @@ def main():
                     f"global_prior_brier={prior_brier:.8f} | "
                     f"fixed_ecst_accuracy={fixed_preference_accuracy:.8f} | "
                     f"fixed_ecst_brier={fixed_brier:.8f} | "
+                    f"teacher/dabe/tie="
+                    f"{utility_teacher_count}/{utility_dabe_count}/"
+                    f"{utility_tie_count} | "
+                    f"teacher/dabe/tie_ratio="
+                    f"{utility_teacher_count / utility_class_total:.8f}/"
+                    f"{utility_dabe_count / utility_class_total:.8f}/"
+                    f"{utility_tie_count / utility_class_total:.8f} | "
+                    f"teacher_recall={utility_teacher_recall:.8f} | "
+                    f"dabe_recall={utility_dabe_recall:.8f} | "
                     f"memory_active={route_memory is not None}"
                 )
+                if source_arbiter_mode == "pure_loss_space":
+                    shadow_row = {
+                        "epoch": epoch,
+                        "teacher_source_weight_mean": avg.get(
+                            "teacher_source_weight_mean", 1.0
+                        ),
+                        "raw_teacher_group": avg.get(
+                            "shadow_raw_teacher_group", 0.0
+                        ),
+                        "ecst_teacher_group": avg.get(
+                            "shadow_ecst_teacher_group", 0.0
+                        ),
+                        "teacher_group_delta": avg.get(
+                            "shadow_teacher_group_delta", 0.0
+                        ),
+                        "raw_total_group": avg.get(
+                            "shadow_raw_total_group", 0.0
+                        ),
+                        "ecst_total_group": avg.get(
+                            "shadow_ecst_total_group", 0.0
+                        ),
+                        "total_group_delta": avg.get(
+                            "shadow_total_group_delta", 0.0
+                        ),
+                        "teacher_map_abs_delta": avg.get(
+                            "shadow_teacher_map_abs_delta", 0.0
+                        ),
+                        "fg_core_teacher_delta": avg.get(
+                            "shadow_fg_core_teacher_delta", 0.0
+                        ),
+                        "bg_core_teacher_delta": avg.get(
+                            "shadow_bg_core_teacher_delta", 0.0
+                        ),
+                        "extent_teacher_delta": avg.get(
+                            "shadow_extent_teacher_delta", 0.0
+                        ),
+                        "unknown_teacher_delta": avg.get(
+                            "shadow_unknown_teacher_delta", 0.0
+                        ),
+                        "other_teacher_delta": avg.get(
+                            "shadow_other_teacher_delta", 0.0
+                        ),
+                        "final_raw_teacher": avg.get(
+                            "shadow_final_raw_teacher", 0.0
+                        ),
+                        "final_ecst_teacher": avg.get(
+                            "shadow_final_ecst_teacher", 0.0
+                        ),
+                        "final_teacher_delta": avg.get(
+                            "shadow_final_teacher_delta", 0.0
+                        ),
+                        "coarse_raw_teacher": avg.get(
+                            "shadow_coarse_raw_teacher", 0.0
+                        ),
+                        "coarse_ecst_teacher": avg.get(
+                            "shadow_coarse_ecst_teacher", 0.0
+                        ),
+                        "coarse_teacher_delta": avg.get(
+                            "shadow_coarse_teacher_delta", 0.0
+                        ),
+                        "base_raw_teacher": avg.get(
+                            "shadow_base_raw_teacher", 0.0
+                        ),
+                        "base_ecst_teacher": avg.get(
+                            "shadow_base_ecst_teacher", 0.0
+                        ),
+                        "base_teacher_delta": avg.get(
+                            "shadow_base_teacher_delta", 0.0
+                        ),
+                    }
+                    write_csv_row(
+                        train_dir / "egsa_r2_shadow.csv",
+                        list(shadow_row),
+                        shadow_row,
+                    )
+                    utility_row = {
+                        "epoch": epoch,
+                        "valid_pixels": int(
+                            source_arbiter_validation_sums["valid_pixels"]
+                        ),
+                        "teacher_count": utility_teacher_count,
+                        "dabe_count": utility_dabe_count,
+                        "tie_count": utility_tie_count,
+                        "teacher_ratio": utility_teacher_count
+                        / utility_class_total,
+                        "dabe_ratio": utility_dabe_count / utility_class_total,
+                        "tie_ratio": utility_tie_count / utility_class_total,
+                        "teacher_recall": utility_teacher_recall,
+                        "dabe_recall": utility_dabe_recall,
+                        "roc_auc_excluding_ties": preference_auc,
+                        "brier": validation_brier,
+                    }
+                    write_csv_row(
+                        train_dir / "egsa_r2_utility.csv",
+                        list(utility_row),
+                        utility_row,
+                    )
                 epoch_wall_seconds = (
                     time.perf_counter() - source_arbiter_epoch_start_time
                 )
@@ -17498,7 +25354,7 @@ def main():
                     peak_allocated_mb = 0.0
                     peak_reserved_mb = 0.0
                 logger.log(
-                    f"[EGSA-R1 Resources] epoch={epoch:03d} | "
+                    f"[{source_arbiter_identity} Resources] epoch={epoch:03d} | "
                     f"epoch_wall_seconds={epoch_wall_seconds:.3f} | "
                     f"utility_batches={source_arbiter_utility_forward_batches} | "
                     "utility_extra_forwards="
@@ -17524,13 +25380,14 @@ def main():
                         )
                     )
                     logger.log(
-                        "[EGSA-R1 Vis] fixed sample indices = "
+                        f"[{source_arbiter_identity} Vis] fixed sample indices = "
                         f"{source_arbiter_vis_state['selected_indices']} | "
                         f"categories={source_arbiter_vis_state['categories']}"
                     )
                     if missing_vis:
                         logger.log(
-                            "[EGSA-R1 Vis][WARNING] no proxy case found for "
+                            f"[{source_arbiter_identity} Vis][WARNING] no proxy "
+                            "case found for "
                             f"categories={missing_vis}; no synthetic case was added."
                         )
 
@@ -17551,6 +25408,146 @@ def main():
                 )
                 logger.log(format_metric_table(result))
 
+            r2b_stop_reasons = []
+            r2b_stop_details = {}
+            if source_arbiter_mode == "sign_aware_pure_loss_space":
+                student_area = student_pred_area_sum / max(num_batches, 1)
+                (
+                    r2b_stop_reasons,
+                    r2b_stop_details,
+                    r2b_monitor,
+                ) = evaluate_r2b_stop_conditions(
+                    cfg=cfg,
+                    epoch=epoch,
+                    source_sums=source_arbiter_epoch_sums,
+                    source_batches=source_arbiter_epoch_batches,
+                    student_area=student_area,
+                    val_results=val_results,
+                    paired_r1_areas=r2b_paired_r1_areas,
+                    monitor_state=source_arbiter_vis_state.get(
+                        "r2b_monitor", {}
+                    ),
+                )
+                source_arbiter_vis_state["r2b_monitor"] = r2b_monitor
+                if bool(
+                    getattr(
+                        cfg,
+                        "SOURCE_ARBITER_USE_EXPLORATORY_STAGE45_STOP_RULES",
+                        False,
+                    )
+                ):
+                    logger.log(
+                        f"[EGSA-R2b Safety] epoch={epoch:03d} | "
+                        f"stop={bool(r2b_stop_reasons)} | "
+                        f"reasons={r2b_stop_reasons or ['none']} | "
+                        f"student_area={student_area:.8f} | "
+                        "area_floor="
+                        f"{r2b_stop_details.get('student_area_floor', float('nan')):.8f} | "
+                        "saturation_streak positive/negative="
+                        f"{r2b_stop_details.get('positive_saturation_streak', 0)}/"
+                        f"{r2b_stop_details.get('negative_saturation_streak', 0)} | "
+                        "negative_conflict_streak="
+                        f"{r2b_stop_details.get('negative_conflict_not_below_prior_streak', 0)} | "
+                        "post_reset_area_streak="
+                        f"{r2b_stop_details.get('post_reset_area_below_streak', 0)} | "
+                        "area_ceiling_streak="
+                        f"{r2b_stop_details.get('area_above_ceiling_streak', 0)}"
+                    )
+                else:
+                    logger.log(
+                        f"[EGSA-R2b Safety] epoch={epoch:03d} | "
+                        f"stop={bool(r2b_stop_reasons)} | "
+                        f"reasons={r2b_stop_reasons or ['none']} | "
+                        f"student_area={student_area:.8f} | "
+                        "paired_ratio="
+                        f"{r2b_stop_details.get('paired_r1_area_ratio', float('nan')):.8f} | "
+                        "epoch20_ratio="
+                        f"{student_area / max(float(r2b_stop_details.get('epoch20_student_area') or student_area), 1e-12):.8f}"
+                    )
+
+            if use_pssf_train:
+                runtime_payload = build_pssf_runtime_payload(
+                    cfg=cfg,
+                    epoch=epoch,
+                    protocol_fingerprint=pssf_protocol_fingerprint,
+                    state_bank=pssf_state_bank,
+                    history_bank=pssf_history_bank,
+                    pssf_optimizer=pssf_optimizer,
+                    split_manifest=pssf_split_manifest,
+                    global_step=global_step,
+                    train_loader_generator=train_loader_generator,
+                    pssf=pssf,
+                    pssf_actor=pssf_actor,
+                    actor_sync_epoch=(
+                        ppse_actor_epoch_audit["actor_sync_epoch"]
+                        if use_ppse_v2(cfg)
+                        else None
+                    ),
+                )
+                pssf_runtime_sha256 = save_runtime_payload_atomic(
+                    pssf_runtime_path,
+                    runtime_payload,
+                )
+                runtime_label = (
+                    "[PPSE-v2 Runtime]"
+                    if use_ppse_v2(cfg)
+                    else "[PSSF Runtime]"
+                )
+                logger.log(
+                    f"{runtime_label} "
+                    f"epoch={epoch:03d} | "
+                    f"phase={runtime_payload['checkpoint_phase']} | "
+                    f"path={pssf_runtime_path} | "
+                    f"sha256={pssf_runtime_sha256} | "
+                    f"global_step={global_step}"
+                    + (
+                        " | actor_sync_epoch="
+                        f"{runtime_payload['actor_sync_epoch']} | "
+                        "learner_saved=True | actor_saved=True"
+                        if use_ppse_v2(cfg)
+                        else ""
+                    )
+                )
+                epoch_checkpoint_extra = build_pssf_checkpoint_extra(
+                    cfg=cfg,
+                    epoch=epoch,
+                    global_step=global_step,
+                    pssf=pssf,
+                    pssf_actor=pssf_actor,
+                    actor_sync_epoch=(
+                        ppse_actor_epoch_audit["actor_sync_epoch"]
+                        if use_ppse_v2(cfg)
+                        else None
+                    ),
+                    protocol_fingerprint=pssf_protocol_fingerprint,
+                    runtime_path=pssf_runtime_path,
+                    runtime_sha256=pssf_runtime_sha256,
+                )
+            elif use_ap_stcr_train:
+                epoch_checkpoint_extra = build_ap_stcr_checkpoint_extra(
+                    cfg=cfg,
+                    epoch=epoch,
+                    global_step=global_step,
+                    ap_stcr=ap_stcr,
+                    protocol_fingerprint=ap_stcr_protocol_fingerprint,
+                    train_loader_generator=train_loader_generator,
+                )
+            else:
+                epoch_checkpoint_extra = (
+                    build_source_arbiter_checkpoint_extra(
+                        cfg,
+                        epoch,
+                        global_step,
+                        source_arbiter,
+                        arbiter_optimizer,
+                        utility_evaluator,
+                        route_memory,
+                        ecst_memory,
+                        train_loader_generator,
+                        source_arbiter_vis_state,
+                    )
+                )
+
             current_best_candidate = metric_value(val_results[cfg.BEST_DATASET], cfg.BEST_METRIC)
             improved = current_best_candidate < best_metric if cfg.BEST_MODE == "min" else current_best_candidate > best_metric
             if improved:
@@ -17566,18 +25563,7 @@ def main():
                     scheduler,
                     best_metric,
                     best_epoch,
-                    extra_state=build_source_arbiter_checkpoint_extra(
-                        cfg,
-                        epoch,
-                        global_step,
-                        source_arbiter,
-                        arbiter_optimizer,
-                        utility_evaluator,
-                        route_memory,
-                        ecst_memory,
-                        train_loader_generator,
-                        source_arbiter_vis_state,
-                    ),
+                    extra_state=epoch_checkpoint_extra,
                 )
 
             logger.log(f"best MAE so far = {best_metric:.6f}")
@@ -17589,6 +25575,8 @@ def main():
                 cfg.SAVE_INTERVAL,
                 reset_epoch=reset_epoch,
                 save_every_epoch=bool(getattr(cfg, "SAVE_EVERY_EPOCH", False)),
+            ) or (
+                stop_after_epoch > 0 and int(epoch) == int(stop_after_epoch)
             ):
                 save_checkpoint(
                     ckpt_dir / f"epoch_{epoch:03d}.pth",
@@ -17600,21 +25588,89 @@ def main():
                     scheduler,
                     best_metric,
                     best_epoch,
-                    extra_state=build_source_arbiter_checkpoint_extra(
-                        cfg,
-                        epoch,
-                        global_step,
-                        source_arbiter,
-                        arbiter_optimizer,
-                        utility_evaluator,
-                        route_memory,
-                        ecst_memory,
-                        train_loader_generator,
-                        source_arbiter_vis_state,
-                    ),
+                    extra_state=epoch_checkpoint_extra,
                 )
 
-            if reset_enabled and is_after_epoch_finetune_reset(cfg) and epoch == reset_epoch:
+            if r2b_stop_reasons:
+                stop_checkpoint = ckpt_dir / f"epoch_{epoch:03d}.pth"
+                if not stop_checkpoint.is_file():
+                    save_checkpoint(
+                        stop_checkpoint,
+                        epoch,
+                        cfg,
+                        student,
+                        teacher,
+                        optimizer,
+                        scheduler,
+                        best_metric,
+                        best_epoch,
+                        extra_state=epoch_checkpoint_extra,
+                    )
+                stop_status = {
+                    "schema_version": "egsa_r2b_clean_stop_v1",
+                    "stopped": True,
+                    "epoch": int(epoch),
+                    "reasons": list(r2b_stop_reasons),
+                    "details": r2b_stop_details,
+                    "checkpoint": str(stop_checkpoint.resolve()),
+                    "checkpoint_phase": (
+                        "pending_after_epoch_reset"
+                        if int(epoch) == int(reset_epoch)
+                        else (
+                            "post_reset_frozen"
+                            if int(epoch) > int(reset_epoch)
+                            else "active_pre_reset"
+                        )
+                    ),
+                    "reset_executed_after_stop": False,
+                }
+                stop_path = train_dir / "egsa_r2b_stop_status.json"
+                stop_path.write_text(
+                    json.dumps(stop_status, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+                logger.log(
+                    "[EGSA-R2b CleanStop] current state saved; ending run "
+                    f"without exception | epoch={epoch:03d} | "
+                    f"checkpoint={stop_checkpoint} | status={stop_path} | "
+                    f"reasons={r2b_stop_reasons}"
+                )
+                break
+
+            if (
+                reset_enabled
+                and is_after_epoch_finetune_reset(cfg)
+                and epoch == reset_epoch
+                and source_arbiter_mode == "sign_aware_pure_loss_space"
+                and bool(
+                    getattr(
+                        cfg,
+                        "SOURCE_ARBITER_SKIP_AFTER_EPOCH_RESET",
+                        False,
+                    )
+                )
+            ):
+                logger.log(
+                    "[EGSA-R2b Stage20] epoch20 checkpoint saved with "
+                    "checkpoint_phase=pending_after_epoch_reset | "
+                    "reset_executed=False | run_finished_cleanly=True"
+                )
+
+            if (
+                reset_enabled
+                and is_after_epoch_finetune_reset(cfg)
+                and epoch == reset_epoch
+                and not (
+                    source_arbiter_mode == "sign_aware_pure_loss_space"
+                    and bool(
+                        getattr(
+                            cfg,
+                            "SOURCE_ARBITER_SKIP_AFTER_EPOCH_RESET",
+                            False,
+                        )
+                    )
+                )
+            ):
                 optimizer, scheduler, global_step, lr_floor_activated_logged = apply_finetune_reset(
                     logger,
                     cfg,
@@ -17640,9 +25696,21 @@ def main():
                     if route_memory is not None:
                         route_memory.clear()
                     route_memory = None
+                    if (
+                        source_arbiter_mode
+                        == "sign_aware_pure_loss_space"
+                    ):
+                        utility_evaluator = None
+                        source_arbiter.eval()
+                        for parameter in source_arbiter.parameters():
+                            parameter.requires_grad_(False)
                     logger.log(
-                        "[EGSA-R1] route memory cleared and released at finetune "
-                        f"reset | epoch={epoch:03d} | router_active=False | "
+                        f"[{source_arbiter_identity}] route memory cleared and "
+                        "released at finetune "
+                        f"reset | epoch={epoch:03d} | "
+                        "router_trainable=False | "
+                        "router_apply_active="
+                        f"{source_arbiter_mode == 'sign_aware_pure_loss_space'} | "
                         "utility_evaluator_active=False"
                     )
                 if use_tepr_lite and bool(
@@ -17655,6 +25723,61 @@ def main():
                         f"[TEPR-Lite] temporal memory cleared and released at finetune reset | "
                         f"epoch={epoch:03d}"
                     )
+                if use_pssf_train:
+                    pssf_history_bank.clear(next_epoch=epoch + 1)
+                    if use_ppse_v2(cfg):
+                        logger.log(
+                            f"[PPSE-v2 Reset] epoch={epoch:03d} | "
+                            f"next_epoch={epoch + 1:03d} | "
+                            "q_state_preserved=True | "
+                            "learner_preserved=True | "
+                            "actor_preserved=True | "
+                            "pssf_optimizer_preserved=True | "
+                            "history_cleared=True | "
+                            "cross_reset_target_used=False | "
+                            "prior_p0_available=True | "
+                            "delayed_targets_resume_epoch="
+                            f"{epoch + 1 + int(getattr(cfg, 'PSSF_HORIZON', 3)):03d}"
+                        )
+                    else:
+                        logger.log(
+                            f"[PSSF Reset] epoch={epoch:03d} | "
+                            f"next_epoch={epoch + 1:03d} | "
+                            "q_state_preserved=True | "
+                            "pssf_network_preserved=True | "
+                            "pssf_optimizer_preserved=True | "
+                            "history_cleared=True | "
+                            "cross_reset_targets_used=False | "
+                            "delayed_targets_resume_epoch="
+                            f"{epoch + 1 + int(getattr(cfg, 'PSSF_HORIZON', 3)):03d}"
+                        )
+                if use_ap_stcr_train and bool(
+                    getattr(cfg, "AP_STCR").get(
+                        "clear_history_on_reset", True
+                    )
+                ):
+                    ap_stcr.clear_temporal_history()
+                    logger.log(
+                        f"[AP-STCR Reset] epoch={epoch:03d} | "
+                        f"next_epoch={epoch + 1:03d} | "
+                        "semantic_cache_preserved=True | "
+                        "history_cleared=True | "
+                        "cross_reset_history_used=False"
+                    )
+
+            if stop_after_epoch > 0 and int(epoch) == int(stop_after_epoch):
+                stop_checkpoint = ckpt_dir / f"epoch_{epoch:03d}.pth"
+                if not stop_checkpoint.is_file():
+                    raise RuntimeError(
+                        "--stop_after_epoch checkpoint was not saved: "
+                        f"{stop_checkpoint}"
+                    )
+                logger.log(
+                    "[StopAfterEpoch] completed train, validation, logging, "
+                    "checkpoint, and configured after-epoch reset | "
+                    f"epoch={epoch:03d} | checkpoint={stop_checkpoint}"
+                )
+                break
 
 
 if __name__ == "__main__":
