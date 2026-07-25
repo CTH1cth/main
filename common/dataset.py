@@ -7,12 +7,20 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from common.dre_safe_prior import build_dre_safe_prior
+from common.dabe_clean import (
+    DABE_CLEAN_CONTREC_VERSION,
+    DABE_CLEAN_TARGET_MODES,
+    expected_dabe_clean_payload_version,
+    select_clean_target,
+)
 from common.utils import (
     build_image_items,
     cacd_feature_manifest_path,
     ccr_manifest_path,
     check_exact_keys,
     cssd_hr_feature_manifest_path,
+    dabe_clean_legacy_region_manifest_path,
+    dabe_clean_manifest_path,
     dabe_pu_manifest_path,
     dabe_pseudo_manifest_path,
     despl_light_cache_manifest_path,
@@ -28,6 +36,7 @@ from common.utils import (
     tce_cover_manifest_path,
     torch_load,
 )
+from common.bitc import BITC_CACHE_SCHEMA, BITC_GRID
 
 
 QRA_TENSOR_FIELDS = {
@@ -83,6 +92,40 @@ DABE_PU_REQUIRED_37_FIELDS = [
     "unknown_37",
 ]
 
+DABE_CLEAN_REQUIRED_FIELDS = (
+    "foreground_evidence_37",
+    "foreground_evidence_68",
+    "background_evidence_37",
+    "background_evidence_68",
+    "target_dp_37",
+    "target_dp_68",
+    "target_diff_37",
+    "target_diff_68",
+)
+
+DABE_CLEAN_CONTREC_REQUIRED_FIELDS = (
+    "foreground_evidence_37",
+    "foreground_evidence_68",
+    "background_evidence_37",
+    "background_evidence_68",
+    "target_dp_37",
+    "target_dp_68",
+    "p_rw_37",
+    "evidence_gate_37",
+    "semantic_fg_tendency_37",
+    "latent_rw_37",
+    "recoverability_37",
+    "recoverability_68",
+)
+
+LEGACY_ECST_REGION_FIELDS = {
+    "legacy_ecst_fg_core": "fg_core_pu_68",
+    "legacy_ecst_fg_fallback": "fg_core_fallback_68",
+    "legacy_ecst_bg_core": "bg_core_pu_68",
+    "legacy_ecst_extent": "extent_candidate_68",
+    "legacy_ecst_unknown": "unknown_68",
+}
+
 DABE_PU_DESPL_SCHED_MODES = {
     "dabe_pu_v11_desplsched",
     "dabe_pu_v11_desplsched_exactreset",
@@ -103,6 +146,60 @@ DABE_PU_ALLOWED_MODES = {
 DABE_PU_ALLOWED_VERSIONS = {"pu_v11", "pu_v12_shape_complete"}
 
 
+def _cvsa_config(cfg):
+    value = getattr(cfg, "CVSA", None)
+    if not isinstance(value, dict):
+        raise RuntimeError("USE_CVSA=True requires a CVSA dict configuration.")
+    return value
+
+
+def _cvsa_manifest_path(cfg, cache_key):
+    root = _cvsa_config(cfg).get(cache_key)
+    if not root:
+        raise RuntimeError(f"CVSA.{cache_key} must be configured.")
+    return Path(root) / "manifest_train.jsonl"
+
+
+def _load_cvsa_hflip_fixed(row, expected_dataset, expected_stem, cfg):
+    cache_path = row.get("fixed_path", row.get("cache_path"))
+    if not cache_path:
+        raise RuntimeError(
+            f"CVSA hflip fixed manifest has no cache path for "
+            f"{expected_dataset}/{expected_stem}."
+        )
+    payload = torch_load(cache_path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(f"CVSA hflip fixed payload must be a dict: {cache_path}")
+    checks = {
+        "dataset": expected_dataset,
+        "stem": expected_stem,
+        "view": "hflip",
+        "backbone_key": cfg.BACKBONE_KEY,
+        "dabe_version": "pu_v11",
+        "source_feature_view": "hflip",
+        "independently_generated": True,
+    }
+    for field, expected in checks.items():
+        if payload.get(field) != expected:
+            raise RuntimeError(
+                f"CVSA hflip fixed provenance mismatch for "
+                f"{expected_dataset}/{expected_stem}: "
+                f"{field}={payload.get(field)!r} != {expected!r} | {cache_path}"
+            )
+    target = payload.get("target_soft_68")
+    expected_shape = [1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE)]
+    if not torch.is_tensor(target) or list(target.shape) != expected_shape:
+        raise RuntimeError(
+            f"CVSA hflip fixed target shape mismatch for "
+            f"{expected_dataset}/{expected_stem}: "
+            f"{list(target.shape) if torch.is_tensor(target) else type(target)!r} "
+            f"!= {expected_shape} | {cache_path}"
+        )
+    target = target.float()
+    _validate_unit_range(target, "CVSA target_soft_68", cache_path)
+    return target
+
+
 def _feature_manifest_path(cfg, split):
     # feature cache manifest 按 split 管理，train/val/test 不混用。
     return Path(cfg.CACHE_ROOT) / "features_cache" / cfg.BACKBONE_KEY / f"manifest_{split}.jsonl"
@@ -111,6 +208,108 @@ def _feature_manifest_path(cfg, split):
 def _pseudo_manifest_path(cfg):
     # fixed pseudo 只为训练集生成，因此 manifest 名固定为 train。
     return Path(cfg.CACHE_ROOT) / "pseudo_label_cache" / cfg.BACKBONE_KEY / "manifest_train.jsonl"
+
+
+def _bitc_manifest_path(cfg):
+    return Path(getattr(cfg, "BITC_CACHE_ROOT")) / "manifest_train.jsonl"
+
+
+def _load_bitc_cache(row, expected_dataset, expected_stem, cfg):
+    payload = torch_load(row["cache_path"], map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(f"BITC cache payload must be a dict: {row['cache_path']}")
+    expected = {
+        "schema": BITC_CACHE_SCHEMA,
+        "dataset": expected_dataset,
+        "stem": expected_stem,
+        "backbone_key": cfg.BACKBONE_KEY,
+        "dabe_version": str(getattr(cfg, "DABE_PU_VERSION", "pu_v11")),
+        "seed": int(getattr(cfg, "BITC_CACHE_SEED", 20260724)),
+    }
+    mismatched = {
+        name: (payload.get(name), value)
+        for name, value in expected.items()
+        if payload.get(name) != value
+    }
+    if mismatched:
+        raise RuntimeError(
+            f"BITC cache metadata mismatch for {row['cache_path']}: {mismatched}"
+        )
+    required = (
+        "topk_indices",
+        "topk_weights",
+        "background_anchor_indices",
+        "nearest_bg_index",
+        "fixed_random_bg_index",
+    )
+    missing = [name for name in required if not torch.is_tensor(payload.get(name))]
+    if missing:
+        raise RuntimeError(
+            f"BITC cache is missing tensor fields for {row['cache_path']}: {missing}"
+        )
+    nodes = BITC_GRID * BITC_GRID
+    topk_indices = payload["topk_indices"].long()
+    topk_weights = payload["topk_weights"].float()
+    anchor_indices = payload["background_anchor_indices"].long()
+    nearest = payload["nearest_bg_index"].long()
+    random_index = payload["fixed_random_bg_index"].long()
+    if topk_indices.ndim != 2 or int(topk_indices.shape[0]) != nodes:
+        raise RuntimeError(
+            f"BITC topk_indices must be [1369,K], got {list(topk_indices.shape)}"
+        )
+    if list(topk_weights.shape) != list(topk_indices.shape):
+        raise RuntimeError(
+            f"BITC topk weight/index mismatch: {list(topk_weights.shape)}/"
+            f"{list(topk_indices.shape)}"
+        )
+    if list(nearest.shape) != [nodes] or list(random_index.shape) != [nodes]:
+        raise RuntimeError(
+            f"BITC nearest/random shape mismatch: {list(nearest.shape)}/{list(random_index.shape)}"
+        )
+    tensors = (topk_indices, topk_weights, anchor_indices, nearest, random_index)
+    if not all(bool(torch.isfinite(tensor.float()).all().item()) for tensor in tensors):
+        raise RuntimeError(f"BITC cache contains NaN/Inf: {row['cache_path']}")
+    index_tensors = (topk_indices, anchor_indices, nearest, random_index)
+    if any(
+        int(tensor.min().item()) < 0 or int(tensor.max().item()) >= nodes
+        for tensor in index_tensors
+        if int(tensor.numel()) > 0
+    ):
+        raise RuntimeError(f"BITC cache contains an out-of-range index: {row['cache_path']}")
+    if int(anchor_indices.numel()) < 1:
+        raise RuntimeError(f"BITC background anchor set is empty: {row['cache_path']}")
+    anchor_mask = torch.zeros(nodes, dtype=torch.bool)
+    anchor_mask[anchor_indices] = True
+    if not bool(anchor_mask[topk_indices].all().item()):
+        raise RuntimeError(f"BITC top-K contains non-anchor indices: {row['cache_path']}")
+    if not bool(anchor_mask[nearest].all().item()):
+        raise RuntimeError(f"BITC nearest contains non-anchor indices: {row['cache_path']}")
+    if not bool(anchor_mask[random_index].all().item()):
+        raise RuntimeError(f"BITC random contains non-anchor indices: {row['cache_path']}")
+    sum_error = float((topk_weights.sum(dim=1) - 1.0).abs().max().item())
+    if sum_error > 2e-3:
+        raise RuntimeError(
+            f"BITC float16 top-K weight sum error is too large: {sum_error:.9g}"
+        )
+    fingerprint = str(payload.get("cache_fingerprint", ""))
+    if not fingerprint:
+        raise RuntimeError(f"BITC cache fingerprint is missing: {row['cache_path']}")
+    manifest_fingerprint = str(row.get("cache_fingerprint", ""))
+    if manifest_fingerprint != fingerprint:
+        raise RuntimeError(
+            "BITC manifest/payload fingerprint mismatch: "
+            f"{manifest_fingerprint!r} != {fingerprint!r} | {row['cache_path']}"
+        )
+    return {
+        "bitc_topk_indices": topk_indices.to(torch.int16),
+        "bitc_topk_weights": topk_weights.to(torch.float16),
+        "bitc_background_anchor_mask": anchor_mask,
+        "bitc_nearest_bg_index": nearest.to(torch.int16),
+        "bitc_fixed_random_bg_index": random_index.to(torch.int16),
+        "bitc_background_anchor_count": int(anchor_indices.numel()),
+        "bitc_cache_fingerprint": fingerprint,
+        "bitc_cache_path": str(row["cache_path"]),
+    }
 
 
 def _pseudo_override_path(override_root, dataset, stem):
@@ -665,6 +864,16 @@ def _load_dabe_pu_v11(row, expected_dataset, expected_stem, cfg):
     out = {}
     missing = []
     required_fields = list(DABE_PU_REQUIRED_68_FIELDS)
+    static_source = str(
+        getattr(cfg, "DABE_PU_STATIC_SOURCE", "target_soft_68")
+    ).strip().lower()
+    if static_source not in {"target_soft_68", "p_base_68"}:
+        raise RuntimeError(
+            "Unsupported DABE_PU_STATIC_SOURCE="
+            f"{static_source!r}; expected 'target_soft_68' or 'p_base_68'."
+        )
+    if static_source == "p_base_68":
+        required_fields.append("p_base_68")
     if use_oem:
         required_fields.extend(DABE_PU_REQUIRED_37_FIELDS)
     if use_ap_stcr:
@@ -683,6 +892,12 @@ def _load_dabe_pu_v11(row, expected_dataset, expected_stem, cfg):
                 f"cache_path={row['cache_path']} | {field} {list(tensor.shape)} != {shape}"
             )
         _validate_unit_range(tensor, field, row["cache_path"])
+        if field == "p_base_68" and not bool(torch.isfinite(tensor).all().item()):
+            raise RuntimeError(
+                "DABE-PU p_base_68 contains NaN/Inf | "
+                f"dataset={expected_dataset} | stem={expected_stem} | "
+                f"cache_path={row['cache_path']}"
+            )
         out[field] = tensor
     if missing:
         raise RuntimeError(
@@ -712,6 +927,7 @@ def _load_dabe_pu_v11(row, expected_dataset, expected_stem, cfg):
 
     return {
         "pu_target_soft": out["target_soft_68"],
+        "pu_p_base_soft": out.get("p_base_68"),
         "pu_weight_map": out["weight_map_68"],
         "pu_fg_core": out["fg_core_pu_68"],
         "pu_fg_fallback": out["fg_core_fallback_68"],
@@ -746,6 +962,163 @@ def _load_dabe_pu_v11(row, expected_dataset, expected_stem, cfg):
         "pu_sc_lost_extent_ratio": float(payload.get("sc_lost_extent_ratio", sc_lost_extent.mean().item())),
         "pu_sc_new_boundary_ratio": float(payload.get("sc_new_boundary_ratio", sc_new_boundary.mean().item())),
     }
+
+
+def _load_dabe_clean(row, expected_dataset, expected_stem, cfg):
+    payload = torch_load(row["cache_path"], map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(f"DABE-Clean payload must be a dict: {row['cache_path']}")
+    if payload.get("dataset") != expected_dataset or payload.get("stem") != expected_stem:
+        raise RuntimeError(
+            "DABE-Clean identity mismatch | "
+            f"expected={expected_dataset}/{expected_stem} | "
+            f"actual={payload.get('dataset')}/{payload.get('stem')} | "
+            f"cache={row['cache_path']}"
+        )
+    if str(payload.get("backbone_key")) != str(cfg.BACKBONE_KEY):
+        raise RuntimeError(f"DABE-Clean backbone mismatch: {row['cache_path']}")
+    mode = str(getattr(cfg, "DABE_CLEAN_TARGET_MODE", "dp")).strip().lower()
+    if mode not in DABE_CLEAN_TARGET_MODES:
+        raise RuntimeError(f"Unsupported DABE_CLEAN_TARGET_MODE={mode!r}.")
+    expected_version = expected_dabe_clean_payload_version(cfg, mode)
+    if str(payload.get("version")) != expected_version:
+        raise RuntimeError(
+            f"DABE-Clean version mismatch: {payload.get('version')} != "
+            f"{expected_version} | {row['cache_path']}"
+        )
+    target_37 = select_clean_target(payload, mode, suffix="37")
+    target_68 = select_clean_target(payload, mode, suffix="68")
+    expected_37 = (1, 37, 37)
+    expected_68 = (1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE))
+    if tuple(target_37.shape) != expected_37 or tuple(target_68.shape) != expected_68:
+        raise RuntimeError(
+            f"DABE-Clean target shape mismatch: {list(target_37.shape)}/"
+            f"{list(target_68.shape)}"
+        )
+    out = {
+        "dabe_clean_target_37": target_37,
+        "dabe_clean_target_68": target_68,
+        "dabe_clean_target_mode": mode,
+        "dabe_clean_version": expected_version,
+    }
+    if mode == "bridge":
+        foreground_37 = payload.get("source_p_base_37")
+        if not torch.is_tensor(foreground_37):
+            raise RuntimeError(
+                f"Bridge cache is missing source_p_base_37: {row['cache_path']}"
+            )
+        foreground_37 = foreground_37.detach().cpu().float()
+        _validate_unit_range(foreground_37, "source_p_base_37", row["cache_path"])
+        out["dabe_clean_fg_evidence_37"] = foreground_37
+        out["dabe_clean_fg_evidence_68"] = torch.empty(0)
+        out["dabe_clean_bg_evidence_37"] = torch.empty(0)
+        out["dabe_clean_bg_evidence_68"] = torch.empty(0)
+    else:
+        required_fields = (
+            DABE_CLEAN_CONTREC_REQUIRED_FIELDS
+            if expected_version == DABE_CLEAN_CONTREC_VERSION
+            else DABE_CLEAN_REQUIRED_FIELDS
+        )
+        for field in required_fields:
+            value = payload.get(field)
+            if not torch.is_tensor(value):
+                raise RuntimeError(
+                    f"DABE-Clean payload is missing {field}: {row['cache_path']}"
+                )
+            value = value.detach().cpu().float()
+            expected = expected_37 if field.endswith("_37") else expected_68
+            if tuple(value.shape) != expected:
+                raise RuntimeError(
+                    f"DABE-Clean {field} shape mismatch: {list(value.shape)} != "
+                    f"{list(expected)} | {row['cache_path']}"
+                )
+            _validate_unit_range(value, field, row["cache_path"])
+        out.update(
+            {
+                "dabe_clean_fg_evidence_37": payload[
+                    "foreground_evidence_37"
+                ].detach().cpu().float(),
+                "dabe_clean_fg_evidence_68": payload[
+                    "foreground_evidence_68"
+                ].detach().cpu().float(),
+                "dabe_clean_bg_evidence_37": payload[
+                    "background_evidence_37"
+                ].detach().cpu().float(),
+                "dabe_clean_bg_evidence_68": payload[
+                    "background_evidence_68"
+                ].detach().cpu().float(),
+            }
+        )
+        if expected_version == DABE_CLEAN_CONTREC_VERSION:
+            if bool(payload.get("training_gt_read", True)):
+                raise RuntimeError(
+                    f"DABE-Clean contrec cache reports GT access: {row['cache_path']}"
+                )
+            forbidden = {
+                "weight_map",
+                "static_weight_map",
+                "hard_ring",
+                "extent",
+                "unknown",
+                "fg_core",
+                "bg_core",
+            }
+            leaked = sorted(forbidden.intersection(payload))
+            if leaked:
+                raise RuntimeError(
+                    "DABE-Clean contrec cache leaked forbidden fields: "
+                    f"{leaked} | {row['cache_path']}"
+                )
+            out.update(
+                {
+                    "dabe_clean_p_rw_37": payload["p_rw_37"].detach().cpu().float(),
+                    "dabe_clean_evidence_gate_37": payload[
+                        "evidence_gate_37"
+                    ].detach().cpu().float(),
+                    "dabe_clean_semantic_fg_tendency_37": payload[
+                        "semantic_fg_tendency_37"
+                    ].detach().cpu().float(),
+                    "dabe_clean_latent_rw_37": payload[
+                        "latent_rw_37"
+                    ].detach().cpu().float(),
+                    "dabe_clean_recoverability_37": payload[
+                        "recoverability_37"
+                    ].detach().cpu().float(),
+                    "dabe_clean_recoverability_68": payload[
+                        "recoverability_68"
+                    ].detach().cpu().float(),
+                }
+            )
+    return out
+
+
+def _load_dabe_clean_legacy_regions(row, expected_dataset, expected_stem, cfg):
+    """Materialize only the five PU tensors needed by legacy ECST routing."""
+
+    payload = torch_load(row["cache_path"], map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(f"Legacy ECST source must be a dict: {row['cache_path']}")
+    if payload.get("dataset") != expected_dataset or payload.get("stem") != expected_stem:
+        raise RuntimeError(f"Legacy ECST source identity mismatch: {row['cache_path']}")
+    if str(payload.get("backbone_key")) != str(cfg.BACKBONE_KEY):
+        raise RuntimeError(f"Legacy ECST source backbone mismatch: {row['cache_path']}")
+    expected = (1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE))
+    out = {}
+    for output_key, source_key in LEGACY_ECST_REGION_FIELDS.items():
+        value = payload.get(source_key)
+        if not torch.is_tensor(value):
+            raise RuntimeError(
+                f"Legacy ECST source is missing {source_key}: {row['cache_path']}"
+            )
+        value = value.detach().cpu().float()
+        if tuple(value.shape) != expected:
+            raise RuntimeError(
+                f"Legacy ECST {source_key} shape mismatch: {list(value.shape)} != "
+                f"{list(expected)} | {row['cache_path']}"
+            )
+        _validate_unit_range(value, source_key, row["cache_path"])
+        out[output_key] = value
+    return out
 
 
 def _load_tce_cover(row, expected_dataset, expected_stem, cfg):
@@ -1112,6 +1485,14 @@ class CachedTrainDataset(Dataset):
         self.use_drepp = bool(getattr(cfg, "USE_DREPP", False))
         self.use_dabe_pseudo = bool(getattr(cfg, "USE_DABE_PSEUDO", False))
         self.use_dabe_pu = bool(getattr(cfg, "USE_DABE_PU", False))
+        self.use_dabe_clean = bool(getattr(cfg, "USE_DABE_CLEAN", False))
+        self.use_ecst_clean = bool(getattr(cfg, "USE_ECST_CLEAN", False))
+        self.dabe_clean_target_mode = str(
+            getattr(cfg, "DABE_CLEAN_TARGET_MODE", "dp")
+        ).strip().lower()
+        self.dabe_clean_use_legacy_regions = self.use_dabe_clean and bool(
+            getattr(cfg, "DABE_CLEAN_USE_LEGACY_ECST_REGIONS", False)
+        )
         self.use_tce = bool(getattr(cfg, "USE_TCE", False))
         self.use_lceg = bool(getattr(cfg, "USE_LCEG", False))
         self.use_despl_pseudo = bool(getattr(cfg, "USE_DESPL_PSEUDO", False))
@@ -1141,19 +1522,23 @@ class CachedTrainDataset(Dataset):
         self.multi_view_types = [str(view).lower() for view in getattr(cfg, "MULTI_VIEW_TYPES", [])]
         self.use_source_arbiter = bool(getattr(cfg, "USE_SOURCE_ARBITER", False))
         self.use_ap_stcr = bool(getattr(cfg, "USE_AP_STCR", False))
+        self.use_bitc = bool(getattr(cfg, "USE_BITC", False))
+        self.use_cvsa = bool(getattr(cfg, "USE_CVSA", False)) or str(
+            getattr(cfg, "SUPERVISION_MODE", "")
+        ).lower() == "cvsa"
         self.use_arbiter_hflip = self.use_source_arbiter and bool(
             getattr(cfg, "SOURCE_ARBITER_UTILITY_USE_HFLIP", True)
         )
         self.use_hflip_view = (
             self.use_multi_view_feature and "hflip" in self.multi_view_types
-        ) or self.use_arbiter_hflip
+        ) or self.use_arbiter_hflip or self.use_cvsa
         self.multi_level_layers = [int(layer) for layer in getattr(cfg, "MULTI_LEVEL_LAYERS", [4, 8, 12])]
         if self.use_hflip_view and self.use_multi_level_feature:
             raise RuntimeError("HFlip multi-view feature currently supports single-level cached DINO features only.")
         if self.use_qra and self.use_ccr:
             raise RuntimeError("USE_QRA=True and USE_CCR=True cannot be combined.")
-        if self.use_drepp and (self.use_qra or self.use_ccr or self.use_despl_pseudo or self.use_dabe_pseudo or self.use_dabe_pu):
-            raise RuntimeError("USE_DREPP=True cannot be combined with USE_QRA, USE_CCR, USE_DESPL_PSEUDO, USE_DABE_PSEUDO, or USE_DABE_PU.")
+        if self.use_drepp and (self.use_qra or self.use_ccr or self.use_despl_pseudo or self.use_dabe_pseudo or self.use_dabe_pu or self.use_dabe_clean):
+            raise RuntimeError("USE_DREPP=True cannot be combined with QRA/CCR/DESPL/DABE-PU/DABE-Clean.")
         if self.use_despl_pseudo and (self.use_qra or self.use_ccr):
             raise RuntimeError("USE_DESPL_PSEUDO=True cannot be combined with USE_QRA=True or USE_CCR=True.")
         if self.use_dabe_pseudo:
@@ -1189,6 +1574,35 @@ class CachedTrainDataset(Dataset):
                 and not (self.use_despl_pseudo and self.use_despl_light_cache)
             ):
                 raise RuntimeError("DABE-PU training requires DESPL light cache for pseudo_fixed/pseudo_despl diagnostics.")
+        if self.use_dabe_clean:
+            if self.use_dabe_pu or self.use_dabe_pseudo or self.use_despl_pseudo:
+                raise RuntimeError(
+                    "USE_DABE_CLEAN=True is an independent supervision path and "
+                    "cannot be combined with DABE-PU/DABE-pseudo/DESPL."
+                )
+            if self.dabe_clean_target_mode not in DABE_CLEAN_TARGET_MODES:
+                raise RuntimeError(
+                    f"Unsupported DABE_CLEAN_TARGET_MODE={self.dabe_clean_target_mode!r}."
+                )
+            if str(getattr(cfg, "DABE_CLEAN_STATIC_WEIGHT_MODE", "ones")).lower() != "ones":
+                raise RuntimeError("DABE-Clean requires DABE_CLEAN_STATIC_WEIGHT_MODE='ones'.")
+            if self.use_ecst_clean:
+                if self.dabe_clean_use_legacy_regions:
+                    raise RuntimeError(
+                        "Clean-ECST Dataset must not load legacy ECST regions."
+                    )
+                if bool(getattr(cfg, "DABE_CLEAN_LEGACY_ROUTING_ONLY", False)):
+                    raise RuntimeError(
+                        "Clean-ECST Dataset requires DABE_CLEAN_LEGACY_ROUTING_ONLY=False."
+                    )
+                if str(getattr(cfg, "DABE_CLEAN_LEGACY_REGION_ROOT", "")).strip():
+                    raise RuntimeError(
+                        "Clean-ECST Dataset requires an empty legacy region root."
+                    )
+                if str(getattr(cfg, "DABE_PU_ROOT", "")).strip():
+                    raise RuntimeError(
+                        "Clean-ECST Dataset requires the inactive DABE-PU root to be empty."
+                    )
         # 训练集只建立 image/cache 索引，不读取 GT，避免把训练 GT 引入监督。
         self.items = build_image_items(cfg.DATA_ROOT, cfg.TRAIN_DATASETS, require_gt=False)
         if max_samples >= 0:
@@ -1256,7 +1670,11 @@ class CachedTrainDataset(Dataset):
         self.hflip_feature_root = None
         self.hflip_first_cache_path = None
         if self.use_hflip_view:
-            hflip_manifest = hflip_feature_cache_manifest_path(cfg)
+            hflip_manifest = (
+                _cvsa_manifest_path(cfg, "feature_cache_hflip_root")
+                if self.use_cvsa
+                else hflip_feature_cache_manifest_path(cfg)
+            )
             hflip_rows = read_jsonl(hflip_manifest)
             self.hflip_feature_map = manifest_to_map(hflip_rows, hflip_manifest)
             if max_samples < 0:
@@ -1266,6 +1684,36 @@ class CachedTrainDataset(Dataset):
                 if missing_hflip:
                     raise RuntimeError(f"hflip feature train cache missing first 10: {missing_hflip[:10]}")
             self.hflip_feature_root = str(hflip_manifest.parent.resolve())
+
+        self.cvsa_fixed_hflip_map = None
+        self.cvsa_fixed_hflip_root = None
+        self.cvsa_fixed_hflip_first_cache_path = None
+        if self.use_cvsa:
+            fixed_hflip_manifest = _cvsa_manifest_path(
+                cfg, "fixed_cache_hflip_root"
+            )
+            fixed_hflip_rows = read_jsonl(fixed_hflip_manifest)
+            self.cvsa_fixed_hflip_map = manifest_to_map(
+                fixed_hflip_rows, fixed_hflip_manifest
+            )
+            if max_samples < 0:
+                check_exact_keys(
+                    "CVSA hflip DABE-PU cache",
+                    self.cvsa_fixed_hflip_map.keys(),
+                    self.keys,
+                )
+            else:
+                missing_fixed_hflip = sorted(
+                    set(self.keys) - set(self.cvsa_fixed_hflip_map)
+                )
+                if missing_fixed_hflip:
+                    raise RuntimeError(
+                        "CVSA hflip DABE-PU cache missing first 10: "
+                        f"{missing_fixed_hflip[:10]}"
+                    )
+            self.cvsa_fixed_hflip_root = str(
+                fixed_hflip_manifest.parent.resolve()
+            )
 
         override = getattr(cfg, "PSEUDO_CACHE_OVERRIDE", None)
         self.pseudo_cache_override = (
@@ -1283,6 +1731,8 @@ class CachedTrainDataset(Dataset):
             raise RuntimeError("USE_DABE_PSEUDO=True cannot be combined with PSEUDO_CACHE_OVERRIDE.")
         if self.use_dabe_pu and self.pseudo_cache_override is not None:
             raise RuntimeError("USE_DABE_PU=True cannot be combined with PSEUDO_CACHE_OVERRIDE.")
+        if self.use_dabe_clean and self.pseudo_cache_override is not None:
+            raise RuntimeError("USE_DABE_CLEAN=True cannot be combined with PSEUDO_CACHE_OVERRIDE.")
         self.original_pseudo_cache_root = str(
             (
                 Path(cfg.CACHE_ROOT)
@@ -1304,6 +1754,15 @@ class CachedTrainDataset(Dataset):
         self.dabe_pu_map = None
         self.dabe_pu_cache_root = None
         self.dabe_pu_first_cache_path = None
+        self.dabe_clean_map = None
+        self.dabe_clean_cache_root = None
+        self.dabe_clean_first_cache_path = None
+        self.dabe_clean_legacy_region_map = None
+        self.dabe_clean_legacy_region_root = None
+        self.bitc_map = None
+        self.bitc_cache_root = None
+        self.bitc_first_cache_path = None
+        self.bitc_cache_fingerprint = None
         self.tce_cover_map = None
         self.tce_cover_cache_root = None
         self.tce_cover_first_cache_path = None
@@ -1366,7 +1825,7 @@ class CachedTrainDataset(Dataset):
                 if pseudo_manifest.exists():
                     pseudo_rows = read_jsonl(pseudo_manifest)
                     self.pseudo_map = manifest_to_map(pseudo_rows, pseudo_manifest)
-        elif self.use_dabe_pu:
+        elif self.use_dabe_pu or self.use_dabe_clean:
             self.pseudo_map = {}
             self.actual_pseudo_cache_root = self.original_pseudo_cache_root
             self.actual_pseudo_cache_pattern = f"{self.original_pseudo_cache_root}/<dataset>/<stem>.pt"
@@ -1446,6 +1905,64 @@ class CachedTrainDataset(Dataset):
             self.dabe_pu_cache_root = str(dabe_pu_manifest.parent.resolve())
             self.actual_pseudo_cache_root = self.dabe_pu_cache_root
             self.actual_pseudo_cache_pattern = f"{self.dabe_pu_cache_root}/<dataset>/<stem>.pt"
+        if self.use_dabe_clean:
+            dabe_clean_manifest = dabe_clean_manifest_path(cfg)
+            dabe_clean_rows = read_jsonl(dabe_clean_manifest)
+            self.dabe_clean_map = manifest_to_map(
+                dabe_clean_rows, dabe_clean_manifest
+            )
+            if max_samples < 0:
+                check_exact_keys(
+                    "DABE-Clean cache", self.dabe_clean_map.keys(), self.keys
+                )
+            else:
+                missing_clean = sorted(set(self.keys) - set(self.dabe_clean_map))
+                if missing_clean:
+                    raise RuntimeError(
+                        f"DABE-Clean cache missing first 10: {missing_clean[:10]}"
+                    )
+            self.dabe_clean_cache_root = str(dabe_clean_manifest.parent.resolve())
+            self.actual_pseudo_cache_root = self.dabe_clean_cache_root
+            self.actual_pseudo_cache_pattern = (
+                f"{self.dabe_clean_cache_root}/<dataset>/<stem>.pt"
+            )
+            if self.dabe_clean_use_legacy_regions:
+                legacy_manifest = dabe_clean_legacy_region_manifest_path(cfg)
+                legacy_rows = read_jsonl(legacy_manifest)
+                self.dabe_clean_legacy_region_map = manifest_to_map(
+                    legacy_rows, legacy_manifest
+                )
+                if max_samples < 0:
+                    check_exact_keys(
+                        "DABE-Clean legacy ECST region cache",
+                        self.dabe_clean_legacy_region_map.keys(),
+                        self.keys,
+                    )
+                else:
+                    missing_legacy = sorted(
+                        set(self.keys) - set(self.dabe_clean_legacy_region_map)
+                    )
+                    if missing_legacy:
+                        raise RuntimeError(
+                            "DABE-Clean legacy ECST region cache missing first 10: "
+                            f"{missing_legacy[:10]}"
+                        )
+                self.dabe_clean_legacy_region_root = str(
+                    legacy_manifest.parent.resolve()
+                )
+        if self.use_bitc:
+            bitc_manifest = _bitc_manifest_path(cfg)
+            bitc_rows = read_jsonl(bitc_manifest)
+            self.bitc_map = manifest_to_map(bitc_rows, bitc_manifest)
+            if max_samples < 0:
+                check_exact_keys("BITC background intervention cache", self.bitc_map.keys(), self.keys)
+            else:
+                missing_bitc = sorted(set(self.keys) - set(self.bitc_map))
+                if missing_bitc:
+                    raise RuntimeError(
+                        f"BITC background intervention cache missing first 10: {missing_bitc[:10]}"
+                    )
+            self.bitc_cache_root = str(bitc_manifest.parent.resolve())
         if self.use_tce:
             tce_manifest = tce_cover_manifest_path(cfg)
             tce_rows = read_jsonl(tce_manifest)
@@ -1541,7 +2058,7 @@ class CachedTrainDataset(Dataset):
                     f"{self.despl_blend_despl_weight:.3f}*p_despl+"
                     f"{self.despl_blend_fixed_weight:.3f}*p_fixed"
                 )
-        elif not self.use_dabe_pu:
+        elif not (self.use_dabe_pu or self.use_dabe_clean):
             pseudo, pseudo_payload = _load_pseudo(
                 self.pseudo_map[(first_dataset, first_stem)],
                 first_dataset,
@@ -1597,7 +2114,9 @@ class CachedTrainDataset(Dataset):
                     or str(getattr(cfg, "DABE_PU_STATIC_TARGET_MODE", "soft")).lower()
                     == "hard_from_target_soft"
                 )
-                else "target_soft_68"
+                else str(
+                    getattr(cfg, "DABE_PU_STATIC_SOURCE", "target_soft_68")
+                ).strip().lower()
             )
             self.pseudo_final_candidate = (
                 "DABE-PU seed masks + OEM dynamic extent"
@@ -1610,6 +2129,41 @@ class CachedTrainDataset(Dataset):
             )
             self.dabe_pu_first_cache_path = self.dabe_pu_map[(first_dataset, first_stem)]["cache_path"]
             self.first_pseudo_cache_path = self.dabe_pu_first_cache_path
+        if self.use_dabe_clean:
+            dabe_clean_payload = _load_dabe_clean(
+                self.dabe_clean_map[(first_dataset, first_stem)],
+                first_dataset,
+                first_stem,
+                cfg,
+            )
+            self.pseudo_shape = list(
+                dabe_clean_payload["dabe_clean_target_68"].shape
+            )
+            self.pseudo_source = str(dabe_clean_payload["dabe_clean_version"])
+            self.pseudo_final_candidate = (
+                f"single continuous DABE target ({self.dabe_clean_target_mode}) "
+                "+ DESPL-style full binary EMA Teacher"
+            )
+            self.dabe_clean_first_cache_path = self.dabe_clean_map[
+                (first_dataset, first_stem)
+            ]["cache_path"]
+            self.first_pseudo_cache_path = self.dabe_clean_first_cache_path
+            if self.dabe_clean_use_legacy_regions:
+                _load_dabe_clean_legacy_regions(
+                    self.dabe_clean_legacy_region_map[(first_dataset, first_stem)],
+                    first_dataset,
+                    first_stem,
+                    cfg,
+                )
+        if self.use_bitc:
+            bitc_payload = _load_bitc_cache(
+                self.bitc_map[(first_dataset, first_stem)],
+                first_dataset,
+                first_stem,
+                cfg,
+            )
+            self.bitc_first_cache_path = bitc_payload["bitc_cache_path"]
+            self.bitc_cache_fingerprint = bitc_payload["bitc_cache_fingerprint"]
         if self.use_tce:
             _load_tce_cover(
                 self.tce_cover_map[(first_dataset, first_stem)],
@@ -1639,6 +2193,17 @@ class CachedTrainDataset(Dataset):
                     f"{self.hflip_feature_map[(first_dataset, first_stem)]['cache_path']}"
                 )
             self.hflip_first_cache_path = self.hflip_feature_map[(first_dataset, first_stem)]["cache_path"]
+        if self.use_cvsa:
+            _load_cvsa_hflip_fixed(
+                self.cvsa_fixed_hflip_map[(first_dataset, first_stem)],
+                first_dataset,
+                first_stem,
+                cfg,
+            )
+            first_row = self.cvsa_fixed_hflip_map[(first_dataset, first_stem)]
+            self.cvsa_fixed_hflip_first_cache_path = first_row.get(
+                "fixed_path", first_row.get("cache_path")
+            )
         if self.pseudo_cache_override is not None:
             input_size = int(cfg.DINO["pseudo_input_size"])
             patch_size = int(cfg.DINO["patch_size"])
@@ -1763,6 +2328,7 @@ class CachedTrainDataset(Dataset):
                 self.cssd_hr_feature_map[key], dataset, stem, self.cfg
             )
         hflip_feature = None
+        cvsa_fixed_hflip = None
         if self.use_hflip_view:
             hflip_feature, hflip_payload = _load_feature(self.hflip_feature_map[key], dataset, stem)
             if list(hflip_feature.shape) != list(feature.shape):
@@ -1774,6 +2340,10 @@ class CachedTrainDataset(Dataset):
                 raise RuntimeError(
                     f"HFlip feature payload view mismatch for {dataset}/{stem}: {hflip_payload.get('view')}"
                 )
+        if self.use_cvsa:
+            cvsa_fixed_hflip = _load_cvsa_hflip_fixed(
+                self.cvsa_fixed_hflip_map[key], dataset, stem, self.cfg
+            )
         if self.use_drepp:
             drepp_payload = _load_drepp(self.drepp_map[key], dataset, stem, self.cfg)
             pseudo = drepp_payload["p_despl"].float()
@@ -1875,7 +2445,7 @@ class CachedTrainDataset(Dataset):
                 p_despl_paper_view_consistency = 0.0
                 p_despl_paper_binary = torch.zeros_like(pseudo)
                 p_despl_paper_sign_mode = ""
-        elif not self.use_dabe_pu:
+        elif not self.use_dabe_pu and not self.use_dabe_clean:
             pseudo, pseudo_payload = _load_pseudo(self.pseudo_map[key], dataset, stem)
             if (
                 self.override_expected_shape is not None
@@ -1918,6 +2488,29 @@ class CachedTrainDataset(Dataset):
             pseudo_safe = pseudo
             p_init_area = float(dabe_pu_payload["pu_target_area"])
             use_fixed_in_pseudo = False
+        if self.use_dabe_clean:
+            dabe_clean_payload = _load_dabe_clean(
+                self.dabe_clean_map[key], dataset, stem, self.cfg
+            )
+            pseudo = dabe_clean_payload["dabe_clean_target_68"].float()
+            pseudo_base = pseudo
+            pseudo_safe = pseudo
+            p_init_area = float(pseudo.mean().item())
+            use_fixed_in_pseudo = False
+            dabe_clean_legacy_regions = (
+                _load_dabe_clean_legacy_regions(
+                    self.dabe_clean_legacy_region_map[key],
+                    dataset,
+                    stem,
+                    self.cfg,
+                )
+                if self.dabe_clean_use_legacy_regions
+                else None
+            )
+        if self.use_bitc:
+            bitc_payload = _load_bitc_cache(
+                self.bitc_map[key], dataset, stem, self.cfg
+            )
         if self.use_tce:
             tce_cover_payload = _load_tce_cover(self.tce_cover_map[key], dataset, stem, self.cfg)
         if self.use_lceg:
@@ -1927,6 +2520,7 @@ class CachedTrainDataset(Dataset):
             "feature": feature,
             "pseudo": pseudo,
             "dataset": dataset,
+            "dataset_name": dataset,
             "stem": stem,
             "image_path": item["image_path"],
             "sample_index": int(index),
@@ -1950,6 +2544,8 @@ class CachedTrainDataset(Dataset):
             )
         if self.use_hflip_view:
             sample["feature_hflip"] = hflip_feature.float()
+        if self.use_cvsa:
+            sample["cvsa_fixed_hflip_68"] = cvsa_fixed_hflip.float()
         if self.use_multi_level_feature:
             sample.update(
                 {
@@ -2081,6 +2677,83 @@ class CachedTrainDataset(Dataset):
                     "pu_sc_new_boundary_ratio": float(dabe_pu_payload["pu_sc_new_boundary_ratio"]),
                     "use_fixed_in_pseudo": False,
                     "fixed_used_for_training": False,
+                }
+            )
+            if dabe_pu_payload.get("pu_p_base_soft") is not None:
+                sample["pu_p_base_soft"] = dabe_pu_payload["pu_p_base_soft"].float()
+        if self.use_dabe_clean:
+            zero_pseudo = torch.zeros_like(pseudo)
+            sample.update(
+                {
+                    "pseudo_fixed": zero_pseudo,
+                    "pseudo_despl": zero_pseudo,
+                    "p_fixed_area": 0.0,
+                    "p_despl_area": 0.0,
+                    "dabe_clean_target_37": dabe_clean_payload[
+                        "dabe_clean_target_37"
+                    ].float(),
+                    "dabe_clean_target_68": dabe_clean_payload[
+                        "dabe_clean_target_68"
+                    ].float(),
+                    "dabe_clean_fg_evidence_37": dabe_clean_payload[
+                        "dabe_clean_fg_evidence_37"
+                    ].float(),
+                    "dabe_clean_fg_evidence_68": dabe_clean_payload[
+                        "dabe_clean_fg_evidence_68"
+                    ].float(),
+                    "dabe_clean_bg_evidence_37": dabe_clean_payload[
+                        "dabe_clean_bg_evidence_37"
+                    ].float(),
+                    "dabe_clean_bg_evidence_68": dabe_clean_payload[
+                        "dabe_clean_bg_evidence_68"
+                    ].float(),
+                    "dabe_clean_target_mode": str(
+                        dabe_clean_payload["dabe_clean_target_mode"]
+                    ),
+                    "dabe_clean_version": str(
+                        dabe_clean_payload["dabe_clean_version"]
+                    ),
+                    "use_fixed_in_pseudo": False,
+                    "fixed_used_for_training": False,
+                }
+            )
+            for field in (
+                "dabe_clean_p_rw_37",
+                "dabe_clean_evidence_gate_37",
+                "dabe_clean_semantic_fg_tendency_37",
+                "dabe_clean_latent_rw_37",
+                "dabe_clean_recoverability_37",
+                "dabe_clean_recoverability_68",
+            ):
+                if field in dabe_clean_payload:
+                    sample[field] = dabe_clean_payload[field].float()
+            if dabe_clean_legacy_regions is not None:
+                sample.update(
+                    {
+                        key: value.float()
+                        for key, value in dabe_clean_legacy_regions.items()
+                    }
+                )
+        if self.use_bitc:
+            sample.update(
+                {
+                    "bitc_topk_indices": bitc_payload["bitc_topk_indices"],
+                    "bitc_topk_weights": bitc_payload["bitc_topk_weights"],
+                    "bitc_background_anchor_mask": bitc_payload[
+                        "bitc_background_anchor_mask"
+                    ],
+                    "bitc_nearest_bg_index": bitc_payload[
+                        "bitc_nearest_bg_index"
+                    ],
+                    "bitc_fixed_random_bg_index": bitc_payload[
+                        "bitc_fixed_random_bg_index"
+                    ],
+                    "bitc_background_anchor_count": int(
+                        bitc_payload["bitc_background_anchor_count"]
+                    ),
+                    "bitc_cache_fingerprint": bitc_payload[
+                        "bitc_cache_fingerprint"
+                    ],
                 }
             )
         if self.use_tce:

@@ -152,12 +152,31 @@ def get_ecst_scale(cfg, epoch):
     return 1.0
 
 
-def build_ecst_region_masks(batch, device):
+def build_ecst_region_masks(batch, device, key_prefix="pu"):
     # pu_fg_fallback is intentionally not an ECST core state.
-    fg_core = batch["pu_fg_core"].to(device, non_blocking=True).float() > 0.5
-    bg_core = batch["pu_bg_core"].to(device, non_blocking=True).float() > 0.5
-    extent = batch["pu_extent"].to(device, non_blocking=True).float() > 0.5
-    unknown = batch["pu_unknown"].to(device, non_blocking=True).float() > 0.5
+    if str(key_prefix) == "pu":
+        keys = {
+            "fg_core": "pu_fg_core",
+            "bg_core": "pu_bg_core",
+            "extent": "pu_extent",
+            "unknown": "pu_unknown",
+        }
+    elif str(key_prefix) == "legacy_ecst":
+        keys = {
+            "fg_core": "legacy_ecst_fg_core",
+            "bg_core": "legacy_ecst_bg_core",
+            "extent": "legacy_ecst_extent",
+            "unknown": "legacy_ecst_unknown",
+        }
+    else:
+        raise RuntimeError(f"Unsupported ECST region key prefix: {key_prefix!r}.")
+    missing = sorted(key for key in keys.values() if key not in batch)
+    if missing:
+        raise KeyError(f"ECST batch is missing region fields: {missing}.")
+    fg_core = batch[keys["fg_core"]].to(device, non_blocking=True).float() > 0.5
+    bg_core = batch[keys["bg_core"]].to(device, non_blocking=True).float() > 0.5
+    extent = batch[keys["extent"]].to(device, non_blocking=True).float() > 0.5
+    unknown = batch[keys["unknown"]].to(device, non_blocking=True).float() > 0.5
     bg_core = bg_core & (~fg_core)
     extent = extent & (~fg_core) & (~bg_core)
     unknown = unknown & (~fg_core) & (~bg_core) & (~extent)
@@ -247,6 +266,93 @@ def _assert_mask_value(value, mask, expected, name, tolerance=1e-5):
         )
 
 
+def build_past_only_temporal_reliability(
+    cfg, temporal_mean, temporal_second, history_count
+):
+    """Shared, pre-update temporal reliability used by ECST variants."""
+
+    if tuple(temporal_mean.shape) != tuple(temporal_second.shape):
+        raise RuntimeError("Temporal mean/second shape mismatch.")
+    if temporal_mean.ndim != 4 or int(temporal_mean.shape[1]) != 1:
+        raise RuntimeError(
+            f"Temporal tensors must be [B,1,H,W], got {list(temporal_mean.shape)}."
+        )
+    if history_count.ndim != 1 or int(history_count.shape[0]) != int(
+        temporal_mean.shape[0]
+    ):
+        raise RuntimeError(
+            f"history_count must be [B], got {list(history_count.shape)}."
+        )
+    if not all(
+        bool(torch.isfinite(tensor).all().item())
+        for tensor in (temporal_mean, temporal_second)
+    ):
+        raise RuntimeError("Temporal reliability input contains NaN/Inf.")
+    mean = temporal_mean.float().clamp(0.0, 1.0)
+    second = temporal_second.float().clamp(0.0, 1.0)
+    variance = (second - mean.square()).clamp(0.0, 0.25)
+    variance_tau = float(getattr(cfg, "ECST_VARIANCE_TAU", 0.02))
+    confidence_gamma = float(getattr(cfg, "ECST_CONF_GAMMA", 1.0))
+    stability = torch.exp(-variance / variance_tau)
+    bg_confidence = F.relu(2.0 * (0.5 - mean)).clamp(0.0, 1.0)
+    observed_reliability = bg_confidence.pow(confidence_gamma) * stability
+    min_history = int(getattr(cfg, "ECST_MIN_HISTORY", 3))
+    history_valid = history_count >= min_history
+    insufficient_mode = str(
+        getattr(cfg, "ECST_INSUFFICIENT_HISTORY_MODE", "dino_only")
+    ).lower()
+    if insufficient_mode != "dino_only":
+        raise RuntimeError(
+            "ECST only supports ECST_INSUFFICIENT_HISTORY_MODE='dino_only', "
+            f"got {insufficient_mode!r}."
+        )
+    enough_history = history_valid.view(-1, 1, 1, 1)
+    bg_reliability = torch.where(
+        enough_history,
+        observed_reliability,
+        torch.ones_like(observed_reliability),
+    )
+    return {
+        "mean": mean.detach(),
+        "variance": variance.detach(),
+        "stability": stability.detach(),
+        "bg_confidence": bg_confidence.detach(),
+        "bg_reliability": bg_reliability.detach(),
+        "history_valid": history_valid.detach(),
+    }
+
+
+def build_asymmetric_negative_verified_weight(cfg, semantic_margin, bg_reliability):
+    """Shared DINO ceiling plus past-only temporal reliability formula."""
+
+    if tuple(semantic_margin.shape) != tuple(bg_reliability.shape):
+        raise RuntimeError(
+            "Semantic margin/temporal reliability shape mismatch: "
+            f"{list(semantic_margin.shape)} != {list(bg_reliability.shape)}."
+        )
+    if not all(
+        bool(torch.isfinite(tensor).all().item())
+        for tensor in (semantic_margin, bg_reliability)
+    ):
+        raise RuntimeError("Negative verification input contains NaN/Inf.")
+    margin_tau = float(getattr(cfg, "ECST_MARGIN_TAU", 0.05))
+    fg_tendency = torch.sigmoid(semantic_margin / margin_tau)
+    extent_dino_lambda = float(
+        getattr(cfg, "ECST_EXTENT_DINO_LAMBDA", math.log(4.0))
+    )
+    extent_floor = float(getattr(cfg, "ECST_EXTENT_BG_WEIGHT_FLOOR", 0.25))
+    dino_ceiling = torch.exp(-extent_dino_lambda * fg_tendency).clamp(
+        extent_floor, 1.0
+    )
+    verified = extent_floor + bg_reliability * (dino_ceiling - extent_floor)
+    return {
+        "fg_tendency": fg_tendency.detach(),
+        "dino_ceiling": dino_ceiling.detach(),
+        "negative_verified_weight": verified.detach(),
+        "floor": extent_floor,
+    }
+
+
 def build_ecst_evidence_states(
     cfg,
     batch,
@@ -255,6 +361,7 @@ def build_ecst_evidence_states(
     temporal_second,
     history_count,
     device,
+    region_key_prefix="pu",
 ):
     """Construct detached ECST evidence states before teacher-map routing."""
     expected_shape = tuple(teacher_prob.shape)
@@ -282,32 +389,17 @@ def build_ecst_evidence_states(
             f"min={teacher_prob_min}, max={teacher_prob_max}."
         )
 
-    mean = temporal_mean.float().clamp(0.0, 1.0)
-    second = temporal_second.float().clamp(0.0, 1.0)
-    variance = (second - mean.square()).clamp(0.0, 0.25)
-    variance_tau = float(getattr(cfg, "ECST_VARIANCE_TAU", 0.02))
-    confidence_gamma = float(getattr(cfg, "ECST_CONF_GAMMA", 1.0))
-    stability = torch.exp(-variance / variance_tau)
-    bg_confidence = F.relu(2.0 * (0.5 - mean)).clamp(0.0, 1.0)
-    observed_reliability = bg_confidence.pow(confidence_gamma) * stability
-    min_history = int(getattr(cfg, "ECST_MIN_HISTORY", 3))
-    history_valid = history_count >= min_history
-    insufficient_mode = str(
-        getattr(cfg, "ECST_INSUFFICIENT_HISTORY_MODE", "dino_only")
-    ).lower()
-    if insufficient_mode != "dino_only":
-        raise RuntimeError(
-            "ECST only supports ECST_INSUFFICIENT_HISTORY_MODE='dino_only', "
-            f"got {insufficient_mode!r}."
-        )
-    enough_history = history_valid.view(-1, 1, 1, 1)
-    bg_reliability = torch.where(
-        enough_history,
-        observed_reliability,
-        torch.ones_like(observed_reliability),
+    temporal = build_past_only_temporal_reliability(
+        cfg, temporal_mean, temporal_second, history_count
     )
+    mean = temporal["mean"]
+    variance = temporal["variance"]
+    stability = temporal["stability"]
+    bg_confidence = temporal["bg_confidence"]
+    bg_reliability = temporal["bg_reliability"]
+    history_valid = temporal["history_valid"]
 
-    masks = build_ecst_region_masks(batch, device)
+    masks = build_ecst_region_masks(batch, device, key_prefix=region_key_prefix)
     fg_core = masks["fg_core"]
     bg_core = masks["bg_core"]
     extent = masks["extent"]
@@ -388,24 +480,15 @@ def build_ecst_teacher_weight_map_from_states(
         )
 
     routed_states = dict(states)
-    margin_tau = float(getattr(cfg, "ECST_MARGIN_TAU", 0.05))
-    fg_tendency = torch.sigmoid(states["margin_68"] / margin_tau)
-    extent_dino_lambda = float(
-        getattr(cfg, "ECST_EXTENT_DINO_LAMBDA", math.log(4.0))
-    )
-    extent_floor = float(getattr(cfg, "ECST_EXTENT_BG_WEIGHT_FLOOR", 0.25))
-    dino_ceiling = torch.exp(
-        -extent_dino_lambda * fg_tendency
-    ).clamp(extent_floor, 1.0)
-    extent_bg_weight = extent_floor + states["bg_reliability"] * (
-        dino_ceiling - extent_floor
+    negative = build_asymmetric_negative_verified_weight(
+        cfg, states["margin_68"], states["bg_reliability"]
     )
     routed_states.update(
         {
-            "fg_tendency": fg_tendency,
-            "dino_ceiling": dino_ceiling,
-            "extent_bg_weight": extent_bg_weight,
-            "extent_floor": extent_floor,
+            "fg_tendency": negative["fg_tendency"],
+            "dino_ceiling": negative["dino_ceiling"],
+            "extent_bg_weight": negative["negative_verified_weight"],
+            "extent_floor": negative["floor"],
         }
     )
 
@@ -635,6 +718,7 @@ def build_ecst_teacher_weight_map(
     device,
     return_raw=False,
     return_states=False,
+    region_key_prefix="pu",
 ):
     """Compatibility wrapper preserving the original ECST public interface."""
     states = build_ecst_evidence_states(
@@ -645,6 +729,7 @@ def build_ecst_teacher_weight_map(
         temporal_second,
         history_count,
         device,
+        region_key_prefix=region_key_prefix,
     )
     return build_ecst_teacher_weight_map_from_states(
         cfg=cfg,

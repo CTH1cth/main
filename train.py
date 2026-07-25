@@ -24,6 +24,16 @@ from common.ap_stcr import (
     render_ap_stcr_diagnostic,
     strict_teacher_binary,
 )
+from common.bitc import (
+    accumulate_bitc_epoch,
+    build_bitc_teacher_map,
+    build_grouped_counterfactuals,
+    build_query_norm_substitute,
+    export_bitc_debug_batch,
+    finalize_bitc_epoch,
+    new_bitc_epoch_accumulator,
+    validate_bitc_config,
+)
 from common.dataset import CachedEvalDataset, CachedTrainDataset
 from common.ecst import (
     TemporalTeacherMemory as ECSTTemporalTeacherMemory,
@@ -32,6 +42,20 @@ from common.ecst import (
     build_ecst_teacher_weight_map,
     build_ecst_teacher_weight_map_from_states,
     get_ecst_scale,
+)
+from common.ecst_clean import (
+    build_ecst_clean_teacher_weight_map,
+    get_ecst_clean_continuous_strengths,
+    get_ecst_clean_directional_strengths,
+    get_ecst_clean_scale,
+    get_ecst_clean_strength_mode,
+    get_ecst_clean_strength_max,
+    validate_ecst_clean_config,
+)
+from common.ecst_minimal import (
+    build_ecst_minimal_teacher_weight_map,
+    get_ecst_minimal_scale,
+    validate_ecst_minimal_config,
 )
 from common.source_arbiter import (
     RouteTrajectoryMemory,
@@ -120,6 +144,7 @@ from common.utils import (
     Logger,
     cache_status,
     check_cacd_feature_cache,
+    check_dabe_clean_cache,
     check_dabe_pu_cache,
     check_dabe_pseudo_cache,
     check_ccr_cache,
@@ -144,8 +169,29 @@ from common.utils import (
     set_seed,
     write_yaml,
 )
+from losses.oed_loss import (
+    build_aux_evidence_loss,
+    compute_logit_gradient_diagnostics,
+    finalize_oed_epoch,
+    new_oed_epoch_accumulator,
+    update_oed_epoch_accumulator,
+    validate_oed_config,
+)
 from model import build_seg_head, update_ema
 from models.pssf import PredictiveSupervisionStateFilter
+from models.supervision.cvsa import (
+    CVSAPatchRouter,
+    accumulate_cvsa_epoch,
+    build_cvsa_batch,
+    build_cvsa_diagnostic_payload,
+    cvsa_protocol_fingerprint,
+    cvsa_router_macs,
+    cvsa_router_parameter_count,
+    export_cvsa_visualization,
+    finalize_cvsa_epoch,
+    new_cvsa_epoch_accumulator,
+    validate_cvsa_cache_manifests,
+)
 
 
 def _legacy_tepr_module():
@@ -191,9 +237,165 @@ def use_ap_stcr(cfg):
     )
 
 
+def use_cvsa(cfg):
+    supervision_mode = str(
+        getattr(cfg, "SUPERVISION_MODE", "")
+    ).strip().lower()
+    return bool(getattr(cfg, "USE_CVSA", False)) or supervision_mode == "cvsa"
+
+
+def validate_cvsa_config(cfg):
+    if not use_cvsa(cfg):
+        return False
+    config = getattr(cfg, "CVSA", None)
+    if not isinstance(config, dict):
+        raise RuntimeError("CVSA requires a CVSA configuration dict.")
+    required_protocol = {
+        "SUPERVISION_MODE": "cvsa",
+        "TEACHER_FUSION_MODE": "dabe_pu_despl_sched",
+        "TEACHER_ROUTING_MODE": "none",
+        "STATIC_WEIGHT_MODE": "ones",
+        "DABE_PU_VERSION": "pu_v11",
+        "P_INIT_MODE": "dabe_pu_v11_desplsched",
+        "TEACHER_TARGET_MODE": "binary",
+        "DABE_PU_STATIC_TARGET_MODE": "soft",
+        "FINETUNE_RESET_TIMING": "after_epoch",
+        "HEAD_TYPE": "dagp_safe",
+    }
+    mismatched = {
+        name: getattr(cfg, name, None)
+        for name, expected in required_protocol.items()
+        if str(getattr(cfg, name, "")).strip().lower() != expected
+    }
+    if mismatched:
+        raise RuntimeError(
+            f"CVSA protected Long45 protocol mismatch: {mismatched}; "
+            f"expected={required_protocol}."
+        )
+    required_true = (
+        "USE_CVSA",
+        "USE_DABE_PU",
+        "USE_DABE_PU_DESPL_SCHEDULE",
+        "USE_DAGP_SAFE_HEAD",
+        "USE_NDR_BRANCH",
+        "USE_NDR_COARSE_AUX",
+        "USE_BASE_AUX_LOSS",
+        "FINETUNE_RESET_REBUILD_OPTIMIZER",
+        "FINETUNE_RESET_REBUILD_SCHEDULER",
+        "FINETUNE_RESET_GLOBAL_STEP",
+        "FINETUNE_RESET_TEACHER",
+        "FINETUNE_RESET_FORCE_LR_FLOOR",
+        "USE_LR_FLOOR",
+    )
+    missing = [name for name in required_true if not bool(getattr(cfg, name, False))]
+    if missing:
+        raise RuntimeError(f"CVSA protected protocol requires flags: {missing}.")
+    forbidden = (
+        "USE_AP_STCR",
+        "USE_PSSF",
+        "USE_ECST",
+        "USE_SOURCE_ARBITER",
+        "USE_MULTI_VIEW_FEATURE",
+        "USE_VIEW_CONSISTENCY",
+        "USE_PROTO_CONTRAST",
+        "USE_DABE_OEM",
+        "USE_RAST",
+        "USE_ESA_ASYM",
+        "ESA_POST_RESET_ENABLE",
+        "USE_TADR_ROUTER",
+        "USE_CSSD",
+        "USE_CACD",
+        "USE_HR_BFR",
+    )
+    enabled_forbidden = [
+        name for name in forbidden if bool(getattr(cfg, name, False))
+    ]
+    if enabled_forbidden:
+        raise RuntimeError(
+            f"CVSA cannot be combined with branches: {enabled_forbidden}."
+        )
+    expected_config = {
+        "enabled": True,
+        "view_type": "hflip",
+        "evidence_resolution": 37,
+        "loss_resolution": 68,
+        "risk_eq_weight": 0.50,
+        "risk_sem_weight": 0.50,
+        "semantic_temperature": 0.20,
+        "route_temperature": 0.10,
+        "min_proto_mass_patches": 4.0,
+        "router_feature_dim": 32,
+        "router_hidden_dim": 32,
+        "router_gn_groups": 4,
+        "router_init_teacher_prob": 0.05,
+        "router_loss_weight": 1.0,
+        "use_global_schedule": False,
+        "use_epoch_ratio": False,
+        "use_temporal_history": False,
+        "use_future_teacher": False,
+    }
+    bad_config = {
+        name: config.get(name)
+        for name, expected in expected_config.items()
+        if config.get(name) != expected
+    }
+    if bad_config:
+        raise RuntimeError(
+            f"CVSA formula/config contract mismatch: {bad_config}; "
+            f"expected={expected_config}."
+        )
+    version = str(config.get("version", ""))
+    route_mode = str(config.get("route_mode", "")).lower()
+    expected_versions = {
+        "learnable": "cvsa_v1_hflip_router",
+        "direct": "cvsa_v1_hflip_direct",
+    }
+    if route_mode not in expected_versions or version != expected_versions[route_mode]:
+        raise RuntimeError(
+            f"CVSA route/version mismatch: route_mode={route_mode!r}, version={version!r}."
+        )
+    for key in ("feature_cache_hflip_root", "fixed_cache_hflip_root"):
+        if not isinstance(config.get(key), str) or not config[key]:
+            raise RuntimeError(f"CVSA.{key} must be a nonempty path.")
+    eps = float(config.get("eps", float("nan")))
+    if not math.isfinite(eps) or eps <= 0.0:
+        raise RuntimeError("CVSA.eps must be positive and finite.")
+    if int(getattr(cfg, "FINETUNE_RESET_EPOCH", -1)) != 20:
+        raise RuntimeError("CVSA Long45 requires the after-epoch-20 reset.")
+    if int(getattr(cfg, "MAX_EPOCH", -1)) != 45:
+        raise RuntimeError("CVSA requires MAX_EPOCH=45.")
+    return True
+
+
 def validate_ap_stcr_config(cfg):
     if not use_ap_stcr(cfg):
         return False
+    ap_config = getattr(cfg, "AP_STCR", None)
+    if not isinstance(ap_config, dict):
+        raise RuntimeError("AP-STCR requires an AP_STCR configuration dict.")
+    ap_version = str(ap_config.get("version", "")).strip()
+    supported_versions = {
+        "ap_stcr_v1_full_pixel_37_to_68",
+        "ap_stcr_v2_conflict_only_pass_through",
+        "ap_stcr_v3_soft_disagreement_bounded_continuation",
+        "ap_stcr_v4_transition_envelope_non_compensatory",
+        "ap_stcr_v4_semantic_only_ablation",
+    }
+    if ap_version not in supported_versions:
+        raise RuntimeError(
+            f"Unsupported AP-STCR version={ap_version!r}; "
+            f"expected one of {sorted(supported_versions)}."
+        )
+    is_v2 = ap_version == "ap_stcr_v2_conflict_only_pass_through"
+    is_v3 = (
+        ap_version
+        == "ap_stcr_v3_soft_disagreement_bounded_continuation"
+    )
+    is_v4 = (
+        ap_version
+        == "ap_stcr_v4_transition_envelope_non_compensatory"
+    )
+    is_semantic_only = ap_version == "ap_stcr_v4_semantic_only_ablation"
     required_values = {
         "SUPERVISION_MODE": "ap_stcr",
         "TEACHER_FUSION_MODE": "dabe_pu_despl_sched",
@@ -203,7 +405,6 @@ def validate_ap_stcr_config(cfg):
         "P_INIT_MODE": "dabe_pu_v11_desplsched",
         "TEACHER_TARGET_MODE": "binary",
         "DABE_PU_STATIC_TARGET_MODE": "soft",
-        "SUPERVISION_HANDOVER_MODE": "linear",
         "FINETUNE_RESET_TIMING": "after_epoch",
         "HEAD_TYPE": "dagp_safe",
     }
@@ -217,6 +418,10 @@ def validate_ap_stcr_config(cfg):
             f"AP-STCR protected protocol mismatch: {mismatched}; "
             f"expected={required_values}."
         )
+    if get_supervision_handover_mode(cfg) != "linear":
+        raise RuntimeError(
+            "AP-STCR requires the original linear supervision handover."
+        )
     required_true = (
         "USE_AP_STCR",
         "USE_DABE_PU",
@@ -227,7 +432,13 @@ def validate_ap_stcr_config(cfg):
         "USE_NDR_BRANCH",
         "USE_NDR_COARSE_AUX",
         "USE_BASE_AUX_LOSS",
+        "FINETUNE_RESET_REBUILD_OPTIMIZER",
+        "FINETUNE_RESET_REBUILD_SCHEDULER",
+        "FINETUNE_RESET_GLOBAL_STEP",
         "FINETUNE_RESET_TEACHER",
+        "FINETUNE_RESET_FORCE_LR_FLOOR",
+        "USE_LR_FLOOR",
+        "LR_FLOOR_APPLY_AFTER_FINETUNE_RESET",
     )
     missing_true = [
         name for name in required_true if not bool(getattr(cfg, name, False))
@@ -273,13 +484,21 @@ def validate_ap_stcr_config(cfg):
         )
     if str(getattr(cfg, "GKD_MODE", "off")).strip().lower() != "off":
         raise RuntimeError("AP-STCR requires GKD_MODE='off'.")
+    is_long45 = is_v2 or is_v3 or is_v4 or is_semantic_only
+    stage_end = 20 if is_long45 else 29
+    teacher_only_start = stage_end + 1
+    max_epoch = 45 if is_long45 else 50
     exact_ints = {
-        "MAX_EPOCH": 50,
+        "MAX_EPOCH": max_epoch,
+        "max_epoch": max_epoch,
         "LOSS_SIZE": 68,
         "DABE_PU_DESPL_STAGE_START": 1,
-        "DABE_PU_DESPL_STAGE_END": 29,
-        "DABE_PU_DESPL_TEACHER_ONLY_START": 30,
-        "FINETUNE_RESET_EPOCH": 29,
+        "DABE_PU_DESPL_STAGE_END": stage_end,
+        "DABE_PU_DESPL_TEACHER_ONLY_START": teacher_only_start,
+        "FUSION_ORIG_DECAY_EPOCHS": stage_end,
+        "TEACHER_FUSION_PRE_RESET_EPOCHS": stage_end - 1,
+        "LR_LINEAR_STAGE1_EPOCHS": stage_end - 1,
+        "FINETUNE_RESET_EPOCH": stage_end,
     }
     bad_ints = {
         name: getattr(cfg, name, None)
@@ -288,7 +507,7 @@ def validate_ap_stcr_config(cfg):
     }
     if bad_ints:
         raise RuntimeError(
-            f"AP-STCR Linear30 boundary mismatch: {bad_ints}; "
+            f"AP-STCR protected schedule boundary mismatch: {bad_ints}; "
             f"expected={exact_ints}."
         )
     exact_floats = {
@@ -296,6 +515,7 @@ def validate_ap_stcr_config(cfg):
         "DABE_PU_DESPL_STATIC_END": 0.05,
         "DABE_PU_DESPL_TEACHER_START": 0.0,
         "DABE_PU_DESPL_TEACHER_END": 0.95,
+        "FUSION_HOLD_FIXED_WEIGHT": 0.05,
         "LAMBDA_NDR_COARSE_AUX": 0.5,
         "LAMBDA_BASE_AUX": 0.5,
         "LAMBDA_BASE_AUX_AFTER_RESET": 0.3,
@@ -315,19 +535,69 @@ def validate_ap_stcr_config(cfg):
         )
     if bool(getattr(cfg, "USE_TEACHER_SOFT_FULL_LOSS", False)):
         raise RuntimeError("AP-STCR requires the binary EMA teacher target.")
-    ap_config = getattr(cfg, "AP_STCR", None)
-    if not isinstance(ap_config, dict):
-        raise RuntimeError("AP-STCR requires an AP_STCR configuration dict.")
     expected_ap = {
         "enabled": True,
         "background_source": "dabe_seed:bg_anchor_37",
-        "history_dtype": "float16",
-        "clear_history_on_reset": True,
         "teacher_binary_comparison": "strict_gt",
         "evidence_resolution": 37,
         "loss_resolution": 68,
-        "temporal_window": 3,
     }
+    if is_v2:
+        expected_ap.update(
+            {
+                "history_dtype": "float16",
+                "temporal_window": 3,
+                "conflict_only": True,
+                "temporal_empty_support": 0.5,
+                "clear_history_on_teacher_reset": True,
+            }
+        )
+    elif is_v3:
+        expected_ap.update(
+            {
+                "history_dtype": "float16",
+                "temporal_window": 3,
+                "temporal_empty_support": 0.5,
+                "clear_history_on_teacher_reset": True,
+                "use_soft_deviation": True,
+                "use_soft_correction_for_semantic": True,
+                "post_reset_teacher_continuation": True,
+            }
+        )
+    elif is_v4:
+        expected_ap.update(
+            {
+                "history_dtype": "float16",
+                "temporal_window": 3,
+                "temporal_empty_support": 0.5,
+                "clear_history_on_teacher_reset": True,
+                "use_soft_deviation": True,
+                "use_soft_correction_for_semantic": True,
+                "evidence_fusion": "negative_soft_or",
+                "use_transition_envelope": True,
+                "post_reset_teacher_continuation": True,
+            }
+        )
+    elif is_semantic_only:
+        expected_ap.update(
+            {
+                "use_soft_deviation": True,
+                "use_soft_correction_for_semantic": True,
+                "evidence_fusion": "semantic_only",
+                "use_temporal_evidence": False,
+                "temporal_history_enabled": False,
+                "use_transition_envelope": True,
+                "post_reset_teacher_continuation": True,
+            }
+        )
+    else:
+        expected_ap.update(
+            {
+                "history_dtype": "float16",
+                "temporal_window": 3,
+                "clear_history_on_reset": True,
+            }
+        )
     bad_ap = {
         name: ap_config.get(name)
         for name, expected in expected_ap.items()
@@ -340,7 +610,404 @@ def validate_ap_stcr_config(cfg):
         )
     if abs(float(ap_config.get("teacher_binary_threshold", -1.0)) - 0.5) > 1e-12:
         raise RuntimeError("AP-STCR requires teacher_binary_threshold=0.5.")
+    if is_v2:
+        if "lambda_semantic" in ap_config or "lambda_temporal" in ap_config:
+            raise RuntimeError(
+                "AP-STCR v2 must remove lambda_semantic/lambda_temporal."
+            )
+        required_v2_floats = {
+            "rejection_max": 0.35,
+            "support_neutral_point": 0.50,
+            "tau_delta": 0.25,
+            "tau_margin": 0.50,
+            "tau_temporal": 0.20,
+        }
+        bad_v2_floats = {
+            name: ap_config.get(name)
+            for name, expected in required_v2_floats.items()
+            if not math.isfinite(
+                float(ap_config.get(name, float("nan")))
+            )
+            or abs(float(ap_config.get(name)) - expected) > 1e-12
+        }
+        if bad_v2_floats:
+            raise RuntimeError(
+                f"AP-STCR v2 numeric mismatch: {bad_v2_floats}; "
+                f"expected={required_v2_floats}."
+            )
+    elif is_v3:
+        forbidden_v3_keys = {
+            "conflict_only",
+            "rejection_max",
+            "support_neutral_point",
+            "lambda_semantic",
+            "lambda_temporal",
+        }
+        present_forbidden = sorted(forbidden_v3_keys.intersection(ap_config))
+        if present_forbidden:
+            raise RuntimeError(
+                "AP-STCR v3 must remove conflict-only/legacy parameters: "
+                f"{present_forbidden}."
+            )
+        required_v3_floats = {
+            "tau_delta": 0.25,
+            "tau_margin": 0.50,
+            "tau_temporal": 0.20,
+            "soft_rejection_strength": 0.35,
+            "min_local_acceptance": 0.65,
+            "post_reset_teacher_start_ratio": 0.95,
+            "post_reset_teacher_end_ratio": 1.00,
+        }
+        bad_v3_floats = {
+            name: ap_config.get(name)
+            for name, expected in required_v3_floats.items()
+            if not math.isfinite(
+                float(ap_config.get(name, float("nan")))
+            )
+            or abs(float(ap_config.get(name)) - expected) > 1e-12
+        }
+        if bad_v3_floats:
+            raise RuntimeError(
+                f"AP-STCR v3 numeric mismatch: {bad_v3_floats}; "
+                f"expected={required_v3_floats}."
+            )
+        rejection_strength = float(
+            ap_config["soft_rejection_strength"]
+        )
+        min_acceptance = float(ap_config["min_local_acceptance"])
+        start_ratio = float(ap_config["post_reset_teacher_start_ratio"])
+        end_ratio = float(ap_config["post_reset_teacher_end_ratio"])
+        if not 0.0 <= rejection_strength <= 1.0:
+            raise RuntimeError(
+                "AP-STCR v3 soft_rejection_strength must be in [0,1]."
+            )
+        if not 0.0 <= min_acceptance <= 1.0:
+            raise RuntimeError(
+                "AP-STCR v3 min_local_acceptance must be in [0,1]."
+            )
+        if abs(min_acceptance - (1.0 - rejection_strength)) > 1e-12:
+            raise RuntimeError(
+                "AP-STCR v3 requires min_local_acceptance == "
+                "1 - soft_rejection_strength."
+            )
+        if not (0.0 <= start_ratio <= end_ratio <= 1.0):
+            raise RuntimeError(
+                "AP-STCR v3 post-reset teacher ratios must satisfy "
+                "0 <= start <= end <= 1."
+            )
+        continuation_start = int(
+            ap_config.get("post_reset_teacher_start_epoch", -1)
+        )
+        continuation_end = int(
+            ap_config.get("post_reset_teacher_end_epoch", -1)
+        )
+        if (
+            continuation_start != teacher_only_start
+            or continuation_end != 25
+            or continuation_end <= continuation_start
+            or continuation_end > max_epoch
+        ):
+            raise RuntimeError(
+                "AP-STCR v3 post-reset continuation boundary mismatch: "
+                f"start={continuation_start}, end={continuation_end}; "
+                f"expected start={teacher_only_start}, end=25 within "
+                f"MAX_EPOCH={max_epoch}."
+            )
+    elif is_v4:
+        forbidden_v4_keys = {
+            "conflict_only",
+            "rejection_max",
+            "support_neutral_point",
+            "lambda_semantic",
+            "lambda_temporal",
+            "soft_rejection_strength",
+            "fused_support",
+            "support_deficiency",
+            "soft_inertia",
+        }
+        present_forbidden = sorted(forbidden_v4_keys.intersection(ap_config))
+        if present_forbidden:
+            raise RuntimeError(
+                "AP-STCR v4 must remove compensatory/legacy acceptance "
+                f"parameters: {present_forbidden}."
+            )
+        allowed_continuation_epoch_keys = {
+            "post_reset_teacher_start_epoch",
+            "post_reset_teacher_end_epoch",
+        }
+        local_epoch_switches = sorted(
+            name
+            for name in ap_config
+            if name not in allowed_continuation_epoch_keys
+            and (
+                str(name).lower().endswith("_start_epoch")
+                or str(name).lower().endswith("_stop_epoch")
+                or str(name).lower().endswith("_end_epoch")
+                or "teacher_only" in str(name).lower()
+                or str(name).lower() in {
+                    "start_epoch",
+                    "stop_epoch",
+                    "end_epoch",
+                    "enable_epoch",
+                    "disable_epoch",
+                }
+            )
+        )
+        if local_epoch_switches:
+            raise RuntimeError(
+                "AP-STCR v4 must not define a local start/stop or "
+                f"teacher-only epoch: {local_epoch_switches}."
+            )
+        required_v4_floats = {
+            "tau_delta": 0.25,
+            "tau_margin": 0.50,
+            "tau_temporal": 0.20,
+            "evidence_rejection_strength": 0.35,
+            "min_local_acceptance": 0.65,
+            "post_reset_teacher_start_ratio": 0.95,
+            "post_reset_teacher_end_ratio": 1.00,
+        }
+        bad_v4_floats = {
+            name: ap_config.get(name)
+            for name, expected in required_v4_floats.items()
+            if not math.isfinite(
+                float(ap_config.get(name, float("nan")))
+            )
+            or abs(float(ap_config.get(name)) - expected) > 1e-12
+        }
+        if bad_v4_floats:
+            raise RuntimeError(
+                f"AP-STCR v4 numeric mismatch: {bad_v4_floats}; "
+                f"expected={required_v4_floats}."
+            )
+        rejection_strength = float(
+            ap_config["evidence_rejection_strength"]
+        )
+        min_acceptance = float(ap_config["min_local_acceptance"])
+        start_ratio = float(ap_config["post_reset_teacher_start_ratio"])
+        end_ratio = float(ap_config["post_reset_teacher_end_ratio"])
+        if not 0.0 <= rejection_strength <= 1.0:
+            raise RuntimeError(
+                "AP-STCR v4 evidence_rejection_strength must be in [0,1]."
+            )
+        if not 0.0 <= min_acceptance <= 1.0:
+            raise RuntimeError(
+                "AP-STCR v4 min_local_acceptance must be in [0,1]."
+            )
+        if abs(min_acceptance - (1.0 - rejection_strength)) > 1e-12:
+            raise RuntimeError(
+                "AP-STCR v4 requires min_local_acceptance == "
+                "1 - evidence_rejection_strength."
+            )
+        if not (0.0 <= start_ratio <= end_ratio <= 1.0):
+            raise RuntimeError(
+                "AP-STCR v4 post-reset teacher ratios must satisfy "
+                "0 <= start <= end <= 1."
+            )
+        continuation_start = int(
+            ap_config.get("post_reset_teacher_start_epoch", -1)
+        )
+        continuation_end = int(
+            ap_config.get("post_reset_teacher_end_epoch", -1)
+        )
+        if (
+            continuation_start != teacher_only_start
+            or continuation_end != 25
+            or continuation_end <= continuation_start
+            or continuation_end > max_epoch
+        ):
+            raise RuntimeError(
+                "AP-STCR v4 post-reset continuation boundary mismatch: "
+                f"start={continuation_start}, end={continuation_end}; "
+                f"expected start={teacher_only_start}, end=25 within "
+                f"MAX_EPOCH={max_epoch}."
+            )
+    elif is_semantic_only:
+        allowed_a1_keys = {
+            "enabled",
+            "version",
+            "fg_anchor_ratio",
+            "bg_anchor_ratio",
+            "min_fg_anchors",
+            "min_bg_anchors",
+            "max_fg_anchors",
+            "max_bg_anchors",
+            "prefer_dabe_background_seed",
+            "background_source",
+            "tau_delta",
+            "tau_margin",
+            "use_soft_deviation",
+            "use_soft_correction_for_semantic",
+            "evidence_fusion",
+            "use_temporal_evidence",
+            "temporal_history_enabled",
+            "use_transition_envelope",
+            "evidence_rejection_strength",
+            "min_local_acceptance",
+            "post_reset_teacher_continuation",
+            "post_reset_teacher_start_ratio",
+            "post_reset_teacher_end_ratio",
+            "post_reset_teacher_start_epoch",
+            "post_reset_teacher_end_epoch",
+            "evidence_resolution",
+            "loss_resolution",
+            "teacher_binary_threshold",
+            "teacher_binary_comparison",
+            "eps",
+            "log_statistics",
+            "log_interval_epoch",
+            "export_visualization",
+            "visualization_interval",
+            "visualization_sample_indices",
+        }
+        unexpected_a1_keys = sorted(set(ap_config).difference(allowed_a1_keys))
+        if unexpected_a1_keys:
+            raise RuntimeError(
+                "AP-STCR A1 forbids temporal/legacy/compensation parameters: "
+                f"{unexpected_a1_keys}."
+            )
+        temporal_parameter_keys = sorted(
+            name
+            for name in ap_config
+            if "temporal" in str(name).lower()
+            and name
+            not in {
+                "use_temporal_evidence",
+                "temporal_history_enabled",
+            }
+        )
+        if temporal_parameter_keys:
+            raise RuntimeError(
+                "AP-STCR A1 must not configure temporal target parameters: "
+                f"{temporal_parameter_keys}."
+            )
+        allowed_continuation_epoch_keys = {
+            "post_reset_teacher_start_epoch",
+            "post_reset_teacher_end_epoch",
+        }
+        local_epoch_switches = sorted(
+            name
+            for name in ap_config
+            if name not in allowed_continuation_epoch_keys
+            and (
+                str(name).lower().endswith("_start_epoch")
+                or str(name).lower().endswith("_stop_epoch")
+                or str(name).lower().endswith("_end_epoch")
+                or "teacher_only" in str(name).lower()
+                or str(name).lower()
+                in {
+                    "start_epoch",
+                    "stop_epoch",
+                    "end_epoch",
+                    "enable_epoch",
+                    "disable_epoch",
+                }
+            )
+        )
+        if local_epoch_switches:
+            raise RuntimeError(
+                "AP-STCR A1 must not define a local start/stop or "
+                f"teacher-only epoch: {local_epoch_switches}."
+            )
+        required_a1_floats = {
+            "fg_anchor_ratio": 0.20,
+            "bg_anchor_ratio": 0.20,
+            "tau_delta": 0.25,
+            "tau_margin": 0.50,
+            "evidence_rejection_strength": 0.35,
+            "min_local_acceptance": 0.65,
+            "post_reset_teacher_start_ratio": 0.95,
+            "post_reset_teacher_end_ratio": 1.00,
+            "eps": 1e-6,
+        }
+        bad_a1_floats = {
+            name: ap_config.get(name)
+            for name, expected in required_a1_floats.items()
+            if not math.isfinite(float(ap_config.get(name, float("nan"))))
+            or abs(float(ap_config.get(name)) - expected) > 1e-12
+        }
+        if bad_a1_floats:
+            raise RuntimeError(
+                f"AP-STCR A1 numeric mismatch: {bad_a1_floats}; "
+                f"expected={required_a1_floats}."
+            )
+        required_a1_ints = {
+            "min_fg_anchors": 4,
+            "min_bg_anchors": 4,
+            "max_fg_anchors": 64,
+            "max_bg_anchors": 64,
+        }
+        bad_a1_ints = {
+            name: ap_config.get(name)
+            for name, expected in required_a1_ints.items()
+            if int(ap_config.get(name, -1)) != expected
+        }
+        if bad_a1_ints:
+            raise RuntimeError(
+                f"AP-STCR A1 anchor-count mismatch: {bad_a1_ints}; "
+                f"expected={required_a1_ints}."
+            )
+        if ap_config.get("prefer_dabe_background_seed") is not True:
+            raise RuntimeError(
+                "AP-STCR A1 requires prefer_dabe_background_seed=True."
+            )
+        rejection_strength = float(
+            ap_config["evidence_rejection_strength"]
+        )
+        min_acceptance = float(ap_config["min_local_acceptance"])
+        start_ratio = float(ap_config["post_reset_teacher_start_ratio"])
+        end_ratio = float(ap_config["post_reset_teacher_end_ratio"])
+        if not 0.0 <= rejection_strength <= 1.0:
+            raise RuntimeError(
+                "AP-STCR A1 evidence_rejection_strength must be in [0,1]."
+            )
+        if not 0.0 <= min_acceptance <= 1.0:
+            raise RuntimeError(
+                "AP-STCR A1 min_local_acceptance must be in [0,1]."
+            )
+        if abs(min_acceptance - (1.0 - rejection_strength)) > 1e-12:
+            raise RuntimeError(
+                "AP-STCR A1 requires min_local_acceptance == "
+                "1 - evidence_rejection_strength."
+            )
+        if not (0.0 <= start_ratio <= end_ratio <= 1.0):
+            raise RuntimeError(
+                "AP-STCR A1 post-reset teacher ratios must satisfy "
+                "0 <= start <= end <= 1."
+            )
+        continuation_start = int(
+            ap_config.get("post_reset_teacher_start_epoch", -1)
+        )
+        continuation_end = int(
+            ap_config.get("post_reset_teacher_end_epoch", -1)
+        )
+        if (
+            continuation_start != teacher_only_start
+            or continuation_end != 25
+            or continuation_end <= continuation_start
+            or continuation_end > max_epoch
+        ):
+            raise RuntimeError(
+                "AP-STCR A1 post-reset continuation boundary mismatch: "
+                f"start={continuation_start}, end={continuation_end}; "
+                f"expected start={teacher_only_start}, end=25 within "
+                f"MAX_EPOCH={max_epoch}."
+            )
     return True
+
+
+def ap_stcr_should_clear_history_on_reset(cfg):
+    ap_config = dict(getattr(cfg, "AP_STCR", {}))
+    if (
+        str(ap_config.get("version", "")).strip()
+        == "ap_stcr_v4_semantic_only_ablation"
+    ):
+        return False
+    if "clear_history_on_teacher_reset" in ap_config:
+        return bool(
+            ap_config["clear_history_on_teacher_reset"]
+        ) and bool(getattr(cfg, "FINETUNE_RESET_TEACHER", False))
+    return bool(ap_config.get("clear_history_on_reset", True))
 
 
 def validate_ppse_v2_config(cfg):
@@ -688,6 +1355,17 @@ def resolve_epoch_supervision_for_training(cfg, epoch, use_pure_despl=False):
             "teacher_binary_used": True,
         }
 
+    if use_cvsa(cfg):
+        return {
+            "fixed_weight": 0.0,
+            "teacher_weight": 0.0,
+            "fusion_mode": "cvsa_current_cross_view_risk",
+            "effective_despl_weight": 0.0,
+            "effective_teacher_weight": 0.0,
+            "target_mode": "cvsa_current_cross_view_risk",
+            "teacher_binary_used": True,
+        }
+
     fixed_weight, teacher_weight, fusion_mode = get_fixed_teacher_weights(
         cfg, epoch
     )
@@ -767,6 +1445,72 @@ def build_ap_stcr_segmentation_group(
     ) / weight_sum
     if not bool(torch.isfinite(loss).item()):
         raise RuntimeError("AP-STCR segmentation group loss is NaN/Inf.")
+    return {
+        "loss": loss,
+        "loss_final": branch_losses["final"],
+        "loss_coarse": branch_losses["coarse"],
+        "loss_base": branch_losses["base"],
+        "final_weight": branch_weights["final"],
+        "coarse_weight": branch_weights.get("coarse", 0.0),
+        "base_weight": branch_weights.get("base", 0.0),
+        "weight_sum": weight_sum,
+    }
+
+
+def build_cvsa_segmentation_group(
+    cfg,
+    epoch,
+    student_out,
+    student_logits,
+    mixed_target,
+):
+    """Apply one detached CVSA target to final/coarse/base without reweight maps."""
+    if not use_cvsa(cfg):
+        raise RuntimeError("CVSA segmentation helper requires USE_CVSA.")
+    if mixed_target.requires_grad:
+        raise RuntimeError("CVSA mixed target must be detached.")
+    branch_losses = {
+        "final": F.binary_cross_entropy_with_logits(
+            student_logits, mixed_target, reduction="mean"
+        )
+    }
+    branch_weights = {"final": 1.0}
+    zero = student_logits.sum() * 0.0
+    branch_losses["coarse"] = zero
+    branch_losses["base"] = zero
+    if bool(getattr(cfg, "USE_NDR_COARSE_AUX", True)):
+        if not isinstance(student_out, dict) or "coarse_logits_68" not in student_out:
+            raise RuntimeError("CVSA requires coarse_logits_68 for NDR auxiliary.")
+        branch_losses["coarse"] = F.binary_cross_entropy_with_logits(
+            resize_logits_for_loss(student_out["coarse_logits_68"], cfg),
+            mixed_target,
+            reduction="mean",
+        )
+        branch_weights["coarse"] = float(
+            getattr(cfg, "LAMBDA_NDR_COARSE_AUX", 0.5)
+        )
+    if bool(getattr(cfg, "USE_BASE_AUX_LOSS", True)):
+        if not isinstance(student_out, dict) or "base_logits" not in student_out:
+            raise RuntimeError("CVSA requires base_logits for DAGP base auxiliary.")
+        branch_losses["base"] = F.binary_cross_entropy_with_logits(
+            resize_logits_for_loss(student_out["base_logits"], cfg),
+            mixed_target,
+            reduction="mean",
+        )
+        branch_weights["base"] = (
+            float(getattr(cfg, "LAMBDA_BASE_AUX", 0.5))
+            if is_before_finetune_reset(cfg, epoch)
+            else float(getattr(cfg, "LAMBDA_BASE_AUX_AFTER_RESET", 0.3))
+        )
+    weight_sum = float(sum(branch_weights.values()))
+    if not math.isfinite(weight_sum) or weight_sum <= 0.0:
+        raise RuntimeError("CVSA branch weight sum must be positive.")
+    loss = sum(
+        branch_weights[name] * branch_losses[name]
+        for name in branch_weights
+    ) / weight_sum
+    if not bool(torch.isfinite(loss).item()):
+        raise RuntimeError("CVSA segmentation group loss is NaN/Inf.")
     return {
         "loss": loss,
         "loss_final": branch_losses["final"],
@@ -921,7 +1665,16 @@ def supervision_handover_audit_epochs(cfg):
     )
     max_epoch = int(getattr(cfg, "MAX_EPOCH", teacher_only_start))
     milestones = {1, 7, 10, 15, 20, stage_end, teacher_only_start, max_epoch}
-    if stage_end > 20:
+    ap_version = str(
+        dict(getattr(cfg, "AP_STCR", {})).get("version", "")
+    ).strip()
+    if ap_version in {
+        "ap_stcr_v3_soft_disagreement_bounded_continuation",
+        "ap_stcr_v4_transition_envelope_non_compensatory",
+        "ap_stcr_v4_semantic_only_ablation",
+    }:
+        milestones.update(range(20, 27))
+    elif stage_end > 20:
         milestones.add(25)
     return tuple(sorted(epoch for epoch in milestones if 1 <= epoch <= max_epoch))
 
@@ -1064,7 +1817,32 @@ def get_dabe_pu_despl_schedule(epoch, cfg):
     teacher_only_start = int(
         getattr(cfg, "DABE_PU_DESPL_TEACHER_ONLY_START", get_reset_epoch(cfg) + 1)
     )
-    if epoch >= teacher_only_start:
+    ap_config = dict(getattr(cfg, "AP_STCR", {}))
+    use_ap_stcr_continuation = (
+        str(ap_config.get("version", "")).strip()
+        in {
+            "ap_stcr_v3_soft_disagreement_bounded_continuation",
+            "ap_stcr_v4_transition_envelope_non_compensatory",
+            "ap_stcr_v4_semantic_only_ablation",
+        }
+        and bool(ap_config.get("post_reset_teacher_continuation", False))
+    )
+    continuation_start = int(
+        ap_config.get("post_reset_teacher_start_epoch", teacher_only_start)
+    )
+    continuation_end = int(
+        ap_config.get("post_reset_teacher_end_epoch", continuation_start)
+    )
+    if use_ap_stcr_continuation and epoch >= continuation_start:
+        teacher_weight = _linear_schedule_value(
+            epoch,
+            continuation_start,
+            continuation_end,
+            float(ap_config.get("post_reset_teacher_start_ratio", 0.95)),
+            float(ap_config.get("post_reset_teacher_end_ratio", 1.0)),
+        )
+        static_weight = 1.0 - teacher_weight
+    elif epoch >= teacher_only_start:
         static_weight, teacher_weight = 0.0, 1.0
     else:
         stage_start = int(getattr(cfg, "DABE_PU_DESPL_STAGE_START", 1))
@@ -1177,12 +1955,60 @@ def get_dabe_pu_despl_static_target_mode(cfg):
     return mode
 
 
-def build_dabe_pu_despl_static_target(cfg, pu_target_soft, pu_weight_map):
+def get_dabe_pu_static_source(cfg):
+    source = str(
+        getattr(cfg, "DABE_PU_STATIC_SOURCE", "target_soft_68")
+    ).strip().lower()
+    if source not in {"target_soft_68", "p_base_68"}:
+        raise RuntimeError(
+            "Unsupported DABE_PU_STATIC_SOURCE="
+            f"{source!r}; expected 'target_soft_68' or 'p_base_68'."
+        )
+    return source
+
+
+def build_dabe_pu_despl_static_target(
+    cfg,
+    pu_target_soft,
+    pu_weight_map,
+    pu_p_base_soft=None,
+):
     mode = get_dabe_pu_despl_static_target_mode(cfg)
+    source = get_dabe_pu_static_source(cfg)
+    if source == "p_base_68":
+        if mode != "soft":
+            raise RuntimeError(
+                "DABE_PU_STATIC_SOURCE='p_base_68' requires "
+                "DABE_PU_STATIC_TARGET_MODE='soft'."
+            )
+        if pu_p_base_soft is None:
+            raise RuntimeError(
+                "DABE_PU_STATIC_SOURCE='p_base_68' requires "
+                "batch['pu_p_base_soft']."
+            )
+        selected_target = pu_p_base_soft
+    else:
+        selected_target = pu_target_soft
+    if tuple(selected_target.shape) != tuple(pu_weight_map.shape):
+        raise RuntimeError(
+            "DABE-PU static target/weight shape mismatch: "
+            f"{list(selected_target.shape)} != {list(pu_weight_map.shape)}"
+        )
+    if selected_target.requires_grad:
+        raise RuntimeError("DABE-PU static target must be detached")
+    if not bool(torch.isfinite(selected_target).all().item()):
+        raise RuntimeError("DABE-PU static target contains NaN/Inf")
+    target_min = float(selected_target.min().item())
+    target_max = float(selected_target.max().item())
+    if target_min < -1e-6 or target_max > 1.0 + 1e-6:
+        raise RuntimeError(
+            "DABE-PU static target must remain in [0,1], got "
+            f"min={target_min:.8f}, max={target_max:.8f}"
+        )
     if mode == "hard_from_target_soft":
         threshold = float(getattr(cfg, "DABE_PU_HARD_THRESH", 0.5))
-        return (pu_target_soft > threshold).float(), pu_weight_map, mode
-    return pu_target_soft, pu_weight_map, mode
+        return (selected_target > threshold).float(), pu_weight_map, mode
+    return selected_target, pu_weight_map, mode
 
 
 def get_rast_pre_reset_scale(cfg, epoch):
@@ -1263,7 +2089,22 @@ def teacher_routing_apply_flag(cfg, branch):
     routing_mode = get_teacher_routing_mode(cfg)
     if routing_mode == "none":
         return True
-    if routing_mode == "ecst" or bool(getattr(cfg, "USE_ECST", False)):
+    if routing_mode == "bitc_v1":
+        fields = {
+            "final": "BITC_APPLY_TO_FINAL",
+            "coarse": "BITC_APPLY_TO_COARSE",
+            "base": "BITC_APPLY_TO_BASE",
+        }
+        return bool(getattr(cfg, fields[branch], True))
+    if routing_mode == "clean_ecst":
+        return bool(
+            getattr(
+                cfg,
+                f"ECST_CLEAN_APPLY_TO_{suffixes[branch]}",
+                True,
+            )
+        )
+    elif routing_mode in {"ecst", "minimal_ecst"} or bool(getattr(cfg, "USE_ECST", False)):
         prefix = "ECST"
     elif bool(getattr(cfg, "USE_TEPR_LITE", False)):
         prefix = "TEPR"
@@ -1275,13 +2116,18 @@ def teacher_routing_apply_flag(cfg, branch):
 def validate_ecst_config(cfg):
     if not bool(getattr(cfg, "USE_ECST", False)):
         return
+    use_clean = bool(getattr(cfg, "USE_DABE_CLEAN", False))
     arbiter_mode = str(
         getattr(cfg, "SOURCE_ARBITER_MODE", "residual_over_ecst")
     ).lower()
     sign_aware_mode = arbiter_mode == "sign_aware_pure_loss_space"
     required_flags = {
-        "USE_DABE_PU": True,
-        "USE_DABE_PU_DESPL_SCHEDULE": True,
+        "USE_DABE_PU": not use_clean,
+        (
+            "USE_DABE_CLEAN_DESPL_SCHEDULE"
+            if use_clean
+            else "USE_DABE_PU_DESPL_SCHEDULE"
+        ): True,
         "USE_DABE_PU_STATIC_LOSS": True,
         "USE_TEACHER_BINARY_FULL_LOSS": True,
         "ECST_USE_PREUPDATE_STATS": True,
@@ -1330,9 +2176,19 @@ def validate_ecst_config(cfg):
         "ECST_VERSION": "v1_state_conditional_asymneg",
         "ECST_TEMPORAL_SCOPE": "extent_teacher_bg_only",
         "ECST_INSUFFICIENT_HISTORY_MODE": "dino_only",
-        "DABE_PU_VERSION": "pu_v11",
-        "P_INIT_MODE": "dabe_pu_v11_desplsched",
-        "TEACHER_FUSION_MODE": "dabe_pu_despl_sched",
+        (
+            "DABE_CLEAN_VERSION" if use_clean else "DABE_PU_VERSION"
+        ): "v1" if use_clean else "pu_v11",
+        "P_INIT_MODE": (
+            "dabe_clean_v1_desplsched"
+            if use_clean
+            else "dabe_pu_v11_desplsched"
+        ),
+        "TEACHER_FUSION_MODE": (
+            "dabe_clean_despl_sched"
+            if use_clean
+            else "dabe_pu_despl_sched"
+        ),
         "TEACHER_TARGET_MODE": "binary",
         "DABE_PU_STATIC_TARGET_MODE": "soft",
         "HEAD_TYPE": "dagp_safe",
@@ -1346,6 +2202,12 @@ def validate_ecst_config(cfg):
         raise RuntimeError(
             f"ECST string configuration mismatch: {mismatched_strings}; "
             f"expected={expected_strings}."
+        )
+    if use_clean and not bool(
+        getattr(cfg, "DABE_CLEAN_USE_LEGACY_ECST_REGIONS", False)
+    ):
+        raise RuntimeError(
+            "Full ECST with DABE-Clean requires routing-only legacy regions."
         )
 
     expected_values = {
@@ -3098,9 +3960,15 @@ def compute_linear_floor_two_stage_lr(epoch, iter_idx, num_iters_per_epoch, cfg)
     return max(lr_floor, float(lr))
 
 
-def build_optimizer_scheduler(cfg, student, lr=None):
+def build_optimizer_scheduler(cfg, student, lr=None, cvsa_router=None):
     # 与 UCOD-DPL 对齐：AdamW + 每 iteration StepLR。
-    optimizer = torch.optim.AdamW(student.parameters(), lr=float(cfg.DINO["lr"] if lr is None else lr))
+    actual_lr = float(cfg.DINO["lr"] if lr is None else lr)
+    parameter_groups = [{"params": student.parameters(), "lr": actual_lr}]
+    if cvsa_router is not None:
+        parameter_groups.append(
+            {"params": cvsa_router.parameters(), "lr": actual_lr}
+        )
+    optimizer = torch.optim.AdamW(parameter_groups, lr=actual_lr)
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer,
         step_size=25,
@@ -3141,13 +4009,19 @@ def apply_finetune_reset(
     scheduler,
     global_step,
     lr_floor_activated_logged,
+    cvsa_router=None,
 ):
     rebuild_optimizer = bool(getattr(cfg, "FINETUNE_RESET_REBUILD_OPTIMIZER", True))
     rebuild_scheduler = bool(getattr(cfg, "FINETUNE_RESET_REBUILD_SCHEDULER", True))
     reset_global_step = bool(getattr(cfg, "FINETUNE_RESET_GLOBAL_STEP", True))
     reset_teacher = bool(getattr(cfg, "FINETUNE_RESET_TEACHER", False))
     if rebuild_optimizer:
-        optimizer, scheduler = build_optimizer_scheduler(cfg, student, lr=complex_head_post_reset_lr(cfg))
+        optimizer, scheduler = build_optimizer_scheduler(
+            cfg,
+            student,
+            lr=complex_head_post_reset_lr(cfg),
+            cvsa_router=cvsa_router,
+        )
     elif rebuild_scheduler:
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer,
@@ -4041,6 +4915,24 @@ def weighted_bce_with_logits(logits, target, weight_map, eps=1e-6):
     loss = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
     loss = loss * weight_map
     return loss.sum() / (weight_map.sum() + float(eps))
+
+
+def dabe_static_bce_with_logits(logits, target, weight_map, cfg, eps=1e-6):
+    """Keep legacy PU weighting intact while making Clean BCE truly unweighted."""
+    if bool(getattr(cfg, "USE_DABE_CLEAN", False)):
+        if weight_map is None:
+            raise RuntimeError("DABE-Clean requires an internal all-one diagnostic map.")
+        if weight_map.requires_grad:
+            raise RuntimeError("DABE-Clean diagnostic weight map must be detached.")
+        if tuple(weight_map.shape) != tuple(target.shape):
+            raise RuntimeError(
+                "DABE-Clean target/diagnostic-map shape mismatch: "
+                f"{list(target.shape)} != {list(weight_map.shape)}"
+            )
+        if not bool(torch.all(weight_map == 1.0).item()):
+            raise RuntimeError("DABE-Clean static BCE must not consume a non-unit map.")
+        return F.binary_cross_entropy_with_logits(logits, target, reduction="mean")
+    return weighted_bce_with_logits(logits, target, weight_map, eps=eps)
 
 
 def teacher_weighted_bce_with_logits(
@@ -6082,7 +6974,29 @@ def teacher_route_bce_with_logits(
                 "TEACHER_ROUTING_MODE='none' requires an exact detached all-one map"
             )
         return F.binary_cross_entropy_with_logits(logits, target, reduction="mean")
-    if routing_mode == "ecst" or bool(getattr(cfg, "USE_ECST", False)):
+    if routing_mode == "bitc_v1":
+        if teacher_map is None:
+            raise RuntimeError("BITC-v1 teacher route map is unavailable")
+        if teacher_map.requires_grad:
+            raise RuntimeError("BITC-v1 teacher route map must be detached")
+        floor = float(getattr(cfg, "BITC_WEIGHT_FLOOR", 0.20))
+        map_min = float(teacher_map.detach().min().item())
+        map_max = float(teacher_map.detach().max().item())
+        if map_min < floor - 1e-6 or map_max > 1.0 + 1e-6:
+            raise RuntimeError(
+                f"BITC-v1 teacher map outside [{floor},1]: {map_min}/{map_max}"
+            )
+        return teacher_weighted_bce_with_logits(
+            logits,
+            target,
+            teacher_map,
+            enabled=True,
+            apply_to_loss=apply_to_loss,
+            eps=eps,
+        )
+    if routing_mode in {"ecst", "minimal_ecst", "clean_ecst"} or bool(
+        getattr(cfg, "USE_ECST", False)
+    ):
         return teacher_weighted_bce_with_logits(
             logits,
             target,
@@ -6119,9 +7033,78 @@ ECST_STATE_KEYS = (
     "teacher_fg_extent",
 )
 
+CLEAN_ECST_AUDIT_HEADERS = (
+    "epoch",
+    "scale",
+    "schedule_scale",
+    "strength_mode",
+    "strength_max",
+    "effective_strength",
+    "erase_strength",
+    "add_strength",
+    "ring_bg_strength",
+    "recovery_strength",
+    "memory_active_ratio",
+    "history_count_mean",
+    "history_valid_ratio",
+    "support_area_mean",
+    "ring_area_mean",
+    "static_strength_mean",
+    "conflict_ratio",
+    "fg_erase_conflict_ratio",
+    "bg_add_conflict_ratio",
+    "erase_conflict_ratio",
+    "add_conflict_ratio",
+    "ring_teacher_fg_ratio",
+    "ring_teacher_bg_ratio",
+    "semantic_fg_tendency_mean",
+    "history_bg_reliability_mean",
+    "negative_weight_mean",
+    "conflict_weight_mean",
+    "erase_effective_weight_mean",
+    "add_effective_weight_mean",
+    "ring_bg_effective_weight_mean",
+    "erase_suppression_mass",
+    "add_suppression_mass",
+    "ring_bg_suppression_mass",
+    "erase_floor_saturation_ratio",
+    "add_floor_saturation_ratio",
+    "ring_bg_floor_saturation_ratio",
+    "positive_static_evidence_mean",
+    "negative_static_evidence_mean",
+    "recoverability_mean",
+    "teacher_fg_ratio",
+    "teacher_bg_ratio",
+    "recovery_suppression_mass",
+    "combined_teacher_bg_suppression_mass",
+    "recovery_effective_weight_mean",
+    "teacher_bg_effective_weight_mean",
+    "teacher_fg_effective_weight_mean",
+    "recovery_floor_saturation_ratio",
+    "teacher_bg_floor_saturation_ratio",
+    "teacher_fg_floor_saturation_ratio",
+    "erase_recovery_overlap_mass",
+    "raw_map_min",
+    "raw_map_mean",
+    "raw_map_max",
+    "teacher_map_min",
+    "teacher_map_mean",
+    "teacher_map_max",
+    "effective_map_min",
+    "effective_map_mean",
+    "effective_map_max",
+    "student_pred_area",
+    "teacher_pred_area",
+    "student_prob_mean",
+    "teacher_prob_mean",
+    "teacher_loss_final",
+    "teacher_loss_coarse",
+    "teacher_loss_base",
+)
 
-def make_ecst_inactive_stats(batch, teacher_prob, device):
-    masks = build_ecst_region_masks(batch, device)
+
+def make_ecst_inactive_stats(batch, teacher_prob, device, region_key_prefix="pu"):
+    masks = build_ecst_region_masks(batch, device, key_prefix=region_key_prefix)
     teacher_fg = teacher_prob >= 0.5
     teacher_bg = ~teacher_fg
     fg_conflict = masks["fg_core"] & teacher_bg
@@ -6323,6 +7306,57 @@ def new_ecst_epoch_accumulator():
         "student_pred_fg_count": 0,
         "teacher_pred_fg_count": 0,
         "prediction_pixels": 0,
+        "minimal_support_area_sum": 0.0,
+        "minimal_ring_area_sum": 0.0,
+        "minimal_static_strength_sum": 0.0,
+        "minimal_conflict_ratio_sum": 0.0,
+        "minimal_ring_teacher_fg_sum": 0.0,
+        "minimal_ring_teacher_bg_sum": 0.0,
+        "minimal_protect_weight_sum": 0.0,
+        "minimal_negative_weight_sum": 0.0,
+        "clean_support_area_sum": 0.0,
+        "clean_ring_area_sum": 0.0,
+        "clean_static_strength_sum": 0.0,
+        "clean_conflict_ratio_sum": 0.0,
+        "clean_fg_erase_conflict_sum": 0.0,
+        "clean_bg_add_conflict_sum": 0.0,
+        "clean_erase_conflict_sum": 0.0,
+        "clean_add_conflict_sum": 0.0,
+        "clean_ring_teacher_fg_sum": 0.0,
+        "clean_ring_teacher_bg_sum": 0.0,
+        "clean_semantic_fg_tendency_sum": 0.0,
+        "clean_history_bg_reliability_sum": 0.0,
+        "clean_negative_weight_sum": 0.0,
+        "clean_conflict_weight_sum": 0.0,
+        "clean_erase_effective_weight_sum": 0.0,
+        "clean_add_effective_weight_sum": 0.0,
+        "clean_ring_bg_effective_weight_sum": 0.0,
+        "clean_erase_suppression_mass_sum": 0.0,
+        "clean_add_suppression_mass_sum": 0.0,
+        "clean_ring_bg_suppression_mass_sum": 0.0,
+        "clean_erase_floor_saturation_sum": 0.0,
+        "clean_add_floor_saturation_sum": 0.0,
+        "clean_ring_bg_floor_saturation_sum": 0.0,
+        "clean_positive_static_evidence_sum": 0.0,
+        "clean_negative_static_evidence_sum": 0.0,
+        "clean_recoverability_sum": 0.0,
+        "clean_teacher_fg_ratio_sum": 0.0,
+        "clean_teacher_bg_ratio_sum": 0.0,
+        "clean_recovery_suppression_mass_sum": 0.0,
+        "clean_combined_teacher_bg_suppression_mass_sum": 0.0,
+        "clean_recovery_effective_weight_sum": 0.0,
+        "clean_teacher_bg_effective_weight_sum": 0.0,
+        "clean_teacher_fg_effective_weight_sum": 0.0,
+        "clean_recovery_floor_saturation_sum": 0.0,
+        "clean_teacher_bg_floor_saturation_sum": 0.0,
+        "clean_teacher_fg_floor_saturation_sum": 0.0,
+        "clean_erase_recovery_overlap_mass_sum": 0.0,
+        "clean_student_prob_sum": 0.0,
+        "clean_teacher_prob_sum": 0.0,
+        "clean_raw_map_sum": 0.0,
+        "clean_raw_map_pixels": 0,
+        "clean_raw_map_min": None,
+        "clean_raw_map_max": None,
     }
 
 
@@ -6331,6 +7365,200 @@ def accumulate_ecst_epoch(accumulator, stats, student_prob, teacher_prob):
     accumulator["memory_active_batches"] += int(bool(stats.get("memory_active", False)))
     accumulator["history_count_mean_sum"] += float(stats["history_count_mean"])
     accumulator["history_valid_ratio_sum"] += float(stats["history_valid_ratio"])
+    if stats.get("routing_mode") == "clean_ecst":
+        pixels = int(student_prob.numel())
+        accumulator["map_sum"] += float(stats["teacher_map_mean"]) * pixels
+        accumulator["map_pixels"] += pixels
+        map_min = float(stats["teacher_map_min"])
+        map_max = float(stats["teacher_map_max"])
+        accumulator["map_min"] = (
+            map_min
+            if accumulator["map_min"] is None
+            else min(accumulator["map_min"], map_min)
+        )
+        accumulator["map_max"] = (
+            map_max
+            if accumulator["map_max"] is None
+            else max(accumulator["map_max"], map_max)
+        )
+        for source, target in (
+            ("support_area", "clean_support_area_sum"),
+            ("ring_area", "clean_ring_area_sum"),
+            ("static_strength_mean", "clean_static_strength_sum"),
+            ("conflict_ratio", "clean_conflict_ratio_sum"),
+            ("fg_erase_conflict_ratio", "clean_fg_erase_conflict_sum"),
+            ("bg_add_conflict_ratio", "clean_bg_add_conflict_sum"),
+            ("erase_conflict_ratio", "clean_erase_conflict_sum"),
+            ("add_conflict_ratio", "clean_add_conflict_sum"),
+            ("ring_teacher_fg_ratio", "clean_ring_teacher_fg_sum"),
+            ("ring_teacher_bg_ratio", "clean_ring_teacher_bg_sum"),
+            (
+                "semantic_fg_tendency_mean",
+                "clean_semantic_fg_tendency_sum",
+            ),
+            (
+                "history_bg_reliability_mean",
+                "clean_history_bg_reliability_sum",
+            ),
+            ("negative_weight_mean", "clean_negative_weight_sum"),
+            ("conflict_weight_mean", "clean_conflict_weight_sum"),
+            (
+                "erase_effective_weight_mean",
+                "clean_erase_effective_weight_sum",
+            ),
+            (
+                "add_effective_weight_mean",
+                "clean_add_effective_weight_sum",
+            ),
+            (
+                "ring_bg_effective_weight_mean",
+                "clean_ring_bg_effective_weight_sum",
+            ),
+            (
+                "erase_suppression_mass",
+                "clean_erase_suppression_mass_sum",
+            ),
+            (
+                "add_suppression_mass",
+                "clean_add_suppression_mass_sum",
+            ),
+            (
+                "ring_bg_suppression_mass",
+                "clean_ring_bg_suppression_mass_sum",
+            ),
+            (
+                "erase_floor_saturation_ratio",
+                "clean_erase_floor_saturation_sum",
+            ),
+            (
+                "add_floor_saturation_ratio",
+                "clean_add_floor_saturation_sum",
+            ),
+            (
+                "ring_bg_floor_saturation_ratio",
+                "clean_ring_bg_floor_saturation_sum",
+            ),
+        ):
+            accumulator[target] += float(stats[source])
+        for source, target in (
+            (
+                "positive_static_evidence_mean",
+                "clean_positive_static_evidence_sum",
+            ),
+            (
+                "negative_static_evidence_mean",
+                "clean_negative_static_evidence_sum",
+            ),
+            ("recoverability_mean", "clean_recoverability_sum"),
+            ("teacher_fg_ratio", "clean_teacher_fg_ratio_sum"),
+            ("teacher_bg_ratio", "clean_teacher_bg_ratio_sum"),
+            (
+                "recovery_suppression_mass",
+                "clean_recovery_suppression_mass_sum",
+            ),
+            (
+                "combined_teacher_bg_suppression_mass",
+                "clean_combined_teacher_bg_suppression_mass_sum",
+            ),
+            (
+                "recovery_effective_weight_mean",
+                "clean_recovery_effective_weight_sum",
+            ),
+            (
+                "teacher_bg_effective_weight_mean",
+                "clean_teacher_bg_effective_weight_sum",
+            ),
+            (
+                "teacher_fg_effective_weight_mean",
+                "clean_teacher_fg_effective_weight_sum",
+            ),
+            (
+                "recovery_floor_saturation_ratio",
+                "clean_recovery_floor_saturation_sum",
+            ),
+            (
+                "teacher_bg_floor_saturation_ratio",
+                "clean_teacher_bg_floor_saturation_sum",
+            ),
+            (
+                "teacher_fg_floor_saturation_ratio",
+                "clean_teacher_fg_floor_saturation_sum",
+            ),
+            (
+                "erase_recovery_overlap_mass",
+                "clean_erase_recovery_overlap_mass_sum",
+            ),
+        ):
+            accumulator[target] += float(stats.get(source, 0.0))
+        accumulator["clean_student_prob_sum"] += float(
+            student_prob.detach().sum().item()
+        )
+        accumulator["clean_teacher_prob_sum"] += float(
+            teacher_prob.detach().sum().item()
+        )
+        accumulator["student_pred_fg_count"] += int(
+            (student_prob > 0.5).sum().detach().item()
+        )
+        accumulator["teacher_pred_fg_count"] += int(
+            (teacher_prob > 0.5).sum().detach().item()
+        )
+        accumulator["prediction_pixels"] += pixels
+        accumulator["clean_raw_map_sum"] += float(
+            stats["teacher_map_raw_mean"]
+        ) * pixels
+        accumulator["clean_raw_map_pixels"] += pixels
+        raw_min = float(stats["teacher_map_raw_min"])
+        raw_max = float(stats["teacher_map_raw_max"])
+        accumulator["clean_raw_map_min"] = (
+            raw_min
+            if accumulator["clean_raw_map_min"] is None
+            else min(accumulator["clean_raw_map_min"], raw_min)
+        )
+        accumulator["clean_raw_map_max"] = (
+            raw_max
+            if accumulator["clean_raw_map_max"] is None
+            else max(accumulator["clean_raw_map_max"], raw_max)
+        )
+        return
+    if "support_area" in stats:
+        accumulator["map_sum"] += float(stats["teacher_map_mean"]) * int(
+            student_prob.numel()
+        )
+        accumulator["map_pixels"] += int(student_prob.numel())
+        map_min = float(stats["teacher_map_min"])
+        map_max = float(stats["teacher_map_max"])
+        accumulator["map_min"] = (
+            map_min
+            if accumulator["map_min"] is None
+            else min(accumulator["map_min"], map_min)
+        )
+        accumulator["map_max"] = (
+            map_max
+            if accumulator["map_max"] is None
+            else max(accumulator["map_max"], map_max)
+        )
+        for source, target in (
+            ("support_area", "minimal_support_area_sum"),
+            ("ring_area", "minimal_ring_area_sum"),
+            ("static_strength_mean", "minimal_static_strength_sum"),
+            ("conflict_ratio", "minimal_conflict_ratio_sum"),
+            ("ring_teacher_fg_ratio", "minimal_ring_teacher_fg_sum"),
+            ("ring_teacher_bg_ratio", "minimal_ring_teacher_bg_sum"),
+            ("protect_weight_mean", "minimal_protect_weight_sum"),
+            (
+                "negative_verified_weight_mean",
+                "minimal_negative_weight_sum",
+            ),
+        ):
+            accumulator[target] += float(stats[source])
+        accumulator["student_pred_fg_count"] += int(
+            (student_prob >= 0.5).sum().detach().item()
+        )
+        accumulator["teacher_pred_fg_count"] += int(
+            (teacher_prob >= 0.5).sum().detach().item()
+        )
+        accumulator["prediction_pixels"] += int(student_prob.numel())
+        return
     accumulator["temporal_var_mean_sum"] += float(stats["temporal_var_mean"])
     accumulator["temporal_reliability_mean_sum"] += float(
         stats["temporal_reliability_mean"]
@@ -6402,6 +7630,198 @@ def log_ecst_first_batch(logger, cfg, epoch, sample_indices, stats, student_prob
         "[ECST FirstBatch] student/teacher area="
         f"{float((student_prob >= 0.5).float().mean().detach().item()):.6f}/"
         f"{float((teacher_prob >= 0.5).float().mean().detach().item()):.6f}"
+    )
+
+
+def log_ecst_minimal_first_batch(
+    logger, cfg, epoch, sample_indices, stats, student_prob, teacher_prob
+):
+    logger.log(
+        f"[ECST-Minimal FirstBatch] epoch={int(epoch):03d} | "
+        f"version={getattr(cfg, 'ECST_MINIMAL_VERSION', '')} | "
+        f"radius={int(getattr(cfg, 'ECST_MINIMAL_RING_RADIUS', 1))} | "
+        f"sample_indices={sample_indices.tolist()} | "
+        f"scale={float(stats['ecst_scale']):.8f} | "
+        f"history={int(stats['history_count_min'])}/"
+        f"{float(stats['history_count_mean']):.4f}/"
+        f"{int(stats['history_count_max'])} | "
+        f"history_valid_ratio={float(stats['history_valid_ratio']):.6f}"
+    )
+    logger.log(
+        "[ECST-Minimal FirstBatch] support/ring/strength/conflict="
+        f"{float(stats['support_area']):.6f}/"
+        f"{float(stats['ring_area']):.6f}/"
+        f"{float(stats['static_strength_mean']):.6f}/"
+        f"{float(stats['conflict_ratio']):.6f} | ring teacher-fg/bg="
+        f"{float(stats['ring_teacher_fg_ratio']):.6f}/"
+        f"{float(stats['ring_teacher_bg_ratio']):.6f} | protect/negative="
+        f"{float(stats['protect_weight_mean']):.6f}/"
+        f"{float(stats['negative_verified_weight_mean']):.6f}"
+    )
+    logger.log(
+        "[ECST-Minimal FirstBatch] map min/mean/max="
+        f"{float(stats['teacher_map_min']):.6f}/"
+        f"{float(stats['teacher_map_mean']):.6f}/"
+        f"{float(stats['teacher_map_max']):.6f} | student/teacher area="
+        f"{float((student_prob >= 0.5).float().mean().item()):.6f}/"
+        f"{float((teacher_prob >= 0.5).float().mean().item()):.6f}"
+    )
+
+
+def log_ecst_clean_first_batch(
+    logger, cfg, epoch, sample_indices, stats, student_prob, teacher_prob
+):
+    if stats["strength_mode"] == "directional_continuous":
+        logger.log(
+            f"[Clean-ECST v5 FirstBatch] epoch={int(epoch):03d} | "
+            f"version={getattr(cfg, 'ECST_CLEAN_VERSION', '')} | "
+            f"sample_indices={sample_indices.tolist()} | "
+            f"schedule_scale={float(stats['schedule_scale']):.8f} | "
+            "erase/add/recovery_strength="
+            f"{float(stats['erase_strength']):.6f}/"
+            f"{float(stats['add_strength']):.6f}/"
+            f"{float(stats['recovery_strength']):.6f} | "
+            "hard_ring_used=False"
+        )
+        logger.log(
+            "[Clean-ECST v5 FirstBatch] positive/negative_static_evidence_mean="
+            f"{float(stats['positive_static_evidence_mean']):.6f}/"
+            f"{float(stats['negative_static_evidence_mean']):.6f} | "
+            f"recoverability_mean={float(stats['recoverability_mean']):.6f} | "
+            "teacher_fg/bg_ratio="
+            f"{float(stats['teacher_fg_ratio']):.6f}/"
+            f"{float(stats['teacher_bg_ratio']):.6f} | "
+            "history_count_mean/valid_ratio/bg_reliability="
+            f"{float(stats['history_count_mean']):.6f}/"
+            f"{float(stats['history_valid_ratio']):.6f}/"
+            f"{float(stats['history_bg_reliability_mean']):.6f}"
+        )
+        logger.log(
+            "[Clean-ECST v5 FirstBatch] erase/recovery/add/combined_bg_"
+            "suppression_mass="
+            f"{float(stats['erase_suppression_mass']):.6f}/"
+            f"{float(stats['recovery_suppression_mass']):.6f}/"
+            f"{float(stats['add_suppression_mass']):.6f}/"
+            f"{float(stats['combined_teacher_bg_suppression_mass']):.6f} | "
+            "erase_recovery_overlap_mass="
+            f"{float(stats['erase_recovery_overlap_mass']):.6f}"
+        )
+        logger.log(
+            "[Clean-ECST v5 FirstBatch] erase/recovery/teacher_bg/teacher_fg_"
+            "effective_weight_mean="
+            f"{float(stats['erase_effective_weight_mean']):.6f}/"
+            f"{float(stats['recovery_effective_weight_mean']):.6f}/"
+            f"{float(stats['teacher_bg_effective_weight_mean']):.6f}/"
+            f"{float(stats['teacher_fg_effective_weight_mean']):.6f} | "
+            "floor_saturation="
+            f"{float(stats['erase_floor_saturation_ratio']):.6f}/"
+            f"{float(stats['recovery_floor_saturation_ratio']):.6f}/"
+            f"{float(stats['teacher_bg_floor_saturation_ratio']):.6f}/"
+            f"{float(stats['teacher_fg_floor_saturation_ratio']):.6f}"
+        )
+        logger.log(
+            "[Clean-ECST v5 FirstBatch] effective_map_min/mean/max="
+            f"{float(stats['teacher_map_min']):.6f}/"
+            f"{float(stats['teacher_map_mean']):.6f}/"
+            f"{float(stats['teacher_map_max']):.6f} | "
+            "student/teacher_prob_mean="
+            f"{float(student_prob.mean().item()):.6f}/"
+            f"{float(teacher_prob.mean().item()):.6f} | "
+            "student/teacher_pred_area="
+            f"{float((student_prob > 0.5).float().mean().item()):.6f}/"
+            f"{float((teacher_prob > 0.5).float().mean().item()):.6f}"
+        )
+        return
+    if stats["strength_mode"] == "directional":
+        strength_summary = (
+            "strength_mode=directional | erase/add/ring_bg_strength="
+            f"{float(stats['erase_strength']):.6f}/"
+            f"{float(stats['add_strength']):.6f}/"
+            f"{float(stats['ring_bg_strength']):.6f}"
+        )
+    elif stats["strength_mode"] == "directional_continuous":
+        strength_summary = (
+            "strength_mode=directional_continuous | "
+            "erase/add/recovery_strength="
+            f"{float(stats['erase_strength']):.6f}/"
+            f"{float(stats['add_strength']):.6f}/"
+            f"{float(stats['recovery_strength']):.6f} | hard_ring_used=False"
+        )
+    else:
+        strength_summary = (
+            "strength_mode=uniform | strength_max/effective_strength="
+            f"{float(stats['strength_max']):.6f}/"
+            f"{float(stats['effective_strength']):.8f}"
+        )
+    logger.log(
+        f"[Clean-ECST FirstBatch] epoch={int(epoch):03d} | "
+        f"version={getattr(cfg, 'ECST_CLEAN_VERSION', '')} | "
+        f"sample_indices={sample_indices.tolist()} | "
+        f"schedule_scale={float(stats['schedule_scale']):.8f} | "
+        f"{strength_summary} | "
+        "support/ring/teacher_fg="
+        f"{float(stats['support_area']):.6f}/"
+        f"{float(stats['ring_area']):.6f}/"
+        f"{float(stats['teacher_fg_area']):.6f}"
+    )
+    logger.log(
+        "[Clean-ECST FirstBatch] static_strength min/mean/max="
+        f"{float(stats['static_strength_min']):.6f}/"
+        f"{float(stats['static_strength_mean']):.6f}/"
+        f"{float(stats['static_strength_max']):.6f} | "
+        "conflict_ratio/foreground_erase_conflict_ratio/"
+        "background_add_conflict_ratio="
+        f"{float(stats['conflict_ratio']):.6f}/"
+        f"{float(stats['fg_erase_conflict_ratio']):.6f}/"
+        f"{float(stats['bg_add_conflict_ratio']):.6f} | "
+        "ring_teacher_fg_ratio/ring_teacher_bg_ratio="
+        f"{float(stats['ring_teacher_fg_ratio']):.6f}/"
+        f"{float(stats['ring_teacher_bg_ratio']):.6f}"
+    )
+    logger.log(
+        "[Clean-ECST FirstBatch] semantic_fg_tendency min/mean/max="
+        f"{float(stats['semantic_fg_tendency_min']):.6f}/"
+        f"{float(stats['semantic_fg_tendency_mean']):.6f}/"
+        f"{float(stats['semantic_fg_tendency_max']):.6f} | "
+        "history_bg_reliability min/mean/max="
+        f"{float(stats['history_bg_reliability_min']):.6f}/"
+        f"{float(stats['history_bg_reliability_mean']):.6f}/"
+        f"{float(stats['history_bg_reliability_max']):.6f}"
+    )
+    logger.log(
+        "[Clean-ECST FirstBatch] raw_map min/mean/max="
+        f"{float(stats['teacher_map_raw_min']):.6f}/"
+        f"{float(stats['teacher_map_raw_mean']):.6f}/"
+        f"{float(stats['teacher_map_raw_max']):.6f} | effective_map="
+        f"{float(stats['teacher_map_min']):.6f}/"
+        f"{float(stats['teacher_map_mean']):.6f}/"
+        f"{float(stats['teacher_map_max']):.6f} | "
+        "map_on_support/map_on_ring_teacher_fg/"
+        "map_on_ring_teacher_bg/map_outside_support_ring="
+        f"{float(stats['map_on_support']):.6f}/"
+        f"{float(stats['map_on_ring_teacher_fg']):.6f}/"
+        f"{float(stats['map_on_ring_teacher_bg']):.6f}/"
+        f"{float(stats['map_outside_support_ring']):.6f}"
+    )
+    logger.log(
+        "[Clean-ECST FirstBatch] student/teacher area="
+        f"{float((student_prob > 0.5).float().mean().item()):.6f}/"
+        f"{float((teacher_prob > 0.5).float().mean().item()):.6f} | "
+        "legacy_pu_cache_used=False | legacy_regions_loaded=False"
+    )
+    logger.log(
+        "[Clean-ECST FirstBatch] erase/add/ring_bg effective_weight_mean="
+        f"{float(stats['erase_effective_weight_mean']):.6f}/"
+        f"{float(stats['add_effective_weight_mean']):.6f}/"
+        f"{float(stats['ring_bg_effective_weight_mean']):.6f} | "
+        "suppression_mass="
+        f"{float(stats['erase_suppression_mass']):.6f}/"
+        f"{float(stats['add_suppression_mass']):.6f}/"
+        f"{float(stats['ring_bg_suppression_mass']):.6f} | "
+        "floor_saturation_ratio="
+        f"{float(stats['erase_floor_saturation_ratio']):.6f}/"
+        f"{float(stats['add_floor_saturation_ratio']):.6f}/"
+        f"{float(stats['ring_bg_floor_saturation_ratio']):.6f}"
     )
 
 
@@ -9056,6 +10476,43 @@ def build_ap_stcr_checkpoint_extra(
         "global_step": int(global_step),
         "rng_state": capture_rng_state(),
         "train_loader_generator_state": train_loader_generator.get_state(),
+    }
+
+
+def cvsa_checkpoint_phase(cfg, epoch):
+    epoch = int(epoch)
+    reset_epoch = get_reset_epoch(cfg)
+    if is_after_epoch_finetune_reset(cfg) and epoch == reset_epoch:
+        return "pending_after_epoch_reset"
+    if epoch > reset_epoch:
+        return "post_reset_active"
+    return "pre_reset_active"
+
+
+def build_cvsa_checkpoint_extra(
+    cfg,
+    epoch,
+    global_step,
+    cvsa_router,
+    protocol_fingerprint,
+    train_loader_generator,
+):
+    config = dict(getattr(cfg, "CVSA"))
+    return {
+        "cvsa_router": (
+            cvsa_router.state_dict() if cvsa_router is not None else None
+        ),
+        "cvsa_route_mode": str(config["route_mode"]),
+        "cvsa_protocol_fingerprint": str(protocol_fingerprint),
+        "checkpoint_phase": cvsa_checkpoint_phase(cfg, epoch),
+        "global_step": int(global_step),
+        "rng_state": capture_rng_state(),
+        "train_loader_generator_state": train_loader_generator.get_state(),
+        "cvsa_global_schedule_used": False,
+        "cvsa_epoch_ratio_used": False,
+        "cvsa_future_teacher_used": False,
+        "cvsa_temporal_history_allocated": False,
+        "cvsa_training_gt_used": False,
     }
 
 
@@ -11763,6 +13220,18 @@ def log_cache_summary(logger, cfg, train_dataset):
         logger.log(f"hflip feature cache path = {train_dataset.hflip_feature_root}")
         logger.log(f"first hflip feature cache file = {train_dataset.hflip_first_cache_path}")
         logger.log(f"hflip feature shape example = {train_dataset.hflip_feature_shape}")
+    if use_cvsa(cfg):
+        logger.log(f"CVSA hflip feature cache path = {train_dataset.hflip_feature_root}")
+        logger.log(f"first CVSA hflip feature file = {train_dataset.hflip_first_cache_path}")
+        logger.log(f"CVSA hflip feature shape example = {train_dataset.hflip_feature_shape}")
+        logger.log(
+            "CVSA hflip fixed cache path = "
+            f"{train_dataset.cvsa_fixed_hflip_root}"
+        )
+        logger.log(
+            "first CVSA hflip fixed file = "
+            f"{train_dataset.cvsa_fixed_hflip_first_cache_path}"
+        )
     logger.log(f"pseudo shape example = {train_dataset.pseudo_shape}")
     if getattr(cfg, "USE_DABE_PSEUDO", False):
         logger.log(f"DABE pseudo cache path = {train_dataset.dabe_cache_root}")
@@ -11798,12 +13267,19 @@ def log_cache_summary(logger, cfg, train_dataset):
             "dabe_pu_v12_shape_desplsched",
         }:
             logger.log(f"p_init_mode = {getattr(cfg, 'P_INIT_MODE', '')}")
+            static_source = get_dabe_pu_static_source(cfg)
             if get_dabe_pu_despl_teacher_target_mode(cfg) == "soft_prob":
-                logger.log("p_init_formula = target_soft_68 weighted BCE + DESPL-style full teacher soft BCE")
+                logger.log(
+                    f"p_init_formula = {static_source} weighted BCE + "
+                    "DESPL-style full teacher soft BCE"
+                )
             elif get_dabe_pu_despl_static_target_mode(cfg) == "hard_from_target_soft":
                 logger.log("p_init_formula = target_hard_from_target_soft_68 weighted BCE + DESPL-style full teacher binary BCE")
             else:
-                logger.log("p_init_formula = target_soft_68 weighted BCE + DESPL-style full teacher binary BCE")
+                logger.log(
+                    f"p_init_formula = {static_source} weighted BCE + "
+                    "DESPL-style full teacher binary BCE"
+                )
             logger.log("use_despl_pseudo = False")
             logger.log("use_fixed_in_pseudo = False")
             logger.log("fixed_used_for_training = False")
@@ -12079,6 +13555,53 @@ def log_first_batch_pseudo(logger, cfg, train_dataset):
     if getattr(cfg, "USE_DABE_PU", False):
         pu_target = batch["pu_target_soft"].float()
         pu_weight = batch["pu_weight_map"].float()
+        static_source = get_dabe_pu_static_source(cfg)
+        pu_p_base = (
+            batch["pu_p_base_soft"].float()
+            if "pu_p_base_soft" in batch
+            else None
+        )
+        selected_static_target, _, selected_static_mode = (
+            build_dabe_pu_despl_static_target(
+                cfg,
+                pu_target,
+                pu_weight,
+                pu_p_base_soft=pu_p_base,
+            )
+        )
+        expected_static_target = (
+            pu_p_base if static_source == "p_base_68" else pu_target
+        )
+        selected_matches_source = bool(
+            torch.equal(selected_static_target, expected_static_target)
+        )
+        if not selected_matches_source:
+            raise RuntimeError(
+                "First-batch DABE-PU static target does not match its selected source"
+            )
+        effective_static_weight, effective_static_weight_mode = (
+            build_effective_static_weight(
+                cfg=cfg,
+                batch=batch,
+                raw_weight_map=pu_weight,
+                device=torch.device("cpu"),
+            )
+        )
+        effective_weight_all_ones = bool(
+            torch.equal(
+                effective_static_weight,
+                torch.ones_like(effective_static_weight),
+            )
+        )
+        if (
+            static_source == "p_base_68"
+            and effective_static_weight_mode == "ones"
+            and not effective_weight_all_ones
+        ):
+            raise RuntimeError(
+                "p_base_68 no-ECST ablation requires an exact all-ones "
+                "effective static weight"
+            )
         pu_hard_thresh = float(getattr(cfg, "DABE_PU_HARD_THRESH", 0.5))
         pu_target_hard = (pu_target > pu_hard_thresh).float()
         logger.log(f"first batch pu_target_soft shape = {list(pu_target.shape)}")
@@ -12087,6 +13610,42 @@ def log_first_batch_pseudo(logger, cfg, train_dataset):
             f"{float(pu_target.min().item()):.6f}/"
             f"{float(pu_target.max().item()):.6f}/"
             f"{float(pu_target.mean().item()):.6f}"
+        )
+        if pu_p_base is not None:
+            logger.log(f"first batch pu_p_base_soft shape = {list(pu_p_base.shape)}")
+            logger.log(
+                "first batch pu_p_base_soft min/max/mean = "
+                f"{float(pu_p_base.min().item()):.6f}/"
+                f"{float(pu_p_base.max().item()):.6f}/"
+                f"{float(pu_p_base.mean().item()):.6f}"
+            )
+            logger.log(
+                "first batch pu_p_base_soft differs from pu_target_soft = "
+                f"{not bool(torch.equal(pu_p_base, pu_target))}"
+            )
+        logger.log(f"first batch static_target_source = {static_source}")
+        logger.log(f"first batch static_target_mode = {selected_static_mode}")
+        logger.log(
+            "first batch selected_static_target min/max/mean = "
+            f"{float(selected_static_target.min().item()):.6f}/"
+            f"{float(selected_static_target.max().item()):.6f}/"
+            f"{float(selected_static_target.mean().item()):.6f}"
+        )
+        logger.log(
+            "first batch selected_static_target finite/detached/"
+            "matches_source = "
+            f"{bool(torch.isfinite(selected_static_target).all().item())}/"
+            f"{not selected_static_target.requires_grad}/"
+            f"{selected_matches_source}"
+        )
+        logger.log(
+            "first batch effective_static_weight mode/min/mean/max/"
+            "all_ones = "
+            f"{effective_static_weight_mode}/"
+            f"{float(effective_static_weight.min().item()):.6f}/"
+            f"{float(effective_static_weight.mean().item()):.6f}/"
+            f"{float(effective_static_weight.max().item()):.6f}/"
+            f"{effective_weight_all_ones}"
         )
         logger.log(
             "first batch pu_target_hard min/max/mean = "
@@ -13458,6 +15017,44 @@ def compute_drepp_anchor_loss(cfg, student_logits, batch, device, criterion_none
     return lambda_anchor * loss_sample.mean()
 
 
+def validate_oed_baseline_contract(cfg, oed_config):
+    """Protect the Long45 no-ECST baseline while OED is enabled."""
+
+    if str(oed_config["mode"]) == "none":
+        return
+    expected = {
+        "USE_DABE_PU": True,
+        "USE_DABE_PU_DESPL_SCHEDULE": True,
+        "DABE_PU_VERSION": "pu_v11",
+        "DABE_PU_STATIC_TARGET_MODE": "soft",
+        "TEACHER_FUSION_MODE": "dabe_pu_despl_sched",
+        "USE_ECST": False,
+        "TEACHER_ROUTING_MODE": "none",
+        "STATIC_WEIGHT_MODE": "ones",
+        "USE_DAGP_SAFE_HEAD": True,
+        "USE_NDR_BRANCH": True,
+        "MAX_EPOCH": 45,
+        "FINETUNE_RESET_EPOCH": 20,
+        "FINETUNE_RESET_TIMING": "after_epoch",
+        "LOSS_SIZE": 68,
+    }
+    mismatched = {
+        name: getattr(cfg, name, None)
+        for name, value in expected.items()
+        if getattr(cfg, name, None) != value
+    }
+    if mismatched:
+        raise RuntimeError(
+            "OED-v1 must remain an auxiliary-only change to the stable "
+            f"Long45 no-ECST baseline; mismatched fields={mismatched}."
+        )
+    if any(
+        bool(getattr(cfg, field, False))
+        for field in ("USE_AP_STCR", "USE_CVSA", "USE_PSSF")
+    ):
+        raise RuntimeError("OED-v1 cannot be combined with AP-STCR, CVSA, or PSSF.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train clean cached-DINO EMA baseline.")
     parser.add_argument("--config", required=True)
@@ -13467,6 +15064,7 @@ def main():
     parser.add_argument("--max_epochs", type=int, default=None)
     parser.add_argument("--stop_after_epoch", type=int, default=0)
     parser.add_argument("--debug_loader_only", action="store_true")
+    parser.add_argument("--debug_bitc", action="store_true")
     parser.add_argument("--work_dir", default=None)
     parser.add_argument("--resume", default=None)
     args = parser.parse_args()
@@ -13483,11 +15081,26 @@ def main():
         raise ValueError("--resume cannot be combined with --debug_loader_only.")
 
     cfg = load_config(args.config)
+    oed_config = validate_oed_config(cfg)
+    validate_oed_baseline_contract(cfg, oed_config)
+    oed_enabled = str(oed_config["mode"]) != "none"
     pssf_enabled = validate_pssf_config(cfg)
     ap_stcr_enabled = validate_ap_stcr_config(cfg)
+    cvsa_enabled = validate_cvsa_config(cfg)
+    bitc_enabled = validate_bitc_config(cfg)
+    bitc_debug_enabled = bool(
+        args.debug_bitc or getattr(cfg, "BITC_DEBUG", False)
+    )
+    if bitc_debug_enabled and not bitc_enabled:
+        raise RuntimeError("--debug_bitc requires a BITC-v1 configuration.")
     teacher_routing_mode = validate_teacher_routing_config(cfg)
-    if pssf_enabled:
-        supervision_handover_mode = "disabled_by_pssf"
+    ecst_minimal_enabled = validate_ecst_minimal_config(cfg)
+    ecst_clean_enabled = validate_ecst_clean_config(cfg)
+    dabe_clean_enabled = bool(getattr(cfg, "USE_DABE_CLEAN", False))
+    if pssf_enabled or cvsa_enabled:
+        supervision_handover_mode = (
+            "disabled_by_pssf" if pssf_enabled else "disabled_by_cvsa"
+        )
         supervision_handover_gamma = 1.0
     else:
         (
@@ -13495,13 +15108,14 @@ def main():
             supervision_handover_gamma,
         ) = validate_supervision_handover_config(cfg)
     static_weight_mode = (
-        "disabled_by_pssf"
-        if pssf_enabled
+        "disabled_by_state_target"
+        if pssf_enabled or cvsa_enabled
         else get_static_weight_mode(cfg)
     )
     static_weight_audit_enabled = bool(
         not pssf_enabled
         and not ap_stcr_enabled
+        and not cvsa_enabled
         and
         hasattr(cfg, "STATIC_WEIGHT_MODE")
         and bool(getattr(cfg, "USE_DABE_PU", False))
@@ -13512,6 +15126,8 @@ def main():
         and not static_weight_audit_enabled
         and not pssf_enabled
         and not ap_stcr_enabled
+        and not cvsa_enabled
+        and not dabe_clean_enabled
     ):
         raise RuntimeError(
             "STATIC_WEIGHT_MODE is only supported by the DABE-PU DESPL-style "
@@ -13574,6 +15190,7 @@ def main():
         or bool(getattr(cfg, "USE_DESPL_PSEUDO", False))
         or bool(getattr(cfg, "USE_DABE_PSEUDO", False))
         or bool(getattr(cfg, "USE_DABE_PU", False))
+        or bool(getattr(cfg, "USE_DABE_CLEAN", False))
     ):
         raise RuntimeError("USE_DREPP=True cannot be combined with USE_QRA, USE_CCR, USE_DESPL_PSEUDO, USE_DABE_PSEUDO, or USE_DABE_PU.")
     if bool(getattr(cfg, "USE_DESPL_PSEUDO", False)) and (
@@ -13611,6 +15228,14 @@ def main():
             )
         if str(getattr(cfg, "DABE_PU_VERSION", "")).lower() not in {"pu_v11", "pu_v12_shape_complete"}:
             raise RuntimeError("USE_DABE_PU=True requires DABE_PU_VERSION in {'pu_v11', 'pu_v12_shape_complete'}.")
+        dabe_pu_static_source = get_dabe_pu_static_source(cfg)
+        if (
+            dabe_pu_static_source == "p_base_68"
+            and get_dabe_pu_despl_static_target_mode(cfg) != "soft"
+        ):
+            raise RuntimeError(
+                "DABE_PU_STATIC_SOURCE='p_base_68' requires soft static targets."
+            )
         if str(getattr(cfg, "TEACHER_FUSION_MODE", "")).lower() not in {
             "dabe_pu_conf",
             "dabe_pu_balanced_v2",
@@ -13885,6 +15510,94 @@ def main():
         raise RuntimeError("USE_NDR_V2=True requires USE_DABE_PU=True.")
     elif use_hr_bfr(cfg):
         raise RuntimeError("USE_HR_BFR=True requires USE_DABE_PU=True.")
+    if dabe_clean_enabled:
+        if any(
+            bool(getattr(cfg, field, False))
+            for field in (
+                "USE_DABE_PU",
+                "USE_DABE_PSEUDO",
+                "USE_DESPL_PSEUDO",
+                "USE_QRA",
+                "USE_CCR",
+                "USE_DREPP",
+                "USE_AP_STCR",
+                "USE_CVSA",
+                "USE_PSSF",
+                "USE_BITC",
+                "USE_SOURCE_ARBITER",
+                "USE_RAST",
+                "USE_ESA_ASYM",
+                "USE_TEPR_LITE",
+                "USE_TCE",
+                "USE_LCEG",
+                "USE_HBNS_LITE",
+                "USE_EPR_POS",
+                "USE_DABE_OEM",
+            )
+        ):
+            raise RuntimeError(
+                "DABE-Clean cannot be combined with legacy pseudo sources or "
+                "additional teacher routers."
+            )
+        clean_version = str(getattr(cfg, "DABE_CLEAN_VERSION", ""))
+        if clean_version not in {"v1", "v2_contrec"}:
+            raise RuntimeError(
+                f"Unsupported DABE_CLEAN_VERSION={clean_version!r}."
+            )
+        if clean_version == "v2_contrec" and str(
+            getattr(cfg, "ECST_CLEAN_VERSION", "")
+        ) != "v5_asym_continuous_recoverability":
+            raise RuntimeError(
+                "DABE-Clean v2-contrec is reserved for Clean-ECST v5."
+            )
+        expected_clean = {
+            "P_INIT_MODE": "dabe_clean_v1_desplsched",
+            "TEACHER_FUSION_MODE": "dabe_clean_despl_sched",
+            "DABE_CLEAN_STATIC_WEIGHT_MODE": "ones",
+            "STATIC_WEIGHT_MODE": "ones",
+            "TEACHER_TARGET_MODE": "binary",
+            "MAX_EPOCH": 45,
+            "FINETUNE_RESET_EPOCH": 20,
+            "FINETUNE_RESET_TIMING": "after_epoch",
+            "DABE_PU_DESPL_TEACHER_ONLY_START": 21,
+            "LOSS_SIZE": 68,
+        }
+        mismatched_clean = {
+            name: getattr(cfg, name, None)
+            for name, expected in expected_clean.items()
+            if getattr(cfg, name, None) != expected
+        }
+        if mismatched_clean:
+            raise RuntimeError(
+                f"DABE-Clean protected Long45 protocol mismatch: {mismatched_clean}."
+            )
+        if not bool(getattr(cfg, "USE_DABE_CLEAN_DESPL_SCHEDULE", False)):
+            raise RuntimeError("DABE-Clean requires USE_DABE_CLEAN_DESPL_SCHEDULE=True.")
+        if not bool(getattr(cfg, "USE_TEACHER_BINARY_FULL_LOSS", False)) or bool(
+            getattr(cfg, "USE_TEACHER_SOFT_FULL_LOSS", False)
+        ):
+            raise RuntimeError("DABE-Clean requires the full binary EMA Teacher target.")
+        mode = str(getattr(cfg, "DABE_CLEAN_TARGET_MODE", "")).lower()
+        if mode not in {"dp", "diff", "bridge"}:
+            raise RuntimeError(f"Unsupported DABE_CLEAN_TARGET_MODE={mode!r}.")
+        legacy_regions = bool(
+            getattr(cfg, "DABE_CLEAN_USE_LEGACY_ECST_REGIONS", False)
+        )
+        if bool(getattr(cfg, "USE_ECST", False)) and not legacy_regions:
+            raise RuntimeError("Full ECST on DABE-Clean requires legacy routing regions.")
+        if ecst_minimal_enabled and legacy_regions:
+            raise RuntimeError("Minimal ECST forbids legacy routing regions.")
+        if ecst_clean_enabled:
+            if legacy_regions:
+                raise RuntimeError("Clean-ECST forbids legacy routing regions.")
+            if bool(getattr(cfg, "DABE_CLEAN_LEGACY_ROUTING_ONLY", False)):
+                raise RuntimeError("Clean-ECST forbids legacy routing-only loading.")
+            if str(getattr(cfg, "DABE_CLEAN_LEGACY_REGION_ROOT", "")).strip():
+                raise RuntimeError("Clean-ECST requires an empty legacy region root.")
+        if not bool(getattr(cfg, "USE_DAGP_SAFE_HEAD", False)) or not bool(
+            getattr(cfg, "USE_NDR_BRANCH", False)
+        ):
+            raise RuntimeError("DABE-Clean preserves DAGP-Safe and NDR-v1.")
     if bool(getattr(cfg, "USE_CSD_DECODER", False)):
         if not use_csd_head(cfg):
             raise RuntimeError("USE_CSD_DECODER=True requires HEAD_TYPE='csd_v1'.")
@@ -14071,6 +15784,8 @@ def main():
         raise RuntimeError("USE_DABE_PSEUDO=True cannot be combined with --pseudo_cache_override.")
     if bool(getattr(cfg, "USE_DABE_PU", False)) and args.pseudo_cache_override:
         raise RuntimeError("USE_DABE_PU=True cannot be combined with --pseudo_cache_override.")
+    if dabe_clean_enabled and args.pseudo_cache_override:
+        raise RuntimeError("USE_DABE_CLEAN=True cannot be combined with --pseudo_cache_override.")
     if use_cacd(cfg):
         if str(getattr(cfg, "HEAD_TYPE", "")).lower() != "cacd_v1_base" or not bool(
             getattr(cfg, "USE_CACD", False)
@@ -14182,8 +15897,19 @@ def main():
 
     cfg.PSEUDO_CACHE_OVERRIDE = args.pseudo_cache_override
     max_epoch = int(args.max_epochs) if args.max_epochs is not None else int(cfg.MAX_EPOCH)
+    configured_stop_after_epoch = int(getattr(cfg, "STOP_AFTER_EPOCH", 0))
+    requested_stop_after_epoch = (
+        int(args.stop_after_epoch)
+        if int(args.stop_after_epoch) > 0
+        else configured_stop_after_epoch
+    )
+    stop_after_epoch_source = (
+        "cli" if int(args.stop_after_epoch) > 0 else "config"
+        if configured_stop_after_epoch > 0
+        else "disabled"
+    )
     stop_after_epoch = validate_stop_after_epoch(
-        args.stop_after_epoch,
+        requested_stop_after_epoch,
         max_epoch,
         start_epoch=1,
     )
@@ -14297,11 +16023,24 @@ def main():
             f"{bool(getattr(cfg, 'LR_FLOOR_APPLY_AFTER_FINETUNE_RESET', True))}"
         )
         logger.log(f"max_epoch = {max_epoch}")
-        logger.log(f"stop_after_epoch = {stop_after_epoch}")
+        logger.log(
+            f"stop_after_epoch = {stop_after_epoch} | source={stop_after_epoch_source} | "
+            f"cli={int(args.stop_after_epoch)} | config={configured_stop_after_epoch}"
+        )
         logger.log(f"SAVE_EVERY_EPOCH = {bool(getattr(cfg, 'SAVE_EVERY_EPOCH', False))}")
         logger.log(f"SAVE_INTERVAL = {int(getattr(cfg, 'SAVE_INTERVAL', 0))}")
         logger.log(f"max_samples = {sample_limit}")
         logger.log(f"ema_weight = {cfg.EMA_WEIGHT}")
+        if oed_enabled:
+            logger.log("USE_OED_AUXILIARY = True")
+            logger.log("OED training_only = True")
+            logger.log("OED inference_branch_added = False")
+            logger.log("OED evidence_source = batch[pu_target_soft] (original DABE-PU soft target)")
+            logger.log("OED apply_to = Student final logits only")
+            logger.log("OED teacher_usage = diagnostics_only_raw_probability")
+            logger.log("OED pairing_seed_formula = seed + 1000003*epoch + 97003*global_step + 9973*batch_index + 1009*sample_index + 65537*ddp_rank + sha256(sample_id)[:8]")
+            for name, value in sorted(oed_config.items()):
+                logger.log(f"OED.{name} = {value}")
         logger.log(f"finetune_reset_epoch = {reset_epoch}")
         logger.log(f"finetune_reset_enabled = {reset_enabled}")
         logger.log(
@@ -14320,7 +16059,11 @@ def main():
         logger.log(f"finetune_reset_force_lr_floor = {bool(getattr(cfg, 'FINETUNE_RESET_FORCE_LR_FLOOR', False))}")
         logger.log(f"finetune_reset_lr = {float(getattr(cfg, 'FINETUNE_RESET_LR', getattr(cfg, 'LR_FLOOR', 0.0))):.8f}")
         logger.log(f"teacher_fusion_mode = {getattr(cfg, 'TEACHER_FUSION_MODE', 'default')}")
-        if hasattr(cfg, "SUPERVISION_HANDOVER_MODE") and not pssf_enabled:
+        if (
+            hasattr(cfg, "SUPERVISION_HANDOVER_MODE")
+            and not pssf_enabled
+            and not cvsa_enabled
+        ):
             logger.log(
                 f"SUPERVISION_HANDOVER_MODE = {supervision_handover_mode}"
             )
@@ -14341,17 +16084,30 @@ def main():
         if static_weight_audit_enabled:
             logger.log(f"STATIC_WEIGHT_MODE = {static_weight_mode}")
             logger.log(
+                "DABE_PU_STATIC_SOURCE = "
+                f"{get_dabe_pu_static_source(cfg)}"
+            )
+            logger.log(
                 "STATIC_WEIGHT_PROTOCOL_FINGERPRINT = "
                 f"{static_weight_protocol_fingerprint(cfg)}"
             )
-            logger.log(
-                "STATIC_WEIGHT_SINGLE_VARIABLE = target/static schedule/"
-                "DAGP/NDR unchanged; teacher routing audited independently"
-            )
+            static_source = get_dabe_pu_static_source(cfg)
+            if static_source == "p_base_68":
+                logger.log(
+                    "STATIC_TARGET_SINGLE_VARIABLE = target_soft_68 -> "
+                    "p_base_68; static weight/schedule/EMA/reset/DAGP/NDR "
+                    "unchanged"
+                )
+            else:
+                logger.log(
+                    "STATIC_WEIGHT_SINGLE_VARIABLE = target/static schedule/"
+                    "DAGP/NDR unchanged; teacher routing audited independently"
+                )
         if (
             teacher_routing_mode != LEGACY_TEACHER_ROUTING_MODE
             and not pssf_enabled
             and not ap_stcr_enabled
+            and not cvsa_enabled
         ):
             logger.log(f"TEACHER_ROUTING_MODE = {teacher_routing_mode}")
             logger.log(f"USE_ECST = {bool(getattr(cfg, 'USE_ECST', False))}")
@@ -14364,22 +16120,257 @@ def main():
                     "NO_ECST_SINGLE_VARIABLE = ECST teacher pixel weighting "
                     "disabled; target/static schedule/EMA/reset/DAGP/NDR unchanged"
                 )
+            elif teacher_routing_mode == "clean_ecst":
+                logger.log("[Clean-ECST Config]")
+                clean_config_fields = [
+                    "ECST_CLEAN_VERSION",
+                    "ECST_CLEAN_START_EPOCH",
+                    "ECST_CLEAN_RAMP_END_EPOCH",
+                    "ECST_CLEAN_STOP_EPOCH",
+                    "ECST_CLEAN_CONFLICT_FLOOR",
+                    "ECST_CLEAN_NEGATIVE_WEIGHT_FLOOR",
+                    "ECST_CLEAN_WEIGHT_MIN",
+                    "ECST_CLEAN_WEIGHT_MAX",
+                    "ECST_CLEAN_MARGIN_TAU",
+                    "ECST_CLEAN_TEMPORAL_RHO",
+                    "ECST_CLEAN_VARIANCE_TAU",
+                    "ECST_CLEAN_MIN_HISTORY",
+                    "ECST_CLEAN_MEMORY_DTYPE",
+                    "ECST_CLEAN_APPLY_TO_FINAL",
+                    "ECST_CLEAN_APPLY_TO_COARSE_AUX",
+                    "ECST_CLEAN_APPLY_TO_BASE_AUX",
+                ]
+                if bool(getattr(cfg, "ECST_CLEAN_USE_HARD_RING", True)):
+                    clean_config_fields.append("ECST_CLEAN_RING_RADIUS")
+                for field in clean_config_fields:
+                    logger.log(f"{field} = {getattr(cfg, field)}")
+                clean_strength_mode = get_ecst_clean_strength_mode(cfg)
+                logger.log(
+                    f"ECST_CLEAN_STRENGTH_MODE = {clean_strength_mode}"
+                )
+                if clean_strength_mode == "directional":
+                    clean_directional_strengths = (
+                        get_ecst_clean_directional_strengths(cfg)
+                    )
+                    logger.log(
+                        "ECST_CLEAN_ERASE_STRENGTH = "
+                        f"{clean_directional_strengths['erase']}"
+                    )
+                    logger.log(
+                        "ECST_CLEAN_ADD_STRENGTH = "
+                        f"{clean_directional_strengths['add']}"
+                    )
+                    logger.log(
+                        "ECST_CLEAN_RING_BG_STRENGTH = "
+                        f"{clean_directional_strengths['ring_bg']}"
+                    )
+                    logger.log(
+                        "ECST_CLEAN_STRENGTH_MAX_PRESENT = "
+                        f"{hasattr(cfg, 'ECST_CLEAN_STRENGTH_MAX')}"
+                    )
+                elif clean_strength_mode == "directional_continuous":
+                    clean_continuous_strengths = (
+                        get_ecst_clean_continuous_strengths(cfg)
+                    )
+                    logger.log(
+                        "ECST_CLEAN_ERASE_STRENGTH = "
+                        f"{clean_continuous_strengths['erase']}"
+                    )
+                    logger.log(
+                        "ECST_CLEAN_ADD_STRENGTH = "
+                        f"{clean_continuous_strengths['add']}"
+                    )
+                    logger.log(
+                        "ECST_CLEAN_RECOVERY_STRENGTH = "
+                        f"{clean_continuous_strengths['recovery']}"
+                    )
+                    logger.log(
+                        "ECST_CLEAN_USE_HARD_RING = "
+                        f"{bool(getattr(cfg, 'ECST_CLEAN_USE_HARD_RING', True))}"
+                    )
+                    logger.log(
+                        "ECST_CLEAN_RING_RADIUS_PRESENT = "
+                        f"{hasattr(cfg, 'ECST_CLEAN_RING_RADIUS')}"
+                    )
+                    logger.log(
+                        "ECST_CLEAN_RECOVERY_MODE = "
+                        f"{getattr(cfg, 'ECST_CLEAN_RECOVERY_MODE')}"
+                    )
+                else:
+                    logger.log(
+                        "ECST_CLEAN_STRENGTH_MAX = "
+                        f"{get_ecst_clean_strength_max(cfg)}"
+                    )
+                logger.log(
+                    "[Clean-ECST] legacy_pu_cache_used=False | "
+                    "legacy_regions_loaded=False | static_weight_map_used=False | "
+                    "routing_source=clean_dp_target_and_continuous_evidence"
+                )
+            elif teacher_routing_mode == "bitc_v1":
+                logger.log("USE_BITC = True")
+                for field in (
+                    "BITC_VERSION",
+                    "BITC_SUBSTITUTION_MODE",
+                    "BITC_CACHE_ROOT",
+                    "BITC_CACHE_SEED",
+                    "BITC_NUM_GROUPS",
+                    "BITC_GROUP_MODE",
+                    "BITC_BATCH_INTERVENTIONS",
+                    "BITC_USE_COARSE_ONLY",
+                    "BITC_CENTER_MODE",
+                    "BITC_RESPONSE_NORMALIZATION",
+                    "BITC_RESPONSE_CLIP",
+                    "BITC_WEIGHT_FLOOR",
+                    "BITC_APPLY_TO_FINAL",
+                    "BITC_APPLY_TO_COARSE",
+                    "BITC_APPLY_TO_BASE",
+                    "BITC_WEIGHTED_NORMALIZE",
+                    "BITC_DETACH_RESPONSE",
+                    "BITC_DETACH_MAP",
+                ):
+                    logger.log(f"{field} = {getattr(cfg, field)}")
+                logger.log(
+                    "[BITC Contract] ECST/TEPR=False | static_target="
+                    "target_soft_68 | static_weight=ones | global_schedule="
+                    "unchanged | EMA/reset/optimizer/scheduler/checkpoint="
+                    "unchanged | inference_branch_added=False"
+                )
+        if cvsa_enabled:
+            cvsa_config_for_log = dict(getattr(cfg, "CVSA"))
+            logger.log("USE_CVSA = True")
+            logger.log("SUPERVISION_MODE = cvsa")
+            for name, value in sorted(cvsa_config_for_log.items()):
+                logger.log(f"CVSA.{name} = {value}")
+            logger.log("[CVSA] global_schedule_used=False")
+            logger.log("[CVSA] epoch_ratio_used=False")
+            logger.log(
+                "[CVSA] gate_source="
+                + (
+                    "learnable_patch_router"
+                    if cvsa_config_for_log["route_mode"] == "learnable"
+                    else "direct_current_cross_view_risk"
+                )
+            )
+            logger.log("[CVSA] route_target_source=current_cross_view_risk")
+            logger.log("[CVSA] future_teacher_used=False")
+            logger.log("[CVSA] temporal_history_allocated=False")
+            logger.log("[CVSA] training_gt_used=False")
+            logger.log(
+                "[CVSA] segmentation_target=one detached mixed target shared "
+                "by final/coarse/base"
+            )
         if ap_stcr_enabled:
+            ap_config_for_log = dict(getattr(cfg, "AP_STCR"))
+            ap_version_for_log = str(
+                ap_config_for_log.get("version", "")
+            ).strip()
+            ap_stcr_v3_for_log = (
+                ap_version_for_log
+                == "ap_stcr_v3_soft_disagreement_bounded_continuation"
+            )
+            ap_stcr_v4_for_log = (
+                ap_version_for_log
+                == "ap_stcr_v4_transition_envelope_non_compensatory"
+            )
+            ap_stcr_a1_for_log = (
+                ap_version_for_log == "ap_stcr_v4_semantic_only_ablation"
+            )
             logger.log("USE_AP_STCR = True")
             logger.log(f"SUPERVISION_MODE = {getattr(cfg, 'SUPERVISION_MODE')}")
             logger.log(
                 "AP-STCR supervision = one detached full-pixel mixed target; "
                 "legacy static/teacher loss groups and teacher route maps bypassed"
             )
-            for name, value in sorted(dict(getattr(cfg, "AP_STCR")).items()):
+            for name, value in sorted(ap_config_for_log.items()):
                 logger.log(f"AP_STCR.{name} = {value}")
             logger.log("AP_STCR training_gt_used = False")
             logger.log("AP_STCR semantic_cache_storage = cpu_float16")
-            logger.log("AP_STCR temporal_history_storage = cpu_float16")
-            logger.log(
-                "AP_STCR protected path = DABE-PU v1.1 + DAGP-Safe + "
-                "NDR-v1 + EMA + Linear30 + epoch29 after-reset"
-            )
+            if ap_stcr_a1_for_log:
+                logger.log("[AP-STCR Ablation] mode=semantic_only")
+                logger.log(
+                    "[AP-STCR Ablation] temporal_evidence_used=False"
+                )
+                logger.log(
+                    "[AP-STCR Ablation] temporal_history_allocated=False"
+                )
+            else:
+                logger.log("AP_STCR temporal_history_storage = cpu_float16")
+            if ap_stcr_v3_for_log:
+                logger.log(
+                    "AP_STCR protected path = DABE-PU v1.1 + DAGP-Safe + "
+                    "NDR-v1 + EMA + "
+                    f"linear stage1-{int(getattr(cfg, 'DABE_PU_DESPL_STAGE_END'))} "
+                    f"+ epoch{int(getattr(cfg, 'FINETUNE_RESET_EPOCH'))} "
+                    "after-reset + post-reset teacher continuation "
+                    f"epochs{int(ap_config_for_log['post_reset_teacher_start_epoch'])}-"
+                    f"{int(ap_config_for_log['post_reset_teacher_end_epoch'])}"
+                )
+                logger.log(
+                    "[AP-STCR-v3 Schedule] "
+                    "post_reset_teacher_continuation=True | "
+                    "teacher_ratio start/end="
+                    f"{float(ap_config_for_log['post_reset_teacher_start_ratio']):.9f}/"
+                    f"{float(ap_config_for_log['post_reset_teacher_end_ratio']):.9f} | "
+                    "epochs start/end="
+                    f"{int(ap_config_for_log['post_reset_teacher_start_epoch'])}/"
+                    f"{int(ap_config_for_log['post_reset_teacher_end_epoch'])} | "
+                    "epoch20_reset_behavior=unchanged"
+                )
+            elif ap_stcr_v4_for_log:
+                logger.log(
+                    "AP-STCR protected path = DABE-PU v1.1 + DAGP-Safe + "
+                    "NDR-v1 + EMA + "
+                    f"linear stage1-{int(getattr(cfg, 'DABE_PU_DESPL_STAGE_END'))} "
+                    f"+ epoch{int(getattr(cfg, 'FINETUNE_RESET_EPOCH'))} "
+                    "after-reset + unchanged post-reset teacher continuation "
+                    f"epochs{int(ap_config_for_log['post_reset_teacher_start_epoch'])}-"
+                    f"{int(ap_config_for_log['post_reset_teacher_end_epoch'])}"
+                )
+                logger.log(
+                    "[AP-STCR-v4 Schedule] "
+                    "post_reset_teacher_continuation=True | "
+                    "teacher_ratio start/end="
+                    f"{float(ap_config_for_log['post_reset_teacher_start_ratio']):.9f}/"
+                    f"{float(ap_config_for_log['post_reset_teacher_end_ratio']):.9f} | "
+                    "epochs start/end="
+                    f"{int(ap_config_for_log['post_reset_teacher_start_epoch'])}/"
+                    f"{int(ap_config_for_log['post_reset_teacher_end_epoch'])} | "
+                    "epoch20_reset_behavior=unchanged | "
+                    "local_start_stop_epoch=False | "
+                    "teacher_only_epoch_added=False"
+                )
+            elif ap_stcr_a1_for_log:
+                logger.log(
+                    "AP-STCR protected path = DABE-PU v1.1 + DAGP-Safe + "
+                    "NDR-v1 + EMA + "
+                    f"linear stage1-{int(getattr(cfg, 'DABE_PU_DESPL_STAGE_END'))} "
+                    f"+ epoch{int(getattr(cfg, 'FINETUNE_RESET_EPOCH'))} "
+                    "after-reset + unchanged post-reset teacher continuation "
+                    f"epochs{int(ap_config_for_log['post_reset_teacher_start_epoch'])}-"
+                    f"{int(ap_config_for_log['post_reset_teacher_end_epoch'])}"
+                )
+                logger.log(
+                    "[AP-STCR-A1 Schedule] "
+                    "post_reset_teacher_continuation=True | "
+                    "teacher_ratio start/end="
+                    f"{float(ap_config_for_log['post_reset_teacher_start_ratio']):.9f}/"
+                    f"{float(ap_config_for_log['post_reset_teacher_end_ratio']):.9f} | "
+                    "epochs start/end="
+                    f"{int(ap_config_for_log['post_reset_teacher_start_epoch'])}/"
+                    f"{int(ap_config_for_log['post_reset_teacher_end_epoch'])} | "
+                    "epoch20_reset_behavior=unchanged | "
+                    "local_start_stop_epoch=False | "
+                    "teacher_only_epoch_added=False"
+                )
+            else:
+                logger.log(
+                    "AP_STCR protected path = DABE-PU v1.1 + DAGP-Safe + "
+                    "NDR-v1 + EMA + "
+                    f"linear stage1-{int(getattr(cfg, 'DABE_PU_DESPL_STAGE_END'))} "
+                    f"+ epoch{int(getattr(cfg, 'FINETUNE_RESET_EPOCH'))} "
+                    "after-reset + teacher-only from "
+                    f"epoch{int(getattr(cfg, 'DABE_PU_DESPL_TEACHER_ONLY_START'))}"
+                )
         if pssf_enabled:
             logger.log("USE_PSSF = True")
             logger.log(
@@ -14564,6 +16555,7 @@ def main():
             logger.log(f"USE_DABE_PU_DESPL_SCHEDULE = {bool(getattr(cfg, 'USE_DABE_PU_DESPL_SCHEDULE', False))}")
             logger.log(f"USE_DABE_PU_STATIC_LOSS = {bool(getattr(cfg, 'USE_DABE_PU_STATIC_LOSS', True))}")
             logger.log(f"DABE_PU_STATIC_TARGET_MODE = {get_dabe_pu_despl_static_target_mode(cfg)}")
+            logger.log(f"DABE_PU_STATIC_SOURCE = {get_dabe_pu_static_source(cfg)}")
             logger.log(f"DABE_PU_HARD_THRESH = {float(getattr(cfg, 'DABE_PU_HARD_THRESH', 0.5)):.6f}")
             logger.log(f"USE_DABE_PU_HARD_STATIC_TARGET = {bool(getattr(cfg, 'USE_DABE_PU_HARD_STATIC_TARGET', False))}")
             logger.log(f"DABE_PU_HARD_KEEP_WEIGHT_MAP = {bool(getattr(cfg, 'DABE_PU_HARD_KEEP_WEIGHT_MAP', True))}")
@@ -15404,6 +17396,26 @@ def main():
         logger.log(f"use_dabe_pu = {bool(getattr(cfg, 'USE_DABE_PU', False))}")
         logger.log(f"dabe_pu_version = {getattr(cfg, 'DABE_PU_VERSION', '')}")
         logger.log(f"dabe_pu_root = {getattr(cfg, 'DABE_PU_ROOT', '')}")
+        logger.log(f"USE_DABE_CLEAN = {bool(getattr(cfg, 'USE_DABE_CLEAN', False))}")
+        if bool(getattr(cfg, "USE_DABE_CLEAN", False)):
+            logger.log(
+                f"DABE_CLEAN_TARGET_MODE = {getattr(cfg, 'DABE_CLEAN_TARGET_MODE', '')}"
+            )
+            logger.log(
+                f"DABE_CLEAN_ROOT = {getattr(cfg, 'DABE_CLEAN_ROOT', '')}"
+            )
+            logger.log(
+                "DABE_CLEAN_STATIC_LOSS = direct BCEWithLogits(reduction='mean')"
+            )
+            logger.log("DABE_CLEAN_CACHE_STATIC_WEIGHT_MAP = False")
+            logger.log(
+                "DABE_CLEAN_LEGACY_ROUTING_ONLY = "
+                f"{bool(getattr(cfg, 'DABE_CLEAN_LEGACY_ROUTING_ONLY', False))}"
+            )
+            logger.log(
+                "DABE_CLEAN_USE_LEGACY_ECST_REGIONS = "
+                f"{bool(getattr(cfg, 'DABE_CLEAN_USE_LEGACY_ECST_REGIONS', False))}"
+            )
         logger.log(f"USE_DABE_AWARE_LOSS = {bool(getattr(cfg, 'USE_DABE_AWARE_LOSS', False))}")
         logger.log(f"DABE_AWARE_USE_TRIMAP = {bool(getattr(cfg, 'DABE_AWARE_USE_TRIMAP', False))}")
         logger.log(f"DABE_AWARE_CORE_LOCK = {bool(getattr(cfg, 'DABE_AWARE_CORE_LOCK', False))}")
@@ -15499,28 +17511,48 @@ def main():
             "dabe_pu_v11_desplsched_dabehard",
             "dabe_pu_v12_shape_desplsched",
         }:
+            dabe_pu_static_source = get_dabe_pu_static_source(cfg)
             if get_dabe_pu_despl_static_target_mode(cfg) == "hard_from_target_soft":
                 logger.log("pseudo final candidate = target_hard_from_target_soft_68")
             else:
-                logger.log("pseudo final candidate = target_soft_68")
+                logger.log(f"pseudo final candidate = {dabe_pu_static_source}")
             if get_dabe_pu_despl_teacher_target_mode(cfg) == "soft_prob":
-                logger.log("p_init_formula = static weighted BCE(target_soft_68, weight_map_68) + full teacher soft BCE")
+                logger.log(
+                    "p_init_formula = static weighted BCE("
+                    f"{dabe_pu_static_source}, weight_map_68) + full teacher soft BCE"
+                )
             elif get_dabe_pu_despl_static_target_mode(cfg) == "hard_from_target_soft":
                 logger.log("p_init_formula = static weighted BCE(target_hard_from_target_soft_68, weight_map_68) + full teacher binary BCE")
             else:
-                logger.log("p_init_formula = static weighted BCE(target_soft_68, weight_map_68) + full teacher binary BCE")
+                logger.log(
+                    "p_init_formula = static weighted BCE("
+                    f"{dabe_pu_static_source}, weight_map_68) + full teacher binary BCE"
+                )
             logger.log("use_fixed_in_pseudo = False")
             logger.log("fixed_used_for_training = False")
         if str(getattr(cfg, "P_INIT_MODE", "")) == "dabe_pu_v11_oem":
             logger.log("pseudo final candidate = DABE-PU seed masks + OEM dynamic extent")
             logger.log("use_fixed_in_pseudo = False")
             logger.log("fixed_used_for_training = False")
+        if str(getattr(cfg, "P_INIT_MODE", "")) == "dabe_clean_v1_desplsched":
+            clean_mode = str(getattr(cfg, "DABE_CLEAN_TARGET_MODE", "")).lower()
+            logger.log(f"pseudo final candidate = dabe_clean_{clean_mode}_68")
+            logger.log(
+                "p_init_formula = direct mean BCE(single continuous Clean target) "
+                "+ full teacher binary BCE"
+            )
+            logger.log("legacy_static_weight_map_used_for_training = False")
+            logger.log("fixed_used_for_training = False")
 
         use_qra = bool(getattr(cfg, "USE_QRA", False))
         use_ccr = bool(getattr(cfg, "USE_CCR", False))
         use_drepp = bool(getattr(cfg, "USE_DREPP", False))
         use_dabe = bool(getattr(cfg, "USE_DABE_PSEUDO", False))
-        use_dabe_pu = bool(getattr(cfg, "USE_DABE_PU", False))
+        use_dabe_pu_cache = bool(getattr(cfg, "USE_DABE_PU", False))
+        use_dabe_clean = bool(getattr(cfg, "USE_DABE_CLEAN", False))
+        # Downstream DESPL scheduling is intentionally shared; cache/data access
+        # remains split by the two explicit flags above.
+        use_dabe_pu = use_dabe_pu_cache or use_dabe_clean
         use_dabe_aware = use_dabe_aware_loss(cfg)
         use_despl = bool(getattr(cfg, "USE_DESPL_PSEUDO", False))
         use_despl_paper = use_despl and bool(getattr(cfg, "USE_DESPL_PAPER_CACHE", False))
@@ -15537,16 +17569,32 @@ def main():
         teacher_fusion_mode = str(getattr(cfg, "TEACHER_FUSION_MODE", "default")).lower()
         use_pssf_train = bool(pssf_enabled)
         use_ap_stcr_train = bool(ap_stcr_enabled)
-        use_dabe_oem = use_dabe_pu and (
+        use_cvsa_train = bool(cvsa_enabled)
+        use_dabe_oem = use_dabe_pu_cache and (
             teacher_fusion_mode == "dabe_pu_oem" or bool(getattr(cfg, "USE_DABE_OEM", False))
         )
-        use_dabe_pu_balanced_v2 = use_dabe_pu and teacher_fusion_mode == "dabe_pu_balanced_v2"
-        use_dabe_pu_despl_sched = use_dabe_pu and teacher_fusion_mode == "dabe_pu_despl_sched"
-        if use_ap_stcr_train and not use_dabe_pu_despl_sched:
+        use_dabe_pu_balanced_v2 = (
+            use_dabe_pu_cache and teacher_fusion_mode == "dabe_pu_balanced_v2"
+        )
+        use_dabe_pu_despl_sched = (
+            use_dabe_pu_cache and teacher_fusion_mode == "dabe_pu_despl_sched"
+        ) or (
+            use_dabe_clean
+            and teacher_fusion_mode == "dabe_clean_despl_sched"
+            and bool(getattr(cfg, "USE_DABE_CLEAN_DESPL_SCHEDULE", False))
+        )
+        use_bitc_train = bool(bitc_enabled) and use_dabe_pu_despl_sched
+        if bool(bitc_enabled) and not use_bitc_train:
             raise RuntimeError(
-                "AP-STCR requires the DABE-PU DESPL-style schedule entry."
+                "BITC-v1 requires the DABE-PU DESPL-style supervision path."
+            )
+        if (use_ap_stcr_train or use_cvsa_train) and not use_dabe_pu_despl_sched:
+            raise RuntimeError(
+                "AP-STCR/CVSA requires the DABE-PU DESPL-style protocol entry."
             )
         use_ecst = teacher_routing_uses_ecst(cfg) and use_dabe_pu_despl_sched
+        use_ecst_minimal_train = bool(ecst_minimal_enabled) and use_dabe_clean
+        use_ecst_clean_train = bool(ecst_clean_enabled) and use_dabe_clean
         use_source_arbiter_train = (
             bool(getattr(cfg, "USE_SOURCE_ARBITER", False)) and use_ecst
         )
@@ -15747,20 +17795,78 @@ def main():
                     max_samples=sample_limit if sample_limit >= 0 else None,
                 )
                 logger.log(f"[Cache] DABE pseudo cache ready | {dabe_reason}")
-            if use_dabe_pu:
+            if use_dabe_pu_cache:
                 _, dabe_pu_reason = check_dabe_pu_cache(
                     cfg,
                     max_samples=sample_limit if sample_limit >= 0 else None,
                 )
                 logger.log(f"[Cache] DABE-PU cache ready | {dabe_pu_reason}")
-        elif use_dabe_pu:
+        elif use_dabe_pu_cache:
             _, dabe_pu_reason = check_dabe_pu_cache(
                 cfg,
                 max_samples=sample_limit if sample_limit >= 0 else None,
             )
             logger.log(f"[Cache] DABE-PU cache ready | {dabe_pu_reason}")
+        elif use_dabe_clean:
+            is_contrec_cache = str(
+                getattr(cfg, "DABE_CLEAN_VERSION", "")
+            ) == "v2_contrec"
+            dabe_clean_check = check_dabe_clean_cache(
+                cfg,
+                max_samples=sample_limit if sample_limit >= 0 else None,
+                return_stats=is_contrec_cache,
+            )
+            if is_contrec_cache:
+                _, dabe_clean_reason, contrec_stats = dabe_clean_check
+            else:
+                _, dabe_clean_reason = dabe_clean_check
+                contrec_stats = {}
+            logger.log(
+                f"[Cache] DABE-Clean independent cache ready | {dabe_clean_reason}"
+            )
+            if is_contrec_cache:
+                for name in (
+                    "p_rw",
+                    "foreground_evidence",
+                    "latent_rw",
+                    "background_evidence",
+                    "semantic_fg_tendency",
+                    "recoverability",
+                ):
+                    values = contrec_stats[name]
+                    label = (
+                        "mean/std/p50/p90/p95/max"
+                        if name == "recoverability"
+                        else "mean/std/p50/p90/p95"
+                    )
+                    logger.log(
+                        f"[DABE-Clean ContRec] {name} {label}="
+                        f"{values['mean']:.8f}/"
+                        f"{values['std']:.8f}/{values['p50']:.8f}/"
+                        f"{values['p90']:.8f}/{values['p95']:.8f}"
+                        + (
+                            f"/{values['max']:.8f}"
+                            if name == "recoverability"
+                            else ""
+                        )
+                    )
+                recovery_stats = contrec_stats["recoverability"]
+                logger.log(
+                    "[DABE-Clean ContRec] recoverability_zero_ratio/"
+                    "gt_0.1/gt_0.3/gt_0.5="
+                    f"{recovery_stats['zero_ratio']:.8f}/"
+                    f"{recovery_stats['gt_0_1_ratio']:.8f}/"
+                    f"{recovery_stats['gt_0_3_ratio']:.8f}/"
+                    f"{recovery_stats['gt_0_5_ratio']:.8f}"
+                )
         else:
             ensure_cache_available(cfg, "pseudo", logger=logger.log)
+        if use_cvsa_train:
+            _, cvsa_cache_reason = validate_cvsa_cache_manifests(
+                cfg,
+                max_samples=sample_limit if sample_limit >= 0 else None,
+            )
+            logger.log(f"[Cache] CVSA hflip evidence ready | {cvsa_cache_reason}")
         if use_hflip_mv or use_source_arbiter_train:
             _, hflip_reason = check_hflip_feature_cache(
                 cfg,
@@ -15811,6 +17917,19 @@ def main():
         )
         log_cache_summary(logger, cfg, train_dataset)
         log_first_batch_pseudo(logger, cfg, train_dataset)
+        if use_bitc_train:
+            logger.log(
+                "[BITC Cache] ready | "
+                f"root={train_dataset.bitc_cache_root} | "
+                f"first={train_dataset.bitc_first_cache_path} | "
+                f"fingerprint={train_dataset.bitc_cache_fingerprint}"
+            )
+            logger.log(
+                "[BITC Debug] "
+                f"enabled={bitc_debug_enabled} | max_images="
+                f"{int(getattr(cfg, 'BITC_DEBUG_MAX_IMAGES', 5))} | "
+                f"output={train_dir.parent / 'bitc_debug'}"
+            )
         if args.debug_loader_only:
             logger.log(
                 "[Debug Loader] completed successfully; training loop not entered."
@@ -15864,9 +17983,50 @@ def main():
             logger.log(f"student_teacher_state_keys_equal = True")
             logger.log(f"student_teacher_initial_max_diff = {max_init_diff:.9g}")
 
+        cvsa_config = dict(getattr(cfg, "CVSA")) if use_cvsa_train else None
+        cvsa_router = None
+        cvsa_visual_root = None
+        cvsa_fingerprint = None
+        if use_cvsa_train:
+            if str(cvsa_config["route_mode"]).lower() == "learnable":
+                cvsa_router = CVSAPatchRouter(
+                    feature_channels=in_channels,
+                    feature_dim=int(cvsa_config["router_feature_dim"]),
+                    hidden_dim=int(cvsa_config["router_hidden_dim"]),
+                    gn_groups=int(cvsa_config["router_gn_groups"]),
+                    init_teacher_prob=float(
+                        cvsa_config["router_init_teacher_prob"]
+                    ),
+                    eps=float(cvsa_config["eps"]),
+                ).to(device)
+            cvsa_fingerprint = cvsa_protocol_fingerprint(cvsa_config)
+            cvsa_visual_root = train_dir / "cvsa_vis"
+            if bool(cvsa_config.get("export_visualization", True)):
+                ensure_dir(cvsa_visual_root)
+            logger.log(
+                "[CVSA Router] "
+                f"mode={cvsa_config['route_mode']} | "
+                f"params={cvsa_router_parameter_count(cvsa_router)} | "
+                "macs_per_sample="
+                f"{cvsa_router_macs(feature_dim=cvsa_config['router_feature_dim'], hidden_dim=cvsa_config['router_hidden_dim'], resolution=cvsa_config['evidence_resolution'], feature_channels=in_channels) if cvsa_router is not None else 0} | "
+                f"protocol_fingerprint={cvsa_fingerprint} | "
+                "optimizer_group="
+                f"{'independent_same_lr' if cvsa_router is not None else 'none'}"
+            )
+            logger.log(
+                "[CVSA Router] inference_used=False | "
+                "training_only=True | "
+                "parameter_bytes_fp32="
+                f"{cvsa_router_parameter_count(cvsa_router) * 4} | "
+                "parameter_grad_adam_state_bytes_approx="
+                f"{cvsa_router_parameter_count(cvsa_router) * 16}"
+            )
+
         criterion = torch.nn.BCEWithLogitsLoss()
         criterion_none = torch.nn.BCEWithLogitsLoss(reduction="none")
-        optimizer, scheduler = build_optimizer_scheduler(cfg, student)
+        optimizer, scheduler = build_optimizer_scheduler(
+            cfg, student, cvsa_router=cvsa_router
+        )
         ap_stcr = None
         ap_stcr_protocol_fingerprint = None
         ap_stcr_protocol_payload = None
@@ -15884,7 +18044,12 @@ def main():
             if bool(getattr(cfg, "AP_STCR").get("export_visualization", True)):
                 ensure_dir(ap_stcr_visual_root)
             semantic_state = ap_stcr.semantic_cache.state_dict()
-            history_state = ap_stcr.history_bank.state_dict()
+            ap_stcr_history_bank = getattr(ap_stcr, "history_bank", None)
+            history_state = (
+                ap_stcr_history_bank.state_dict()
+                if ap_stcr_history_bank is not None
+                else {}
+            )
             semantic_bytes = sum(
                 value.numel() * value.element_size()
                 for value in semantic_state.values()
@@ -15902,6 +18067,8 @@ def main():
                 f"protocol_fingerprint={ap_stcr_protocol_fingerprint} | "
                 f"semantic_cache_bytes={semantic_bytes} | "
                 f"history_bytes={history_bytes} | "
+                "temporal_history_allocated="
+                f"{ap_stcr_history_bank is not None} | "
                 f"visual_root={ap_stcr_visual_root} | "
                 "learnable_parameters=0 | training_gt_used=False"
             )
@@ -16315,6 +18482,43 @@ def main():
 
             student.load_state_dict(checkpoint["student"], strict=True)
             teacher.load_state_dict(checkpoint["teacher"], strict=True)
+            if use_cvsa_train:
+                required_cvsa_keys = {
+                    "cvsa_router",
+                    "cvsa_route_mode",
+                    "cvsa_protocol_fingerprint",
+                    "checkpoint_phase",
+                    "global_step",
+                    "rng_state",
+                    "train_loader_generator_state",
+                }
+                missing_cvsa = sorted(required_cvsa_keys.difference(checkpoint))
+                if missing_cvsa:
+                    raise RuntimeError(
+                        "CVSA resume requires complete causal/router state; "
+                        f"missing={missing_cvsa}."
+                    )
+                if str(checkpoint["cvsa_route_mode"]) != str(
+                    cvsa_config["route_mode"]
+                ):
+                    raise RuntimeError("CVSA resume route_mode mismatch.")
+                if str(checkpoint["cvsa_protocol_fingerprint"]) != str(
+                    cvsa_fingerprint
+                ):
+                    raise RuntimeError("CVSA resume protocol fingerprint mismatch.")
+                if cvsa_router is None:
+                    if checkpoint["cvsa_router"] is not None:
+                        raise RuntimeError(
+                            "CVSA direct resume must not contain router state."
+                        )
+                else:
+                    if checkpoint["cvsa_router"] is None:
+                        raise RuntimeError(
+                            "CVSA learnable resume is missing router state."
+                        )
+                    cvsa_router.load_state_dict(
+                        checkpoint["cvsa_router"], strict=True
+                    )
             optimizer.load_state_dict(checkpoint["optimizer"])
             scheduler.load_state_dict(checkpoint["scheduler"])
             if use_ap_stcr_train:
@@ -16461,7 +18665,24 @@ def main():
                     f"with max_epoch={max_epoch}."
                 )
 
-            if use_ap_stcr_train:
+            if use_cvsa_train:
+                global_step = int(checkpoint["global_step"])
+                global_step_source = "checkpoint"
+                checkpoint_phase = str(checkpoint["checkpoint_phase"])
+                expected_phase = cvsa_checkpoint_phase(cfg, saved_epoch)
+                if checkpoint_phase != expected_phase:
+                    raise RuntimeError(
+                        "CVSA resume phase/epoch mismatch: "
+                        f"{checkpoint_phase} != {expected_phase}."
+                    )
+                resume_pending_after_reset = (
+                    checkpoint_phase == "pending_after_epoch_reset"
+                )
+                restore_rng_state(checkpoint["rng_state"])
+                train_loader_generator.set_state(
+                    checkpoint["train_loader_generator_state"]
+                )
+            elif use_ap_stcr_train:
                 global_step = int(checkpoint["global_step"])
                 global_step_source = "checkpoint"
                 expected_phase = ap_stcr_checkpoint_phase(cfg, saved_epoch)
@@ -16498,14 +18719,39 @@ def main():
                 "student_restored=True | teacher_restored=True | "
                 "optimizer_restored=True | scheduler_restored=True"
             )
-            if use_ap_stcr_train:
+            if use_cvsa_train:
                 logger.log(
-                    "[AP-STCR Resume] "
+                    "[CVSA Resume] "
                     f"phase={checkpoint['checkpoint_phase']} | "
-                    "semantic_cache_restored=True | history_restored=True | "
-                    "rng_restored=True | dataloader_generator_restored=True | "
+                    f"route_mode={cvsa_config['route_mode']} | "
+                    f"router_restored={cvsa_router is not None} | "
+                    "optimizer_restored=True | rng_restored=True | "
+                    "dataloader_generator_restored=True | "
                     f"pending_after_epoch_reset={resume_pending_after_reset}"
                 )
+            if use_ap_stcr_train:
+                if getattr(ap_stcr, "history_bank", None) is None:
+                    logger.log(
+                        "[AP-STCR Resume] "
+                        f"phase={checkpoint['checkpoint_phase']} | "
+                        "semantic_cache_restored=True | "
+                        "history_restored=False | "
+                        "temporal_history_allocated=False | "
+                        "rng_restored=True | "
+                        "dataloader_generator_restored=True | "
+                        "pending_after_epoch_reset="
+                        f"{resume_pending_after_reset}"
+                    )
+                else:
+                    logger.log(
+                        "[AP-STCR Resume] "
+                        f"phase={checkpoint['checkpoint_phase']} | "
+                        "semantic_cache_restored=True | "
+                        "history_restored=True | "
+                        "rng_restored=True | "
+                        "dataloader_generator_restored=True | "
+                        f"pending_after_epoch_reset={resume_pending_after_reset}"
+                    )
             if use_pssf_train:
                 expected_phase = pssf_checkpoint_phase(cfg, saved_epoch)
                 if pssf_resume_state["phase"] != expected_phase:
@@ -16609,10 +18855,25 @@ def main():
                 f"STATIC_WEIGHT_AUDIT_CSV = {static_weight_audit_path}"
             )
 
+        clean_ecst_audit_path = None
+        if use_ecst_clean_train:
+            clean_ecst_audit_path = train_dir / "clean_ecst_audit.csv"
+            if not args.resume and clean_ecst_audit_path.exists():
+                clean_ecst_audit_path.unlink()
+            logger.log(f"CLEAN_ECST_AUDIT_CSV = {clean_ecst_audit_path}")
+
         lr_floor_activated_logged = False
         ecst_memory = None
         if use_ecst:
-            memory_update_end = int(getattr(cfg, "ECST_MEMORY_UPDATE_END_EPOCH", 20))
+            memory_update_end = int(
+                getattr(
+                    cfg,
+                    "ECST_CLEAN_MEMORY_UPDATE_END_EPOCH"
+                    if use_ecst_clean_train
+                    else "ECST_MEMORY_UPDATE_END_EPOCH",
+                    20,
+                )
+            )
             resume_needs_active_memory = (
                 use_source_arbiter_train
                 and args.resume
@@ -16632,7 +18893,15 @@ def main():
                     num_samples=len(train_dataset),
                     height=int(cfg.LOSS_SIZE),
                     width=int(cfg.LOSS_SIZE),
-                    dtype=str(getattr(cfg, "ECST_MEMORY_DTYPE", "float16")),
+                    dtype=str(
+                        getattr(
+                            cfg,
+                            "ECST_CLEAN_MEMORY_DTYPE"
+                            if use_ecst_clean_train
+                            else "ECST_MEMORY_DTYPE",
+                            "float16",
+                        )
+                    ),
                 )
                 if resume_needs_active_memory:
                     temporal_memory_key = (
@@ -16653,22 +18922,43 @@ def main():
                     + ecst_memory.count.numel() * ecst_memory.count.element_size()
                 )
                 logger.log(
-                    "[ECST] temporal memory initialized | "
+                    (
+                        "[Clean-ECST] temporal memory initialized | "
+                        if use_ecst_clean_train
+                        else "[ECST] temporal memory initialized | "
+                    )
+                    +
                     f"num_samples={len(train_dataset)} | "
                     f"shape=[1,{int(cfg.LOSS_SIZE)},{int(cfg.LOSS_SIZE)}] | "
-                    f"dtype={getattr(cfg, 'ECST_MEMORY_DTYPE', 'float16')} | "
+                    "dtype="
+                    f"{getattr(cfg, 'ECST_CLEAN_MEMORY_DTYPE' if use_ecst_clean_train else 'ECST_MEMORY_DTYPE', 'float16')} | "
                     f"bytes={memory_bytes}"
                 )
             else:
                 logger.log(
-                    "[ECST] temporal memory inactive | "
+                    (
+                        "[Clean-ECST] temporal memory inactive | "
+                        if use_ecst_clean_train
+                        else "[ECST] temporal memory inactive | "
+                    )
+                    +
                     f"start_epoch={start_epoch} | update_end={memory_update_end} | "
                     "memory_active=False"
                 )
+        elif use_bitc_train:
+            logger.log(
+                "[BITC] mode=bitc_v1 | ECST temporal memory initialized=False | "
+                "TEPR memory initialized=False | response_source=EMA-Teacher "
+                "coarse-only counterfactual | teacher_target=binary | "
+                f"substitution={getattr(cfg, 'BITC_SUBSTITUTION_MODE')} | "
+                f"groups={int(getattr(cfg, 'BITC_NUM_GROUPS'))} | "
+                f"weight_floor={float(getattr(cfg, 'BITC_WEIGHT_FLOOR')):.6f}"
+            )
         elif (
             teacher_routing_mode == "none"
             and not use_pssf_train
             and not use_ap_stcr_train
+            and not use_cvsa_train
         ):
             logger.log(
                 "[TeacherRouting] mode=none | ECST temporal memory "
@@ -16787,6 +19077,7 @@ def main():
                     scheduler,
                     global_step,
                     lr_floor_activated_logged,
+                    cvsa_router=cvsa_router,
                 )
             )
             pssf_history_bank.clear(next_epoch=start_epoch)
@@ -16814,6 +19105,35 @@ def main():
                     "cross_reset_targets_used=False"
                 )
 
+        if use_cvsa_train and resume_pending_after_reset:
+            if start_epoch != get_reset_epoch(cfg) + 1:
+                raise RuntimeError(
+                    "CVSA pending-after-reset checkpoint must resume exactly "
+                    f"at epoch {get_reset_epoch(cfg) + 1}, got {start_epoch}."
+                )
+            optimizer, scheduler, global_step, lr_floor_activated_logged = (
+                apply_finetune_reset(
+                    logger,
+                    cfg,
+                    get_reset_epoch(cfg),
+                    student,
+                    teacher,
+                    optimizer,
+                    scheduler,
+                    global_step,
+                    lr_floor_activated_logged,
+                    cvsa_router=cvsa_router,
+                )
+            )
+            logger.log(
+                "[CVSA Reset] pending after-epoch reset replayed exactly once | "
+                f"saved_epoch={get_reset_epoch(cfg):03d} | "
+                f"next_epoch={start_epoch:03d} | "
+                "router_parameters_preserved=True | "
+                f"router_in_optimizer={cvsa_router is not None} | "
+                "temporal_history_allocated=False | cross_reset_target_used=False"
+            )
+
         if use_ap_stcr_train and resume_pending_after_reset:
             if start_epoch != get_reset_epoch(cfg) + 1:
                 raise RuntimeError(
@@ -16833,13 +19153,25 @@ def main():
                     lr_floor_activated_logged,
                 )
             )
-            ap_stcr.clear_temporal_history()
+            ap_history_allocated = (
+                getattr(ap_stcr, "history_bank", None) is not None
+            )
+            clear_ap_history = (
+                ap_history_allocated
+                and ap_stcr_should_clear_history_on_reset(cfg)
+            )
+            if clear_ap_history:
+                ap_stcr.clear_temporal_history()
             logger.log(
                 "[AP-STCR Reset] pending after-epoch reset replayed exactly "
                 f"once | saved_epoch={get_reset_epoch(cfg):03d} | "
                 f"next_epoch={start_epoch:03d} | "
-                "semantic_cache_preserved=True | history_cleared=True | "
-                "cross_reset_history_used=False"
+                "semantic_cache_preserved=True | "
+                f"teacher_reset={bool(getattr(cfg, 'FINETUNE_RESET_TEACHER', False))} | "
+                f"temporal_history_allocated={ap_history_allocated} | "
+                f"history_cleared={clear_ap_history} | "
+                "cross_reset_history_used="
+                f"{ap_history_allocated and not clear_ap_history}"
             )
 
         tepr_memory = None
@@ -16897,6 +19229,8 @@ def main():
         rast_first_batch_logged = False
         static_weight_first_batch_logged = False
         teacher_routing_first_batch_logged = False
+        bitc_first_batch_logged_epoch = None
+        bitc_debug_saved = 0
         ap_stcr_first_batch_logged_epoch = None
         ecst_first_batch_logged_epoch = None
         source_arbiter_first_batch_logged_epoch = None
@@ -16950,6 +19284,9 @@ def main():
 
         for epoch in range(start_epoch, max_epoch + 1):
             ppse_actor_epoch_audit = None
+            bitc_epoch_start_time = (
+                time.perf_counter() if use_bitc_train else None
+            )
             source_arbiter_epoch_start_time = (
                 time.perf_counter() if use_source_arbiter_train else None
             )
@@ -16972,6 +19309,8 @@ def main():
             set_model_epoch(teacher, epoch)
             student.train()
             teacher.eval()
+            if cvsa_router is not None:
+                cvsa_router.train()
             if use_pssf_train:
                 pssf.train()
                 if use_ppse_v2(cfg):
@@ -17012,6 +19351,9 @@ def main():
             target_mode = supervision_state["target_mode"]
             teacher_binary_used = supervision_state["teacher_binary_used"]
             total_loss = 0.0
+            oed_epoch_accumulator = (
+                new_oed_epoch_accumulator() if oed_enabled else None
+            )
             total_base_loss = 0.0
             total_anchor_loss = 0.0
             total_soft_loss = 0.0
@@ -17085,9 +19427,14 @@ def main():
                     teacher_routing_mode != LEGACY_TEACHER_ROUTING_MODE
                     and not use_pssf_train
                     and not use_ap_stcr_train
+                    and not use_cvsa_train
                 )
                 else None
             )
+            bitc_epoch_accumulator = (
+                new_bitc_epoch_accumulator() if use_bitc_train else None
+            )
+            bitc_baseline_teacher_final_loss_sum = 0.0
             ap_stcr_epoch_accumulator = (
                 new_ap_stcr_epoch_accumulator(
                     histogram_bins=int(
@@ -17103,6 +19450,10 @@ def main():
             ap_stcr_loss_coarse_sum = 0.0
             ap_stcr_loss_base_sum = 0.0
             ap_stcr_loss_group_sum = 0.0
+            cvsa_epoch_accumulator = (
+                new_cvsa_epoch_accumulator() if use_cvsa_train else None
+            )
+            cvsa_first_batch_logged = False
             pssf_epoch_accumulator = (
                 new_pssf_epoch_accumulator() if use_pssf_train else None
             )
@@ -17658,14 +20009,16 @@ def main():
             )
             gkd_branch_epoch = init_gkd_branch_accumulator() if gkd_mode == "branch" else None
             if (
-                use_hflip_training_view(cfg) or use_source_arbiter_train
+                use_hflip_training_view(cfg)
+                or use_source_arbiter_train
+                or use_bitc_train
             ) and torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats(device)
 
             for iter_idx, batch in enumerate(train_loader):
                 if use_cssd_train:
                     optimizer.zero_grad(set_to_none=True)
-                if use_ap_stcr_train:
+                if use_ap_stcr_train or use_cvsa_train or use_bitc_train:
                     leaked_gt_keys = sorted(
                         key
                         for key in batch
@@ -17679,8 +20032,28 @@ def main():
                     )
                     if leaked_gt_keys:
                         raise RuntimeError(
-                            "AP-STCR training batch must not contain GT fields: "
+                            "AP-STCR/CVSA/BITC training batch must not contain GT fields: "
                             f"{leaked_gt_keys}."
+                        )
+                if use_cvsa_train:
+                    required_cvsa_fields = {
+                        "sample_index",
+                        "dataset",
+                        "stem",
+                        "image_path",
+                        "feature",
+                        "feature_hflip",
+                        "image_hflip_68",
+                        "pu_target_soft",
+                        "cvsa_fixed_hflip_68",
+                    }
+                    missing_cvsa_fields = sorted(
+                        required_cvsa_fields.difference(batch)
+                    )
+                    if missing_cvsa_fields:
+                        raise RuntimeError(
+                            "CVSA batch is missing required fields: "
+                            f"{missing_cvsa_fields}."
                         )
                     required_ap_fields = {
                         "sample_index",
@@ -17752,6 +20125,8 @@ def main():
                 image_136 = make_image_136(cfg, batch, device)
                 pseudo_68 = F.interpolate(pseudo, size=(cfg.LOSS_SIZE, cfg.LOSS_SIZE), mode="bilinear").float()
                 pu_target_soft = None
+                pu_p_base_soft = None
+                pu_static_source_target = None
                 pu_weight_map_raw = None
                 pu_weight_map = None
                 pu_static_target = None
@@ -17760,8 +20135,57 @@ def main():
                 pu_target_hard = None
                 pu_fg_core = None
                 pu_bg_core = None
-                if use_dabe_pu:
+                if use_dabe_clean:
+                    forbidden_clean_batch_keys = {
+                        "pu_weight_map",
+                        "weight_map",
+                        "dabe_clean_static_weight_map",
+                    }.intersection(batch)
+                    if forbidden_clean_batch_keys:
+                        raise RuntimeError(
+                            "DABE-Clean batch must not carry a static weight map: "
+                            f"{sorted(forbidden_clean_batch_keys)}"
+                        )
+                    pu_target_soft = batch["dabe_clean_target_68"].to(
+                        device, non_blocking=True
+                    ).float().detach()
+                    pu_static_source_target = pu_target_soft
+                    pu_static_target = pu_target_soft
+                    # Internal diagnostic only. It is not read from cache/batch,
+                    # and dabe_static_bce_with_logits uses direct mean BCE.
+                    pu_static_weight_map = torch.ones_like(
+                        pu_static_target, requires_grad=False
+                    )
+                    batch_static_weight_mode = "clean_internal_ones_diagnostic"
+                    hard_thresh = float(getattr(cfg, "DABE_PU_HARD_THRESH", 0.5))
+                    pu_target_hard = (pu_target_soft > hard_thresh).float()
+                    dabe_pu_static_source = (
+                        f"dabe_clean_{str(getattr(cfg, 'DABE_CLEAN_TARGET_MODE', '')).lower()}_68"
+                    )
+                    for tensor_name, tensor in (
+                        ("target", pu_static_target),
+                        ("diagnostic_weight", pu_static_weight_map),
+                    ):
+                        if tensor.requires_grad or not bool(torch.isfinite(tensor).all().item()):
+                            raise RuntimeError(
+                                f"DABE-Clean {tensor_name} must be finite and detached."
+                            )
+                elif use_dabe_pu_cache:
                     pu_target_soft = batch["pu_target_soft"].to(device, non_blocking=True).float()
+                    dabe_pu_static_source = get_dabe_pu_static_source(cfg)
+                    if dabe_pu_static_source == "p_base_68":
+                        if "pu_p_base_soft" not in batch:
+                            raise RuntimeError(
+                                "DABE_PU_STATIC_SOURCE='p_base_68' requires "
+                                "batch['pu_p_base_soft']."
+                            )
+                        pu_p_base_soft = batch["pu_p_base_soft"].to(
+                            device,
+                            non_blocking=True,
+                        ).float()
+                        pu_static_source_target = pu_p_base_soft
+                    else:
+                        pu_static_source_target = pu_target_soft
                     hard_thresh = float(getattr(cfg, "DABE_PU_HARD_THRESH", 0.5))
                     pu_target_hard = (pu_target_soft > hard_thresh).float()
                     pu_static_target = pu_target_soft
@@ -17773,19 +20197,20 @@ def main():
                         # Compatibility alias: legacy branches and diagnostics still
                         # consume the unmodified cache tensor.
                         pu_weight_map = pu_weight_map_raw
-                        if use_ap_stcr_train:
+                        if use_ap_stcr_train or use_cvsa_train:
                             pu_static_target = pu_target_soft.detach()
                             pu_static_weight_map = None
                             batch_static_weight_mode = (
-                                "bypassed_by_ap_stcr"
+                                "bypassed_by_detached_mixed_target"
                             )
                         elif use_dabe_pu_despl_sched:
                             pu_static_target, _, _ = build_dabe_pu_despl_static_target(
                                 cfg,
                                 pu_target_soft,
                                 pu_weight_map_raw,
+                                pu_p_base_soft=pu_p_base_soft,
                             )
-                        if not use_ap_stcr_train:
+                        if not use_ap_stcr_train and not use_cvsa_train:
                             pu_static_weight_map, batch_static_weight_mode = (
                                 build_effective_static_weight(
                                     cfg=cfg,
@@ -17825,6 +20250,37 @@ def main():
                         pu_bg_core = batch["pu_bg_core"].to(
                             device, non_blocking=True
                         ).float()
+                if use_dabe_clean and iter_idx == 0:
+                    evidence_parts = []
+                    for clean_key in (
+                        "dabe_clean_fg_evidence_37",
+                        "dabe_clean_bg_evidence_37",
+                    ):
+                        clean_value = batch[clean_key]
+                        if int(clean_value.numel()) == 0:
+                            evidence_parts.append(f"{clean_key}=not_available")
+                        else:
+                            clean_value = clean_value.float()
+                            evidence_parts.append(
+                                f"{clean_key}[min/mean/max]="
+                                f"{float(clean_value.min()):.6f}/"
+                                f"{float(clean_value.mean()):.6f}/"
+                                f"{float(clean_value.max()):.6f}"
+                            )
+                    logger.log(
+                        f"[DABE-Clean FirstBatch] epoch={epoch:03d} | "
+                        f"mode={getattr(cfg, 'DABE_CLEAN_TARGET_MODE')} | "
+                        f"target_shape={list(pu_static_target.shape)} | "
+                        "target_min/mean/max="
+                        f"{float(pu_static_target.min()):.6f}/"
+                        f"{float(pu_static_target.mean()):.6f}/"
+                        f"{float(pu_static_target.max()):.6f} | "
+                        "static_map_from_batch=False | internal_map_all_ones="
+                        f"{bool(torch.all(pu_static_weight_map == 1.0).item())} | "
+                        f"legacy_routing_namespace={'legacy_ecst' if bool(getattr(cfg, 'DABE_CLEAN_USE_LEGACY_ECST_REGIONS', False)) else 'disabled'} | "
+                        f"stems={list(batch.get('stem', []))} | "
+                        + " | ".join(evidence_parts)
+                    )
                 csd_bg_reliable_68 = None
                 if (
                     (use_csd_head(cfg) or use_csd_v1r_head(cfg))
@@ -18016,8 +20472,16 @@ def main():
                         image_68=image_68,
                         image_136=image_136,
                         sobel_68=sobel_68,
-                        return_aux=False,
+                        return_aux=use_bitc_train,
                     )
+                    if use_bitc_train and (
+                        not isinstance(teacher_out, dict)
+                        or "coarse_logits_37" not in teacher_out
+                    ):
+                        raise RuntimeError(
+                            "BITC-v1 requires the existing EMA-Teacher forward "
+                            "to expose coarse_logits_37."
+                        )
                     teacher_logits = resize_logits_for_loss(extract_logits(teacher_out), cfg)
                     teacher_prob = teacher_logits.sigmoid()
                     if use_pssf_train:
@@ -18048,6 +20512,123 @@ def main():
                         teacher_full_target = teacher_prob.detach()
                     else:
                         teacher_full_target = teacher_binary
+
+                    cvsa_teacher_hflip_prob = None
+                    if use_cvsa_train:
+                        cvsa_hflip_model_input = make_hflip_model_input(
+                            cfg, batch, device
+                        )
+                        cvsa_hflip_image_68 = make_hflip_image_68(
+                            cfg, batch, device
+                        )
+                        cvsa_teacher_hflip_out = forward_seg_head(
+                            teacher,
+                            cvsa_hflip_model_input,
+                            cfg,
+                            image_68=cvsa_hflip_image_68,
+                            return_aux=False,
+                        )
+                        cvsa_teacher_hflip_logits = resize_logits_for_loss(
+                            extract_logits(cvsa_teacher_hflip_out), cfg
+                        )
+                        cvsa_teacher_hflip_prob = (
+                            cvsa_teacher_hflip_logits.sigmoid().detach()
+                        )
+
+                cvsa_batch_result = None
+                if use_cvsa_train:
+                    cvsa_fixed_hflip_68 = batch[
+                        "cvsa_fixed_hflip_68"
+                    ].to(device, non_blocking=True).float()
+                    cvsa_feature_hflip = batch["feature_hflip"].to(
+                        device, non_blocking=True
+                    ).float()
+                    cvsa_batch_result = build_cvsa_batch(
+                        config=cvsa_config,
+                        feature_a=model_input,
+                        feature_b=cvsa_feature_hflip,
+                        fixed_a_68=pu_target_soft.detach(),
+                        fixed_b_68=cvsa_fixed_hflip_68.detach(),
+                        teacher_a_68=teacher_prob.detach(),
+                        teacher_b_68=cvsa_teacher_hflip_prob,
+                        teacher_binary_a_68=teacher_binary.detach(),
+                        router=cvsa_router,
+                    )
+                    if cvsa_batch_result["mixed_target_68"].requires_grad:
+                        raise RuntimeError("CVSA mixed target must be detached.")
+                    if not cvsa_first_batch_logged:
+                        cvsa_result = cvsa_batch_result
+                        logger.log(
+                            "[CVSA FirstBatch] "
+                            f"epoch={epoch:03d} | "
+                            f"route_mode={cvsa_result['route_mode']} | "
+                            f"feature_a/b={list(model_input.shape)}/"
+                            f"{list(cvsa_feature_hflip.shape)} | "
+                            f"fixed_a/b={list(pu_target_soft.shape)}/"
+                            f"{list(cvsa_fixed_hflip_68.shape)} | "
+                            f"teacher_a/b={list(teacher_prob.shape)}/"
+                            f"{list(cvsa_teacher_hflip_prob.shape)}"
+                        )
+                        logger.log(
+                            "[CVSA FirstBatch] validity | "
+                            "fixed/teacher/both/both_invalid="
+                            f"{float(cvsa_result['fixed_valid'].float().mean()):.6f}/"
+                            f"{float(cvsa_result['teacher_valid'].float().mean()):.6f}/"
+                            f"{float(cvsa_result['both_valid'].float().mean()):.6f}/"
+                            f"{float(cvsa_result['both_invalid'].float().mean()):.6f}"
+                        )
+                        logger.log(
+                            "[CVSA FirstBatch] risk/gate | "
+                            "fixed_total/teacher_total/target/gate mean="
+                            f"{float(cvsa_result['fixed_total_risk_37'].mean()):.6f}/"
+                            f"{float(cvsa_result['teacher_total_risk_37'].mean()):.6f}/"
+                            f"{float(cvsa_result['route_target_37'].mean()):.6f}/"
+                            f"{float(cvsa_result['router_gate_37'].mean()):.6f} | "
+                            f"route_loss={float(cvsa_result['loss_route'].detach()):.8f}"
+                        )
+                        logger.log(
+                            "[CVSA FirstBatch] causal_contract | "
+                            "gate_inputs=canonical_only | "
+                            "route_target=current_cross_view_risk | "
+                            "future_teacher=False | global_schedule=False | "
+                            "temporal_history=False | training_gt=False"
+                        )
+                        cvsa_first_batch_logged = True
+                    if (
+                        bool(cvsa_config.get("export_visualization", True))
+                        and int(epoch)
+                        % max(
+                            1,
+                            int(cvsa_config.get("visualization_interval", 1)),
+                        )
+                        == 0
+                    ):
+                        selected = {
+                            int(value)
+                            for value in cvsa_config.get(
+                                "visualization_sample_indices", [0]
+                            )
+                        }
+                        for local_index, sample_index in enumerate(
+                            batch["sample_index"].tolist()
+                        ):
+                            if int(sample_index) not in selected:
+                                continue
+                            payload = build_cvsa_diagnostic_payload(
+                                epoch=epoch,
+                                local_index=local_index,
+                                batch=batch,
+                                image_68=image_68,
+                                student_prob_68=student_logits.sigmoid().detach(),
+                                result=cvsa_batch_result,
+                            )
+                            visual_dir = cvsa_visual_root / f"epoch_{epoch:03d}"
+                            ensure_dir(visual_dir)
+                            prefix = f"{payload['dataset']}__{payload['stem']}"
+                            torch.save(payload, visual_dir / f"{prefix}.pt")
+                            export_cvsa_visualization(
+                                payload, visual_dir / f"{prefix}.png", gt=None
+                            )
 
                 ap_stcr_batch_result = None
                 if use_ap_stcr_train:
@@ -18096,21 +20677,39 @@ def main():
                         == 0
                     ):
                         ap_result = ap_stcr_batch_result
-                        logger.log(
-                            "[AP-STCR FirstBatch] "
-                            f"epoch={epoch:03d} | "
-                            f"feature_shape={list(model_input.shape)} | "
-                            f"target37/bg_anchor37="
-                            f"{list(ap_fixed_37.shape)}/"
-                            f"{list(ap_bg_anchor_37.shape)} | "
-                            f"target68={list(ap_result['mixed_target_68'].shape)} | "
-                            f"sample_index={ap_sample_indices.tolist()} | "
-                            f"alpha={float(ap_result['global_teacher_ratio']):.9f} | "
-                            "history_count min/mean/max="
-                            f"{int(ap_result['history_count'].min())}/"
-                            f"{float(ap_result['history_count'].float().mean()):.4f}/"
-                            f"{int(ap_result['history_count'].max())}"
+                        ap_result_is_a1 = (
+                            str(ap_result.get("version", "")).strip()
+                            == "ap_stcr_v4_semantic_only_ablation"
                         )
+                        if ap_result_is_a1:
+                            logger.log(
+                                "[AP-STCR-A1 FirstBatch] "
+                                f"epoch={epoch:03d} | "
+                                f"feature_shape={list(model_input.shape)} | "
+                                f"target37/bg_anchor37="
+                                f"{list(ap_fixed_37.shape)}/"
+                                f"{list(ap_bg_anchor_37.shape)} | "
+                                f"target68={list(ap_result['mixed_target_68'].shape)} | "
+                                f"sample_index={ap_sample_indices.tolist()} | "
+                                f"alpha={float(ap_result['global_teacher_ratio']):.9f} | "
+                                "temporal_history_allocated=False"
+                            )
+                        else:
+                            logger.log(
+                                "[AP-STCR FirstBatch] "
+                                f"epoch={epoch:03d} | "
+                                f"feature_shape={list(model_input.shape)} | "
+                                f"target37/bg_anchor37="
+                                f"{list(ap_fixed_37.shape)}/"
+                                f"{list(ap_bg_anchor_37.shape)} | "
+                                f"target68={list(ap_result['mixed_target_68'].shape)} | "
+                                f"sample_index={ap_sample_indices.tolist()} | "
+                                f"alpha={float(ap_result['global_teacher_ratio']):.9f} | "
+                                "history_count min/mean/max="
+                                f"{int(ap_result['history_count'].min())}/"
+                                f"{float(ap_result['history_count'].float().mean()):.4f}/"
+                                f"{int(ap_result['history_count'].max())}"
+                            )
                         logger.log(
                             "[AP-STCR FirstBatch] "
                             "fg/bg anchors mean="
@@ -18122,22 +20721,151 @@ def main():
                             f"{float(ap_result['semantic_margin_37'].mean()):.6f}/"
                             f"{float(ap_result['semantic_margin_37'].max()):.6f}"
                         )
-                        logger.log(
-                            "[AP-STCR FirstBatch] "
-                            "semantic/temporal/acceptance mean="
-                            f"{float(ap_result['semantic_support_37'].mean()):.6f}/"
-                            f"{float(ap_result['temporal_support_37'].mean()):.6f}/"
-                            f"{float(ap_result['local_acceptance_37'].mean()):.6f} | "
-                            "effective teacher min/mean/max="
-                            f"{float(ap_result['effective_teacher_weight_68'].min()):.6f}/"
-                            f"{float(ap_result['effective_teacher_weight_68'].mean()):.6f}/"
-                            f"{float(ap_result['effective_teacher_weight_68'].max()):.6f} | "
-                            "fixed/teacher/mixed area="
-                            f"{float(pu_target_soft.mean()):.6f}/"
-                            f"{float(teacher_binary.mean()):.6f}/"
-                            f"{float(ap_result['mixed_target_68'].mean()):.6f} | "
-                            "training_gt_used=False"
-                        )
+                        if ap_result_is_a1:
+                            logger.log(
+                                "[AP-STCR-A1 FirstBatch] "
+                                "semantic_contradiction min/mean/max="
+                                f"{float(ap_result['semantic_contradiction_37'].min()):.6f}/"
+                                f"{float(ap_result['semantic_contradiction_37'].mean()):.6f}/"
+                                f"{float(ap_result['semantic_contradiction_37'].max()):.6f} | "
+                                "soft_deviation_mean="
+                                f"{float(ap_result['soft_deviation_37'].mean()):.6f} | "
+                                "transition_envelope="
+                                f"{float(ap_result['transition_envelope']):.6f} | "
+                                "transition_penalty mean/std="
+                                f"{float(ap_result['transition_penalty_37'].mean()):.6f}/"
+                                f"{float(ap_result['transition_penalty_37'].std(unbiased=False)):.6f}"
+                            )
+                            logger.log(
+                                "[AP-STCR-A1 FirstBatch] "
+                                "local_acceptance min/mean/max="
+                                f"{float(ap_result['local_acceptance_37'].min()):.6f}/"
+                                f"{float(ap_result['local_acceptance_37'].mean()):.6f}/"
+                                f"{float(ap_result['local_acceptance_37'].max()):.6f} | "
+                                "effective_teacher/effective_fixed mean="
+                                f"{float(ap_result['effective_teacher_weight_37'].mean()):.6f}/"
+                                f"{float((1.0 - ap_result['effective_teacher_weight_37']).mean()):.6f} | "
+                                "fixed/teacher/mixed area="
+                                f"{float(pu_target_soft.mean()):.6f}/"
+                                f"{float(teacher_binary.mean()):.6f}/"
+                                f"{float(ap_result['mixed_target_68'].mean()):.6f} | "
+                                "training_gt_used=False"
+                            )
+                        else:
+                            logger.log(
+                                "[AP-STCR FirstBatch] "
+                                "semantic/temporal/acceptance mean="
+                                f"{float(ap_result['semantic_support_37'].mean()):.6f}/"
+                                f"{float(ap_result['temporal_support_37'].mean()):.6f}/"
+                                f"{float(ap_result['local_acceptance_37'].mean()):.6f} | "
+                                "effective teacher min/mean/max="
+                                f"{float(ap_result['effective_teacher_weight_68'].min()):.6f}/"
+                                f"{float(ap_result['effective_teacher_weight_68'].mean()):.6f}/"
+                                f"{float(ap_result['effective_teacher_weight_68'].max()):.6f} | "
+                                "fixed/teacher/mixed area="
+                                f"{float(pu_target_soft.mean()):.6f}/"
+                                f"{float(teacher_binary.mean()):.6f}/"
+                                f"{float(ap_result['mixed_target_68'].mean()):.6f} | "
+                                "training_gt_used=False"
+                            )
+                        if (
+                            str(ap_result.get("version", "")).strip()
+                            == "ap_stcr_v3_soft_disagreement_bounded_continuation"
+                        ):
+                            logger.log(
+                                "[AP-STCR-v3 FirstBatch] "
+                                "soft_deviation min/mean/max="
+                                f"{float(ap_result['soft_deviation_37'].min()):.6f}/"
+                                f"{float(ap_result['soft_deviation_37'].mean()):.6f}/"
+                                f"{float(ap_result['soft_deviation_37'].max()):.6f} | "
+                                "fused_support min/mean/max="
+                                f"{float(ap_result['fused_support_37'].min()):.6f}/"
+                                f"{float(ap_result['fused_support_37'].mean()):.6f}/"
+                                f"{float(ap_result['fused_support_37'].max()):.6f} | "
+                                "support_deficiency/soft_inertia mean="
+                                f"{float(ap_result['support_deficiency_37'].mean()):.6f}/"
+                                f"{float(ap_result['soft_inertia_37'].mean()):.6f}"
+                            )
+                            logger.log(
+                                "[AP-STCR-v3 FirstBatch] "
+                                "local_acceptance min/mean/max="
+                                f"{float(ap_result['local_acceptance_37'].min()):.6f}/"
+                                f"{float(ap_result['local_acceptance_37'].mean()):.6f}/"
+                                f"{float(ap_result['local_acceptance_37'].max()):.6f} | "
+                                "effective_teacher/effective_fixed mean="
+                                f"{float(ap_result['effective_teacher_weight_37'].mean()):.6f}/"
+                                f"{float((1.0 - ap_result['effective_teacher_weight_37']).mean()):.6f} | "
+                                "source_conflict_ratio_diagnostic_only="
+                                f"{float(ap_result['source_conflict_37'].float().mean()):.6f}"
+                            )
+                        if (
+                            str(ap_result.get("version", "")).strip()
+                            == "ap_stcr_v4_transition_envelope_non_compensatory"
+                        ):
+                            logger.log(
+                                "[AP-STCR-v4 FirstBatch] "
+                                "soft_deviation min/mean/max="
+                                f"{float(ap_result['soft_deviation_37'].min()):.6f}/"
+                                f"{float(ap_result['soft_deviation_37'].mean()):.6f}/"
+                                f"{float(ap_result['soft_deviation_37'].max()):.6f} | "
+                                "semantic_contradiction min/mean/max="
+                                f"{float(ap_result['semantic_contradiction_37'].min()):.6f}/"
+                                f"{float(ap_result['semantic_contradiction_37'].mean()):.6f}/"
+                                f"{float(ap_result['semantic_contradiction_37'].max()):.6f} | "
+                                "temporal_instability min/mean/max="
+                                f"{float(ap_result['temporal_instability_37'].min()):.6f}/"
+                                f"{float(ap_result['temporal_instability_37'].mean()):.6f}/"
+                                f"{float(ap_result['temporal_instability_37'].max()):.6f}"
+                            )
+                            logger.log(
+                                "[AP-STCR-v4 FirstBatch] "
+                                "combined_negative_evidence min/mean/max="
+                                f"{float(ap_result['combined_negative_evidence_37'].min()):.6f}/"
+                                f"{float(ap_result['combined_negative_evidence_37'].mean()):.6f}/"
+                                f"{float(ap_result['combined_negative_evidence_37'].max()):.6f} | "
+                                "transition_envelope="
+                                f"{float(ap_result['transition_envelope']):.6f} | "
+                                "transition_penalty min/mean/max="
+                                f"{float(ap_result['transition_penalty_37'].min()):.6f}/"
+                                f"{float(ap_result['transition_penalty_37'].mean()):.6f}/"
+                                f"{float(ap_result['transition_penalty_37'].max()):.6f}"
+                            )
+                            logger.log(
+                                "[AP-STCR-v4 FirstBatch] "
+                                "local_acceptance min/mean/max="
+                                f"{float(ap_result['local_acceptance_37'].min()):.6f}/"
+                                f"{float(ap_result['local_acceptance_37'].mean()):.6f}/"
+                                f"{float(ap_result['local_acceptance_37'].max()):.6f} | "
+                                "effective_teacher/effective_fixed mean="
+                                f"{float(ap_result['effective_teacher_weight_37'].mean()):.6f}/"
+                                f"{float((1.0 - ap_result['effective_teacher_weight_37']).mean()):.6f} | "
+                                "history_valid_ratio="
+                                f"{float(ap_result['history_valid'].float().mean()):.6f}"
+                            )
+                        if bool(ap_result.get("conflict_only", False)):
+                            conflict_mask = (
+                                ap_result["source_conflict_37"] > 0.5
+                            )
+                            non_conflict_mask = ~conflict_mask
+                            logger.log(
+                                "[AP-STCR-v2 FirstBatch] "
+                                "source_conflict_ratio="
+                                f"{float(conflict_mask.float().mean()):.6f} | "
+                                "semantic_negative_mean="
+                                f"{float(ap_result['semantic_negative_37'].mean()):.6f} | "
+                                "temporal_negative_mean="
+                                f"{float(ap_result['temporal_negative_37'].mean()):.6f} | "
+                                "local_rejection_mean="
+                                f"{float(ap_result['local_rejection_37'].mean()):.6f} | "
+                                "local_acceptance_on_conflict="
+                                f"{_masked_mean_for_log(ap_result['local_acceptance_37'], conflict_mask):.6f} | "
+                                "local_acceptance_on_non_conflict="
+                                f"{_masked_mean_for_log(ap_result['local_acceptance_37'], non_conflict_mask):.6f} | "
+                                "effective_teacher_weight_on_conflict="
+                                f"{_masked_mean_for_log(ap_result['effective_teacher_weight_37'], conflict_mask):.6f} | "
+                                "effective_teacher_weight_on_non_conflict="
+                                f"{_masked_mean_for_log(ap_result['effective_teacher_weight_37'], non_conflict_mask):.6f}"
+                            )
                         ap_stcr_first_batch_logged_epoch = int(epoch)
                     ap_visual_cfg = dict(getattr(cfg, "AP_STCR"))
                     if (
@@ -18373,6 +21101,8 @@ def main():
                 history_count = None
                 tepr_sample_indices = None
                 tepr_stats = None
+                bitc_result = None
+                bitc_stats = None
                 rast_stats = {
                     "rast_scale": 0.0,
                     "rast_pre_reset_scale": 0.0,
@@ -18399,8 +21129,175 @@ def main():
                     "esa_post_reset_active": False,
                     "esa_post_reset_scale": 0.0,
                 }
-                if use_pssf_train or use_ap_stcr_train:
+                if use_pssf_train or use_ap_stcr_train or use_cvsa_train:
                     teacher_routing_scale = 0.0
+                elif use_bitc_train:
+                    required_bitc_fields = {
+                        "bitc_topk_indices",
+                        "bitc_topk_weights",
+                        "bitc_background_anchor_mask",
+                        "bitc_nearest_bg_index",
+                        "bitc_fixed_random_bg_index",
+                        "bitc_background_anchor_count",
+                        "bitc_cache_fingerprint",
+                    }
+                    missing_bitc_fields = sorted(
+                        required_bitc_fields.difference(batch)
+                    )
+                    if missing_bitc_fields:
+                        raise RuntimeError(
+                            "BITC-v1 batch is missing cache fields: "
+                            f"{missing_bitc_fields}"
+                        )
+                    substitute_feature, bitc_norm_stats = build_query_norm_substitute(
+                        model_input.detach(),
+                        batch,
+                        str(getattr(cfg, "BITC_SUBSTITUTION_MODE")),
+                    )
+                    counterfactual_feature, bitc_group_masks = (
+                        build_grouped_counterfactuals(
+                            model_input.detach(),
+                            substitute_feature,
+                        )
+                    )
+                    teacher_module = getattr(teacher, "module", teacher)
+                    if not hasattr(teacher_module, "forward_coarse_only"):
+                        raise RuntimeError(
+                            "BITC-v1 requires EMA-Teacher.forward_coarse_only()."
+                        )
+                    # Match the precision of the existing original Teacher
+                    # forward.  The current repository runs it in FP32; using
+                    # FP16 only for the counterfactual would create a false
+                    # response even for the identity intervention.  If the
+                    # outer training path later enables autocast, BITC inherits it.
+                    bitc_autocast_enabled = bool(
+                        device.type == "cuda" and torch.is_autocast_enabled()
+                    )
+                    with torch.autocast(
+                        device_type=device.type,
+                        enabled=bitc_autocast_enabled,
+                    ):
+                        counterfactual_coarse_logits_37 = (
+                            teacher_module.forward_coarse_only(
+                                counterfactual_feature,
+                                epoch=epoch,
+                                return_logits_37=True,
+                            )
+                        )
+                    bitc_result = build_bitc_teacher_map(
+                        original_coarse_logits_37=teacher_out[
+                            "coarse_logits_37"
+                        ].detach(),
+                        counterfactual_coarse_logits_37=(
+                            counterfactual_coarse_logits_37.detach()
+                        ),
+                        group_masks=bitc_group_masks,
+                        teacher_binary_68=teacher_binary.detach(),
+                        weight_floor=float(
+                            getattr(cfg, "BITC_WEIGHT_FLOOR", 0.20)
+                        ),
+                        response_clip=float(
+                            getattr(cfg, "BITC_RESPONSE_CLIP", 6.0)
+                        ),
+                        norm_stats=bitc_norm_stats,
+                    )
+                    teacher_route_map = bitc_result["teacher_map_68"].detach()
+                    bitc_stats = bitc_result["stats"]
+                    teacher_routing_scale = 1.0
+                    if (
+                        bitc_debug_enabled
+                        and bitc_debug_saved
+                        < int(getattr(cfg, "BITC_DEBUG_MAX_IMAGES", 5))
+                    ):
+                        original_norm_37 = torch.linalg.vector_norm(
+                            model_input.detach().float(), dim=1, keepdim=True
+                        )
+                        substitute_norm_37 = torch.linalg.vector_norm(
+                            substitute_feature.detach().float(), dim=1, keepdim=True
+                        )
+                        substitute_norm_ratio_37 = (
+                            substitute_norm_37
+                            / original_norm_37.clamp_min(1e-12)
+                        )
+                        datasets = list(batch.get("dataset", []))
+                        stems = list(batch.get("stem", []))
+                        sample_names = [
+                            f"{dataset}_{stem}"
+                            for dataset, stem in zip(datasets, stems)
+                        ]
+                        saved_now = export_bitc_debug_batch(
+                            train_dir.parent / "bitc_debug",
+                            image_68=image_68.detach(),
+                            dabe_soft_68=pu_target_soft.detach(),
+                            teacher_binary_68=teacher_binary.detach(),
+                            teacher_coarse_logits_37=teacher_out[
+                                "coarse_logits_37"
+                            ].detach(),
+                            substitute_norm_ratio_37=(
+                                substitute_norm_ratio_37.detach()
+                            ),
+                            response_centered_37=bitc_result[
+                                "response_centered_37"
+                            ],
+                            cf_evidence_37=bitc_result["cf_evidence_37"],
+                            teacher_map_68=teacher_route_map,
+                            student_final_prob_68=student_logits.sigmoid().detach(),
+                            group_masks=bitc_group_masks,
+                            sample_names=sample_names,
+                            start_index=bitc_debug_saved,
+                            max_images=int(
+                                getattr(cfg, "BITC_DEBUG_MAX_IMAGES", 5)
+                            ),
+                        )
+                        bitc_debug_saved += int(saved_now)
+                    if (
+                        bitc_first_batch_logged_epoch != int(epoch)
+                        and int(epoch)
+                        % max(1, int(getattr(cfg, "BITC_LOG_INTERVAL", 1)))
+                        == 0
+                    ):
+                        cache_fingerprints = sorted(
+                            set(batch["bitc_cache_fingerprint"])
+                        )
+                        if len(cache_fingerprints) != 1:
+                            raise RuntimeError(
+                                "BITC batch mixes cache protocol fingerprints: "
+                                f"{cache_fingerprints}"
+                            )
+                        logger.log(
+                            f"[BITC FirstBatch] epoch={epoch:03d} | "
+                            f"mode={getattr(cfg, 'BITC_SUBSTITUTION_MODE')} | "
+                            f"cache_fingerprint={cache_fingerprints[0]} | "
+                            f"feature_shape={list(model_input.shape)} | "
+                            f"topk_shape={list(batch['bitc_topk_indices'].shape)} | "
+                            "background_anchor_count_min/max="
+                            f"{int(batch['bitc_background_anchor_count'].min().item())}/"
+                            f"{int(batch['bitc_background_anchor_count'].max().item())} | "
+                            f"num_groups={int(bitc_group_masks.shape[0])} | "
+                            "group_coverage_ratio="
+                            f"{bitc_stats['bitc_group_coverage_ratio']:.6f} | "
+                            "original/coarse_cf/map37/map68_shape="
+                            f"{list(teacher_out['coarse_logits_37'].shape)}/"
+                            f"{list(counterfactual_coarse_logits_37.shape)}/"
+                            f"{list(bitc_result['teacher_map_37'].shape)}/"
+                            f"{list(teacher_route_map.shape)} | "
+                            f"dtype={model_input.dtype} | no_grad=True | "
+                            f"autocast={bitc_autocast_enabled} | "
+                            "norm_original/substitute/ratio/max_relerr="
+                            f"{bitc_stats['bitc_original_token_norm_mean']:.6f}/"
+                            f"{bitc_stats['bitc_substitute_token_norm_mean']:.6f}/"
+                            f"{bitc_stats['bitc_norm_ratio_mean']:.6f}/"
+                            f"{bitc_stats['bitc_norm_relative_error_max']:.9g} | "
+                            "response_centered_mean/mad/evidence="
+                            f"{bitc_stats['bitc_response_centered_mean']:.6f}/"
+                            f"{bitc_stats['bitc_response_mad']:.6f}/"
+                            f"{bitc_stats['bitc_cf_evidence_mean']:.6f} | "
+                            "map_min/mean/max="
+                            f"{bitc_stats['bitc_teacher_map_min']:.6f}/"
+                            f"{bitc_stats['bitc_teacher_map_mean']:.6f}/"
+                            f"{bitc_stats['bitc_teacher_map_max']:.6f}"
+                        )
+                        bitc_first_batch_logged_epoch = int(epoch)
                 elif teacher_routing_mode == "none":
                     teacher_route_map, _ = build_identity_teacher_route(
                         teacher_prob.detach()
@@ -18423,7 +21320,15 @@ def main():
                             f"ECST sample_index out of range: {index_min}/{index_max}, "
                             f"dataset_size={len(train_dataset)}."
                         )
-                    update_end = int(getattr(cfg, "ECST_MEMORY_UPDATE_END_EPOCH", 20))
+                    update_end = int(
+                        getattr(
+                            cfg,
+                            "ECST_CLEAN_MEMORY_UPDATE_END_EPOCH"
+                            if use_ecst_clean_train
+                            else "ECST_MEMORY_UPDATE_END_EPOCH",
+                            20,
+                        )
+                    )
                     if int(epoch) <= update_end:
                         if ecst_memory is None:
                             raise RuntimeError(
@@ -18445,7 +21350,33 @@ def main():
                                     device,
                                 )
                             )
-                        if (
+                        if use_ecst_clean_train:
+                            teacher_route_map, ecst_stats = (
+                                build_ecst_clean_teacher_weight_map(
+                                    cfg=cfg,
+                                    batch=batch,
+                                    teacher_prob=teacher_prob.detach(),
+                                    temporal_mean=temporal_mean,
+                                    temporal_second=temporal_second,
+                                    history_count=history_count,
+                                    epoch=epoch,
+                                    device=device,
+                                )
+                            )
+                        elif use_ecst_minimal_train:
+                            teacher_route_map, ecst_stats = (
+                                build_ecst_minimal_teacher_weight_map(
+                                    cfg=cfg,
+                                    batch=batch,
+                                    teacher_prob=teacher_prob.detach(),
+                                    temporal_mean=temporal_mean,
+                                    temporal_second=temporal_second,
+                                    history_count=history_count,
+                                    epoch=epoch,
+                                    device=device,
+                                )
+                            )
+                        elif (
                             use_source_arbiter_train
                             and source_arbiter_mode
                             in {
@@ -18504,6 +21435,9 @@ def main():
                                 epoch=epoch,
                                 device=device,
                                 return_states=use_source_arbiter_train,
+                                region_key_prefix=(
+                                    "legacy_ecst" if use_dabe_clean else "pu"
+                                ),
                             )
                             if use_source_arbiter_train:
                                 (
@@ -18515,13 +21449,63 @@ def main():
                                 teacher_route_map, ecst_stats = ecst_result
                         ecst_stats["memory_active"] = True
                     else:
-                        teacher_route_map = torch.ones_like(teacher_prob, dtype=torch.float32)
+                        if use_ecst_clean_train:
+                            zero_temporal = torch.zeros_like(teacher_prob)
+                            zero_history = torch.zeros(
+                                int(teacher_prob.shape[0]),
+                                dtype=torch.long,
+                                device=device,
+                            )
+                            teacher_route_map, ecst_stats = (
+                                build_ecst_clean_teacher_weight_map(
+                                    cfg=cfg,
+                                    batch=batch,
+                                    teacher_prob=teacher_prob.detach(),
+                                    temporal_mean=zero_temporal,
+                                    temporal_second=zero_temporal,
+                                    history_count=zero_history,
+                                    epoch=epoch,
+                                    device=device,
+                                )
+                            )
+                            ecst_stats["memory_active"] = False
+                        elif use_ecst_minimal_train:
+                            zero_temporal = torch.zeros_like(teacher_prob)
+                            zero_history = torch.zeros(
+                                int(teacher_prob.shape[0]),
+                                dtype=torch.long,
+                                device=device,
+                            )
+                            teacher_route_map, ecst_stats = (
+                                build_ecst_minimal_teacher_weight_map(
+                                    cfg=cfg,
+                                    batch=batch,
+                                    teacher_prob=teacher_prob.detach(),
+                                    temporal_mean=zero_temporal,
+                                    temporal_second=zero_temporal,
+                                    history_count=zero_history,
+                                    epoch=epoch,
+                                    device=device,
+                                )
+                            )
+                            ecst_stats["memory_active"] = False
+                        else:
+                            teacher_route_map = torch.ones_like(
+                                teacher_prob, dtype=torch.float32
+                            )
+                            ecst_stats = make_ecst_inactive_stats(
+                                batch,
+                                teacher_prob,
+                                device,
+                                region_key_prefix=(
+                                    "legacy_ecst" if use_dabe_clean else "pu"
+                                ),
+                            )
                         if (
                             source_arbiter_mode == "pure_loss_space"
                             and source_arbiter_ecst_audit_enabled
                         ):
                             ecst_map_audit = teacher_route_map
-                        ecst_stats = make_ecst_inactive_stats(batch, teacher_prob, device)
                     teacher_routing_scale = float(ecst_stats["ecst_scale"])
                     if use_source_arbiter_train:
                         teacher_source_weight = build_teacher_source_weight(
@@ -18557,15 +21541,36 @@ def main():
                         % max(1, int(getattr(cfg, "ECST_LOG_INTERVAL_EPOCH", 1)))
                         == 0
                     ):
-                        log_ecst_first_batch(
-                            logger,
-                            cfg,
-                            epoch,
-                            ecst_sample_indices,
-                            ecst_stats,
-                            student_logits.sigmoid().detach(),
-                            teacher_prob.detach(),
-                        )
+                        if use_ecst_clean_train:
+                            log_ecst_clean_first_batch(
+                                logger,
+                                cfg,
+                                epoch,
+                                ecst_sample_indices,
+                                ecst_stats,
+                                student_logits.sigmoid().detach(),
+                                teacher_prob.detach(),
+                            )
+                        elif use_ecst_minimal_train:
+                            log_ecst_minimal_first_batch(
+                                logger,
+                                cfg,
+                                epoch,
+                                ecst_sample_indices,
+                                ecst_stats,
+                                student_logits.sigmoid().detach(),
+                                teacher_prob.detach(),
+                            )
+                        else:
+                            log_ecst_first_batch(
+                                logger,
+                                cfg,
+                                epoch,
+                                ecst_sample_indices,
+                                ecst_stats,
+                                student_logits.sigmoid().detach(),
+                                teacher_prob.detach(),
+                            )
                         ecst_first_batch_logged_epoch = int(epoch)
                 elif use_tepr_lite:
                     if "sample_index" not in batch:
@@ -18712,13 +21717,16 @@ def main():
                     teacher_routing_mode != LEGACY_TEACHER_ROUTING_MODE
                     and not use_pssf_train
                     and not use_ap_stcr_train
+                    and not use_cvsa_train
                 ):
                     if teacher_route_map is None:
                         raise RuntimeError(
                             "Explicit teacher routing did not construct a route map"
                         )
                     memory_active = bool(
-                        teacher_routing_mode == "ecst" and ecst_memory is not None
+                        teacher_routing_mode
+                        in {"ecst", "minimal_ecst", "clean_ecst"}
+                        and ecst_memory is not None
                     )
                     accumulate_teacher_routing(
                         teacher_routing_epoch_accumulator,
@@ -18730,9 +21738,9 @@ def main():
                             schedule_static_weight,
                             schedule_teacher_weight,
                         ) = get_dabe_pu_despl_schedule(epoch, cfg)
-                        static_target_unchanged = torch.equal(
+                        static_target_matches_selected_source = torch.equal(
                             pu_static_target,
-                            pu_target_soft,
+                            pu_static_source_target,
                         )
                         map_all_ones = torch.equal(
                             teacher_route_map,
@@ -18759,7 +21767,10 @@ def main():
                             f"map_all_ones={map_all_ones} | "
                             f"teacher_target_mode={dabe_pu_despl_teacher_target_mode} | "
                             f"static_weight_mode={static_weight_mode} | "
-                            f"static_target_unchanged={static_target_unchanged} | "
+                            "static_target_source="
+                            f"{dabe_pu_static_source} | "
+                            "static_target_matches_selected_source="
+                            f"{static_target_matches_selected_source} | "
                             "global_static/teacher="
                             f"{schedule_static_weight:.6f}/"
                             f"{schedule_teacher_weight:.6f}"
@@ -18813,13 +21824,13 @@ def main():
                             f"STATIC_WEIGHT_MODE={static_weight_mode!r} "
                             "failed its first-batch invariant"
                         )
-                    target_unchanged = torch.equal(
+                    target_matches_selected_source = torch.equal(
                         pu_static_target,
-                        pu_target_soft,
+                        pu_static_source_target,
                     )
-                    if not target_unchanged:
+                    if not target_matches_selected_source:
                         raise RuntimeError(
-                            "Static-weight ablation changed pu_static_target"
+                            "Static target does not match DABE_PU_STATIC_SOURCE"
                         )
                     logger.log(
                         "[StaticWeight FirstBatch] "
@@ -18842,7 +21853,9 @@ def main():
                         f"{float(pu_static_target.min().detach()):.6f}/"
                         f"{float(pu_static_target.mean().detach()):.6f}/"
                         f"{float(pu_static_target.max().detach()):.6f} | "
-                        f"target_unchanged={target_unchanged} | "
+                        f"target_source={dabe_pu_static_source} | "
+                        "target_matches_selected_source="
+                        f"{target_matches_selected_source} | "
                         "teacher_route_map_directly_affected=False | "
                         f"teacher_route_mean={float(teacher_route_map.mean().detach()):.6f}"
                     )
@@ -19797,7 +22810,11 @@ def main():
                     fixed_target = (1.0 - blend) * pseudo_68 + blend * qra_fused
 
                 late_override_ratio = 0.0
-                if use_ap_stcr_train:
+                if use_cvsa_train:
+                    if cvsa_batch_result is None:
+                        raise RuntimeError("CVSA supervision target is unavailable.")
+                    mixed_target = cvsa_batch_result["mixed_target_68"]
+                elif use_ap_stcr_train:
                     if ap_stcr_batch_result is None:
                         raise RuntimeError(
                             "AP-STCR supervision target is unavailable."
@@ -19917,6 +22934,7 @@ def main():
                 loss_oem_dyn_bg = zero_loss
                 pssf_seg_result = None
                 ap_stcr_seg_result = None
+                cvsa_seg_result = None
                 oem_seed_final_stats = {
                     "loss_seed_fg": 0.0,
                     "loss_seed_fg_fallback": 0.0,
@@ -19963,7 +22981,7 @@ def main():
                         "teacher_fg_ratio": teacher_binary_area,
                         "teacher_bg_ratio": 1.0 - teacher_binary_area,
                     }
-                if use_pssf_train or use_ap_stcr_train:
+                if use_pssf_train or use_ap_stcr_train or use_cvsa_train:
                     teacher_binary_area = float(
                         teacher_binary.detach().mean().item()
                     )
@@ -20082,7 +23100,20 @@ def main():
                                 )
                         gkd_first_batch_logged = True
                 else:
-                    if use_ap_stcr_train:
+                    if use_cvsa_train:
+                        cvsa_seg_result = build_cvsa_segmentation_group(
+                            cfg=cfg,
+                            epoch=epoch,
+                            student_out=student_out,
+                            student_logits=student_logits,
+                            mixed_target=mixed_target,
+                        )
+                        loss_final_bce = cvsa_seg_result["loss_final"]
+                        loss_tversky = zero_loss
+                        loss_base = cvsa_seg_result["loss"]
+                        pu_static_loss_weight = 0.0
+                        pu_teacher_loss_weight = 0.0
+                    elif use_ap_stcr_train:
                         ap_stcr_seg_result = (
                             build_ap_stcr_segmentation_group(
                                 cfg=cfg,
@@ -20168,10 +23199,11 @@ def main():
                         )
                     elif use_dabe_pu_despl_sched:
                         eps = float(getattr(cfg, "DABE_PU_WEIGHTED_BCE_EPS", 1e-6))
-                        loss_pu_static_final = weighted_bce_with_logits(
+                        loss_pu_static_final = dabe_static_bce_with_logits(
                             student_logits,
                             pu_static_target,
                             pu_static_weight_map,
+                            cfg,
                             eps=eps,
                         )
                         if use_source_arbiter_train:
@@ -20396,7 +23428,15 @@ def main():
                             )
                         )
                     )
-                    if use_ap_stcr_train:
+                    if use_cvsa_train:
+                        if cvsa_seg_result is None:
+                            raise RuntimeError(
+                                "CVSA segmentation group was not constructed."
+                            )
+                        loss = cvsa_seg_result["loss"]
+                        loss_ndr_coarse_aux = cvsa_seg_result["loss_coarse"]
+                        loss_aux_base = cvsa_seg_result["loss_base"]
+                    elif use_ap_stcr_train:
                         if ap_stcr_seg_result is None:
                             raise RuntimeError(
                                 "AP-STCR segmentation group was not constructed."
@@ -20760,10 +23800,11 @@ def main():
                             pu_aux_weights = [1.0]
                             if decoder_coarse_aux_enabled:
                                 coarse_logits = resize_logits_for_loss(student_out["coarse_logits_68"], cfg)
-                                loss_pu_static_coarse = weighted_bce_with_logits(
+                                loss_pu_static_coarse = dabe_static_bce_with_logits(
                                     coarse_logits,
                                     pu_static_target,
                                     pu_static_weight_map,
+                                    cfg,
                                     eps=eps,
                                 )
                                 if lceg_teacher_map_coarse is not None and bool(getattr(cfg, "LCEG_APPLY_TO_COARSE_AUX", True)):
@@ -20804,10 +23845,11 @@ def main():
                                     else float(getattr(cfg, "LAMBDA_BASE_AUX_AFTER_RESET", 0.1))
                                 )
                                 base_logits = resize_logits_for_loss(student_out["base_logits"], cfg)
-                                loss_pu_static_base = weighted_bce_with_logits(
+                                loss_pu_static_base = dabe_static_bce_with_logits(
                                     base_logits,
                                     pu_static_target,
                                     pu_static_weight_map,
+                                    cfg,
                                     eps=eps,
                                 )
                                 loss_pu_teacher_base = teacher_route_bce_with_logits(
@@ -21336,10 +24378,11 @@ def main():
                     elif use_dabe_pu_despl_sched:
                         eps = float(getattr(cfg, "DABE_PU_WEIGHTED_BCE_EPS", 1e-6))
                         pu_static_loss_weight, pu_teacher_loss_weight = get_dabe_pu_despl_schedule(epoch, cfg)
-                        loss_pu_static_base = weighted_bce_with_logits(
+                        loss_pu_static_base = dabe_static_bce_with_logits(
                             base_logits,
                             pu_static_target,
                             pu_static_weight_map,
+                            cfg,
                             eps=eps,
                         )
                         loss_pu_teacher_base = teacher_route_bce_with_logits(
@@ -21861,6 +24904,80 @@ def main():
                         )
                         esa_ber_first_active_batch_logged = True
 
+                if use_cvsa_train:
+                    if cvsa_batch_result is None or cvsa_seg_result is None:
+                        raise RuntimeError("CVSA loss state is unavailable.")
+                    loss_seg = cvsa_seg_result["loss"]
+                    loss_route = cvsa_batch_result["loss_route"]
+                    loss = loss_seg + float(
+                        cvsa_config["router_loss_weight"]
+                    ) * loss_route
+                oed_batch_result = None
+                if oed_enabled:
+                    if pu_target_soft is None:
+                        raise RuntimeError(
+                            "OED-v1 requires the original batch pu_target_soft."
+                        )
+                    baseline_loss_before_oed = loss
+                    oed_diagnostic_active = (
+                        int(global_step)
+                        % int(oed_config["diagnostic_interval"])
+                        == 0
+                    )
+                    oed_batch_result = build_aux_evidence_loss(
+                        student_final_logits=student_logits,
+                        fixed_soft=pu_target_soft,
+                        config=oed_config,
+                        epoch=epoch,
+                        global_step=global_step,
+                        batch_index=iter_idx,
+                        sample_indices=batch["sample_index"],
+                        sample_ids=[
+                            f"{dataset}/{stem}"
+                            for dataset, stem in zip(
+                                batch["dataset"], batch["stem"]
+                            )
+                        ],
+                        teacher_probability=teacher_prob,
+                        distributed_rank=(
+                            torch.distributed.get_rank()
+                            if torch.distributed.is_available()
+                            and torch.distributed.is_initialized()
+                            else 0
+                        ),
+                    )
+                    if (
+                        oed_diagnostic_active
+                        and bool(oed_config["log_gradient_ratio"])
+                    ):
+                        gradient_diagnostics = (
+                            compute_logit_gradient_diagnostics(
+                                oed_loss=oed_batch_result["loss"],
+                                baseline_loss=baseline_loss_before_oed,
+                                student_final_logits=student_logits,
+                            )
+                        )
+                        oed_batch_result["metrics"].update(
+                            {
+                                name: value
+                                for name, value in gradient_diagnostics.items()
+                                if name
+                                in {
+                                    "oed_logit_grad_norm",
+                                    "baseline_logit_grad_norm",
+                                    "oed_to_baseline_grad_ratio",
+                                }
+                            }
+                        )
+                        oed_batch_result[
+                            "baseline_final_logit_grad_present"
+                        ] = gradient_diagnostics[
+                            "baseline_final_logit_grad_present"
+                        ]
+                    loss = (
+                        baseline_loss_before_oed
+                        + oed_batch_result["weighted_loss"]
+                    )
                 if not bool(torch.isfinite(loss).item()):
                     if (
                         source_arbiter_mode
@@ -21934,8 +25051,24 @@ def main():
                     )
 
                 if use_ecst and not use_source_arbiter_train:
-                    update_start = int(getattr(cfg, "ECST_MEMORY_UPDATE_START_EPOCH", 1))
-                    update_end = int(getattr(cfg, "ECST_MEMORY_UPDATE_END_EPOCH", 20))
+                    update_start = int(
+                        getattr(
+                            cfg,
+                            "ECST_CLEAN_MEMORY_UPDATE_START_EPOCH"
+                            if use_ecst_clean_train
+                            else "ECST_MEMORY_UPDATE_START_EPOCH",
+                            1,
+                        )
+                    )
+                    update_end = int(
+                        getattr(
+                            cfg,
+                            "ECST_CLEAN_MEMORY_UPDATE_END_EPOCH"
+                            if use_ecst_clean_train
+                            else "ECST_MEMORY_UPDATE_END_EPOCH",
+                            20,
+                        )
+                    )
                     if update_start <= int(epoch) <= update_end:
                         if ecst_memory is None or ecst_sample_indices is None:
                             raise RuntimeError(
@@ -21945,7 +25078,15 @@ def main():
                             ecst_memory.update(
                                 indices=ecst_sample_indices,
                                 teacher_prob=teacher_prob.detach(),
-                                rho=float(getattr(cfg, "ECST_TEMPORAL_RHO", 0.90)),
+                                rho=float(
+                                    getattr(
+                                        cfg,
+                                        "ECST_CLEAN_TEMPORAL_RHO"
+                                        if use_ecst_clean_train
+                                        else "ECST_TEMPORAL_RHO",
+                                        0.90,
+                                    )
+                                ),
                             )
 
                 if use_tepr_lite:
@@ -21986,6 +25127,17 @@ def main():
                             "PPSE-v2 actor before segmentation backward",
                         )
                 loss.backward()
+                if use_cvsa_train:
+                    router_grad_sq = 0.0
+                    if cvsa_router is not None:
+                        for parameter in cvsa_router.parameters():
+                            if parameter.grad is not None:
+                                router_grad_sq += float(
+                                    parameter.grad.detach().float().square().sum().item()
+                                )
+                    cvsa_batch_result["router_gradient_norm"] = math.sqrt(
+                        max(router_grad_sq, 0.0)
+                    )
                 if use_pssf_train:
                     _pssf_assert_no_grad(
                         pssf, "PSSF after segmentation backward"
@@ -22060,19 +25212,20 @@ def main():
                 if use_ap_stcr_train:
                     if ap_stcr_batch_result is None:
                         raise RuntimeError(
-                            "AP-STCR batch state is unavailable at history update."
+                            "AP-STCR batch state is unavailable after optimizer step."
                         )
-                    ap_stcr.update_history(
-                        sample_indices=ap_stcr_batch_result[
-                            "sample_indices"
-                        ],
-                        datasets=ap_stcr_batch_result["datasets"],
-                        stems=ap_stcr_batch_result["stems"],
-                        teacher_soft_37=ap_stcr_batch_result[
-                            "teacher_soft_37"
-                        ],
-                        epoch=epoch,
-                    )
+                    if getattr(ap_stcr, "history_bank", None) is not None:
+                        ap_stcr.update_history(
+                            sample_indices=ap_stcr_batch_result[
+                                "sample_indices"
+                            ],
+                            datasets=ap_stcr_batch_result["datasets"],
+                            stems=ap_stcr_batch_result["stems"],
+                            teacher_soft_37=ap_stcr_batch_result[
+                                "teacher_soft_37"
+                            ],
+                            epoch=epoch,
+                        )
                 if use_source_arbiter_train:
                     route_update_active = int(epoch) <= int(
                         getattr(
@@ -22146,6 +25299,28 @@ def main():
                 global_step += 1
 
                 total_loss += float(loss.item())
+                if oed_enabled:
+                    if (
+                        oed_batch_result is None
+                        or oed_epoch_accumulator is None
+                    ):
+                        raise RuntimeError(
+                            "OED batch/epoch diagnostic state is unavailable."
+                        )
+                    update_oed_epoch_accumulator(
+                        oed_epoch_accumulator,
+                        oed_batch_result,
+                    )
+                if use_cvsa_train:
+                    if cvsa_epoch_accumulator is None:
+                        raise RuntimeError("CVSA epoch accumulator is unavailable.")
+                    accumulate_cvsa_epoch(
+                        cvsa_epoch_accumulator,
+                        cvsa_batch_result,
+                        student_logits.sigmoid().detach(),
+                        cvsa_seg_result["loss"],
+                        loss,
+                    )
                 if use_ap_stcr_train:
                     if (
                         ap_stcr_seg_result is None
@@ -22306,19 +25481,45 @@ def main():
                     dabe_aware_stat_batches += 1
                 if use_dabe_pu:
                     dabe_pu_target_mean_sum += float(pu_target_soft.detach().mean().item())
-                    dabe_pu_weight_mean_sum += float(
-                        (
-                            batch["pu_weight_map"].float().mean()
-                            if use_pssf_train
-                            else pu_weight_map.detach().mean()
-                        ).item()
-                    )
+                    if use_dabe_clean:
+                        dabe_pu_weight_mean_sum += 1.0
+                        fg_evidence = batch["dabe_clean_fg_evidence_37"].float()
+                        bg_evidence = batch["dabe_clean_bg_evidence_37"].float()
+                        dabe_pu_fg_core_mean_sum += (
+                            float(fg_evidence.mean().item())
+                            if int(fg_evidence.numel()) > 0
+                            else 0.0
+                        )
+                        dabe_pu_bg_core_mean_sum += (
+                            float(bg_evidence.mean().item())
+                            if int(bg_evidence.numel()) > 0
+                            else 0.0
+                        )
+                        dabe_pu_fg_fallback_mean_sum += 0.0
+                        dabe_pu_extent_mean_sum += (
+                            float(batch["legacy_ecst_extent"].float().mean().item())
+                            if "legacy_ecst_extent" in batch
+                            else 0.0
+                        )
+                        dabe_pu_unknown_mean_sum += (
+                            float(batch["legacy_ecst_unknown"].float().mean().item())
+                            if "legacy_ecst_unknown" in batch
+                            else 0.0
+                        )
+                    else:
+                        dabe_pu_weight_mean_sum += float(
+                            (
+                                batch["pu_weight_map"].float().mean()
+                                if use_pssf_train
+                                else pu_weight_map.detach().mean()
+                            ).item()
+                        )
+                        dabe_pu_fg_core_mean_sum += float(batch["pu_fg_core"].float().mean().item())
+                        dabe_pu_fg_fallback_mean_sum += float(batch["pu_fg_fallback"].float().mean().item())
+                        dabe_pu_bg_core_mean_sum += float(batch["pu_bg_core"].float().mean().item())
+                        dabe_pu_extent_mean_sum += float(batch["pu_extent"].float().mean().item())
+                        dabe_pu_unknown_mean_sum += float(batch["pu_unknown"].float().mean().item())
                     dabe_pu_target_hard_area_sum += float(pu_target_hard.detach().mean().item())
-                    dabe_pu_fg_core_mean_sum += float(batch["pu_fg_core"].float().mean().item())
-                    dabe_pu_fg_fallback_mean_sum += float(batch["pu_fg_fallback"].float().mean().item())
-                    dabe_pu_bg_core_mean_sum += float(batch["pu_bg_core"].float().mean().item())
-                    dabe_pu_extent_mean_sum += float(batch["pu_extent"].float().mean().item())
-                    dabe_pu_unknown_mean_sum += float(batch["pu_unknown"].float().mean().item())
                     dabe_pu_static_final_loss_sum += float(loss_pu_static_final.detach().item())
                     dabe_pu_static_coarse_loss_sum += float(loss_pu_static_coarse.detach().item())
                     dabe_pu_static_base_loss_sum += float(loss_pu_static_base.detach().item())
@@ -22361,6 +25562,22 @@ def main():
                         dabe_pu_v12_sc_lost_extent_sum += float(batch["pu_sc_lost_extent"].float().mean().item())
                         dabe_pu_v12_sc_new_boundary_sum += float(batch["pu_sc_new_boundary"].float().mean().item())
                     dabe_pu_stat_batches += 1
+                    if use_bitc_train:
+                        if bitc_stats is None or bitc_epoch_accumulator is None:
+                            raise RuntimeError(
+                                "BITC-v1 stats are missing for an enabled batch."
+                            )
+                        accumulate_bitc_epoch(
+                            bitc_epoch_accumulator,
+                            bitc_stats,
+                        )
+                        bitc_baseline_teacher_final_loss_sum += float(
+                            F.binary_cross_entropy_with_logits(
+                                student_logits.detach(),
+                                teacher_full_target.detach(),
+                                reduction="mean",
+                            ).item()
+                        )
                     if use_ecst:
                         if ecst_stats is None or ecst_epoch_accumulator is None:
                             raise RuntimeError("ECST stats are missing for an enabled batch.")
@@ -22996,7 +26213,24 @@ def main():
                             "[PPSE-v2 ERROR] actor_grad_present"
                         )
             avg_loss = total_loss / max(num_batches, 1)
-            if use_ap_stcr_train:
+            cvsa_epoch_row = None
+            if use_cvsa_train:
+                if cvsa_epoch_accumulator is None:
+                    raise RuntimeError("CVSA epoch accumulator was not initialized.")
+                cvsa_epoch_row = finalize_cvsa_epoch(cvsa_epoch_accumulator)
+            if use_cvsa_train:
+                logger.log(
+                    f"[Train] Epoch {epoch:03d}/{max_epoch:03d} | "
+                    f"avg_train_loss={cvsa_epoch_row['loss_seg']:.6f} | "
+                    f"loss_seg={cvsa_epoch_row['loss_seg']:.6f} | "
+                    f"loss_route={cvsa_epoch_row['loss_route']:.6f} | "
+                    f"loss_total={cvsa_epoch_row['loss_total']:.6f} | "
+                    f"lr={current_lr(optimizer):.8f} | "
+                    "supervision_mode=cvsa | global_schedule_used=False | "
+                    "epoch_ratio_used=False | future_teacher_used=False | "
+                    "temporal_history_allocated=False | training_gt_used=False"
+                )
+            elif use_ap_stcr_train:
                 schedule_static, schedule_teacher = (
                     get_dabe_pu_despl_schedule(epoch, cfg)
                 )
@@ -23033,6 +26267,73 @@ def main():
                     f"dabe_weight={effective_despl_weight:.2f} | "
                     f"schedule_dabe_weight={fixed_weight:.2f}"
                 )
+            if oed_enabled:
+                if oed_epoch_accumulator is None:
+                    raise RuntimeError("OED epoch accumulator is unavailable.")
+                oed_epoch_row = finalize_oed_epoch(oed_epoch_accumulator)
+                logger.log(
+                    f"[OED] epoch={epoch:03d} | "
+                    f"mode={oed_config['mode']} | "
+                    f"oed_loss={oed_epoch_row['oed_loss']:.8f} | "
+                    "oed_weighted_loss="
+                    f"{oed_epoch_row['oed_weighted_loss']:.8f} | "
+                    "oed_valid_pair_ratio="
+                    f"{oed_epoch_row['oed_valid_pair_ratio']:.8f} | "
+                    "oed_no_valid_pair_count="
+                    f"{int(oed_epoch_row['oed_no_valid_pair_count'])}"
+                )
+                logger.log(
+                    f"[OED] epoch={epoch:03d} | rank_gap mean/p10/p50/p90="
+                    f"{oed_epoch_row['oed_rank_gap_mean']:.8f}/"
+                    f"{oed_epoch_row['oed_rank_gap_p10']:.8f}/"
+                    f"{oed_epoch_row['oed_rank_gap_p50']:.8f}/"
+                    f"{oed_epoch_row['oed_rank_gap_p90']:.8f} | "
+                    "pair_weight mean/p50/p90="
+                    f"{oed_epoch_row['oed_pair_weight_mean']:.8f}/"
+                    f"{oed_epoch_row['oed_pair_weight_p50']:.8f}/"
+                    f"{oed_epoch_row['oed_pair_weight_p90']:.8f}"
+                )
+                logger.log(
+                    f"[OED] epoch={epoch:03d} | order_acc weighted/all/top25/top50="
+                    f"{oed_epoch_row['oed_order_acc_weighted']:.8f}/"
+                    f"{oed_epoch_row['oed_order_acc_all']:.8f}/"
+                    f"{oed_epoch_row['oed_order_acc_top25_gap']:.8f}/"
+                    f"{oed_epoch_row['oed_order_acc_top50_gap']:.8f}"
+                )
+                logger.log(
+                    f"[OED] epoch={epoch:03d} | final_logit mean/std="
+                    f"{oed_epoch_row['oed_final_logit_mean']:.8f}/"
+                    f"{oed_epoch_row['oed_final_logit_std']:.8f} | "
+                    "final_prob mean/std/low_sat/high_sat="
+                    f"{oed_epoch_row['oed_final_prob_mean']:.8f}/"
+                    f"{oed_epoch_row['oed_final_prob_std']:.8f}/"
+                    f"{oed_epoch_row['oed_prob_saturation_low_ratio']:.8f}/"
+                    f"{oed_epoch_row['oed_prob_saturation_high_ratio']:.8f}"
+                )
+                logger.log(
+                    f"[OED] epoch={epoch:03d} | soft unique/tie/rank_entropy="
+                    f"{oed_epoch_row['oed_fixed_soft_unique_ratio']:.8f}/"
+                    f"{oed_epoch_row['oed_fixed_soft_tie_pair_ratio']:.8f}/"
+                    f"{oed_epoch_row['oed_fixed_rank_entropy']:.8f} | "
+                    "spearman mean/median="
+                    f"{oed_epoch_row['oed_spearman_mean']:.8f}/"
+                    f"{oed_epoch_row['oed_spearman_median']:.8f}"
+                )
+                logger.log(
+                    f"[OED] epoch={epoch:03d} | "
+                    "teacher_conflict_source=raw_teacher_probability | "
+                    "teacher_conflict weighted/all/tie="
+                    f"{oed_epoch_row['oed_teacher_conflict_weighted']:.8f}/"
+                    f"{oed_epoch_row['oed_teacher_conflict_all']:.8f}/"
+                    f"{oed_epoch_row['oed_teacher_tie_ratio']:.8f}"
+                )
+                logger.log(
+                    f"[OED] epoch={epoch:03d} | "
+                    "logit_grad oed/baseline/ratio="
+                    f"{oed_epoch_row['oed_logit_grad_norm']:.8f}/"
+                    f"{oed_epoch_row['baseline_logit_grad_norm']:.8f}/"
+                    f"{oed_epoch_row['oed_to_baseline_grad_ratio']:.8f}"
+                )
             stat_batches = max(num_batches, 1)
             logger.log(
                 f"[PredArea] epoch={epoch:03d} | "
@@ -23042,6 +26343,69 @@ def main():
                 f"teacher_pred_area_mean={teacher_pred_area_sum / stat_batches:.6f} | "
                 f"mixed_target_area_mean={mixed_target_area_sum / stat_batches:.6f}"
             )
+            if use_cvsa_train:
+                row = cvsa_epoch_row
+                logger.log(
+                    f"[CVSA] epoch={epoch:03d} | validity | "
+                    f"fixed_valid_ratio={row['fixed_valid_ratio']:.6f} | "
+                    f"teacher_valid_ratio={row['teacher_valid_ratio']:.6f} | "
+                    f"both_valid_ratio={row['both_valid_ratio']:.6f} | "
+                    f"both_invalid_ratio={row['both_invalid_ratio']:.6f} | "
+                    f"fixed_invalid_fg_ratio={row['fixed_invalid_fg_ratio']:.6f} | "
+                    f"fixed_invalid_bg_ratio={row['fixed_invalid_bg_ratio']:.6f} | "
+                    f"teacher_invalid_fg_ratio={row['teacher_invalid_fg_ratio']:.6f} | "
+                    f"teacher_invalid_bg_ratio={row['teacher_invalid_bg_ratio']:.6f}"
+                )
+                for family in (
+                    "fixed_eq_risk",
+                    "teacher_eq_risk",
+                    "fixed_sem_risk",
+                    "teacher_sem_risk",
+                    "fixed_total_risk",
+                    "teacher_total_risk",
+                    "risk_gap",
+                    "route_target",
+                    "router_gate",
+                ):
+                    logger.log(
+                        f"[CVSA] epoch={epoch:03d} | {family} "
+                        "mean/std/p10/p50/p90="
+                        f"{row[family + '_mean']:.6f}/"
+                        f"{row[family + '_std']:.6f}/"
+                        f"{row[family + '_p10']:.6f}/"
+                        f"{row[family + '_p50']:.6f}/"
+                        f"{row[family + '_p90']:.6f}"
+                    )
+                logger.log(
+                    f"[CVSA] epoch={epoch:03d} | route_target_weight_mean="
+                    f"{row['route_target_weight_mean']:.6f} | "
+                    "target_fixed/teacher/ambiguous_ratio="
+                    f"{row['target_fixed_pref_ratio']:.6f}/"
+                    f"{row['target_teacher_pref_ratio']:.6f}/"
+                    f"{row['target_ambiguous_ratio']:.6f} | "
+                    "router_fixed/teacher/ambiguous_ratio="
+                    f"{row['router_fixed_ratio']:.6f}/"
+                    f"{row['router_teacher_ratio']:.6f}/"
+                    f"{row['router_ambiguous_ratio']:.6f}"
+                )
+                logger.log(
+                    f"[CVSA] epoch={epoch:03d} | router_target_mae/brier/correlation="
+                    f"{row['router_target_mae']:.6f}/"
+                    f"{row['router_target_brier']:.6f}/"
+                    f"{row['router_target_correlation']:.6f} | "
+                    f"router_gradient_norm={row['router_gradient_norm']:.6f} | "
+                    f"loss_route={row['loss_route']:.6f}"
+                )
+                logger.log(
+                    f"[CVSA] epoch={epoch:03d} | areas "
+                    "fixed/teacher/mixed/student="
+                    f"{row['fixed_area']:.6f}/{row['teacher_area']:.6f}/"
+                    f"{row['mixed_target_area']:.6f}/{row['student_area']:.6f} | "
+                    "teacher_prob/student_prob="
+                    f"{row['teacher_prob_mean']:.6f}/{row['student_prob_mean']:.6f} | "
+                    f"loss_seg/route/total={row['loss_seg']:.6f}/"
+                    f"{row['loss_route']:.6f}/{row['loss_total']:.6f}"
+                )
             if use_ap_stcr_train:
                 if ap_stcr_epoch_accumulator is None:
                     raise RuntimeError(
@@ -23050,69 +26414,264 @@ def main():
                 ap_stcr_epoch_row = finalize_ap_stcr_epoch(
                     ap_stcr_epoch_accumulator
                 )
-                logger.log(
-                    f"[AP-STCR] epoch={epoch:03d} | "
-                    f"phase={ap_stcr_checkpoint_phase(cfg, epoch)} | "
-                    f"global_teacher_ratio="
-                    f"{ap_stcr_epoch_row['global_teacher_ratio']:.9f} | "
-                    "fg/bg_anchor_count_mean="
-                    f"{ap_stcr_epoch_row['fg_anchor_count_mean']:.4f}/"
-                    f"{ap_stcr_epoch_row['bg_anchor_count_mean']:.4f} | "
-                    f"bg_anchor_source={ap_stcr_epoch_row['bg_anchor_source']} | "
-                    "semantic_margin mean/std="
-                    f"{ap_stcr_epoch_row['semantic_margin_mean']:.6f}/"
-                    f"{ap_stcr_epoch_row['semantic_margin_std']:.6f} | "
-                    "history_valid_ratio="
-                    f"{ap_stcr_epoch_row['history_valid_ratio']:.6f}"
+                ap_stcr_a1_epoch_for_log = (
+                    str(
+                        dict(getattr(cfg, "AP_STCR")).get("version", "")
+                    ).strip()
+                    == "ap_stcr_v4_semantic_only_ablation"
                 )
-                logger.log(
-                    f"[AP-STCR] epoch={epoch:03d} | "
-                    "semantic_support p10/p50/p90="
-                    f"{ap_stcr_epoch_row['semantic_support_p10']:.6f}/"
-                    f"{ap_stcr_epoch_row['semantic_support_p50']:.6f}/"
-                    f"{ap_stcr_epoch_row['semantic_support_p90']:.6f} | "
-                    "temporal_support p10/p50/p90="
-                    f"{ap_stcr_epoch_row['temporal_support_p10']:.6f}/"
-                    f"{ap_stcr_epoch_row['temporal_support_p50']:.6f}/"
-                    f"{ap_stcr_epoch_row['temporal_support_p90']:.6f} | "
-                    "acceptance p10/p50/p90="
-                    f"{ap_stcr_epoch_row['local_acceptance_p10']:.6f}/"
-                    f"{ap_stcr_epoch_row['local_acceptance_p50']:.6f}/"
-                    f"{ap_stcr_epoch_row['local_acceptance_p90']:.6f}"
-                )
-                logger.log(
-                    f"[AP-STCR] epoch={epoch:03d} | "
-                    "effective_teacher_weight mean/std="
-                    f"{ap_stcr_epoch_row['effective_teacher_weight_mean']:.6f}/"
-                    f"{ap_stcr_epoch_row['effective_teacher_weight_std']:.6f} | "
-                    "teacher_correction_abs/accepted_abs="
-                    f"{ap_stcr_epoch_row['teacher_correction_abs_mean']:.6f}/"
-                    f"{ap_stcr_epoch_row['accepted_correction_abs_mean']:.6f} | "
-                    "fixed/teacher/target/student_area="
-                    f"{ap_stcr_epoch_row['fixed_area_mean']:.6f}/"
-                    f"{ap_stcr_epoch_row['teacher_area_mean']:.6f}/"
-                    f"{ap_stcr_epoch_row['target_area_mean']:.6f}/"
-                    f"{ap_stcr_epoch_row['student_area_mean']:.6f} | "
-                    "teacher_fixed_disagreement_ratio="
-                    f"{ap_stcr_epoch_row['teacher_fixed_disagreement_ratio']:.6f}"
-                )
-                logger.log(
-                    f"[AP-STCR] epoch={epoch:03d} | "
-                    "semantic_support agree/disagree="
-                    f"{ap_stcr_epoch_row['semantic_support_agree_mean']:.6f}/"
-                    f"{ap_stcr_epoch_row['semantic_support_disagree_mean']:.6f} | "
-                    "temporal_support agree/disagree="
-                    f"{ap_stcr_epoch_row['temporal_support_agree_mean']:.6f}/"
-                    f"{ap_stcr_epoch_row['temporal_support_disagree_mean']:.6f} | "
-                    "effective_teacher agree/disagree="
-                    f"{ap_stcr_epoch_row['effective_teacher_weight_agree_mean']:.6f}/"
-                    f"{ap_stcr_epoch_row['effective_teacher_weight_disagree_mean']:.6f} | "
-                    "loss final/coarse/base/group="
-                    f"{ap_stcr_loss_final_sum / stat_batches:.8f}/"
-                    f"{ap_stcr_loss_coarse_sum / stat_batches:.8f}/"
-                    f"{ap_stcr_loss_base_sum / stat_batches:.8f}/"
-                    f"{ap_stcr_loss_group_sum / stat_batches:.8f}"
-                )
+                if ap_stcr_a1_epoch_for_log:
+                    logger.log(
+                        f"[AP-STCR-A1] epoch={epoch:03d} | "
+                        "semantic_contradiction mean/std/p10/p50/p90="
+                        f"{ap_stcr_epoch_row['semantic_contradiction_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['semantic_contradiction_std']:.6f}/"
+                        f"{ap_stcr_epoch_row['semantic_contradiction_p10']:.6f}/"
+                        f"{ap_stcr_epoch_row['semantic_contradiction_p50']:.6f}/"
+                        f"{ap_stcr_epoch_row['semantic_contradiction_p90']:.6f}"
+                    )
+                    logger.log(
+                        f"[AP-STCR-A1] epoch={epoch:03d} | "
+                        "soft_deviation_mean="
+                        f"{ap_stcr_epoch_row['soft_deviation_mean']:.6f} | "
+                        "transition_envelope="
+                        f"{ap_stcr_epoch_row['transition_envelope']:.6f} | "
+                        "transition_penalty mean/std="
+                        f"{ap_stcr_epoch_row['transition_penalty_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['transition_penalty_std']:.6f}"
+                    )
+                    logger.log(
+                        f"[AP-STCR-A1] epoch={epoch:03d} | "
+                        "local_acceptance mean/std/p10/p50/p90="
+                        f"{ap_stcr_epoch_row['local_acceptance_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['local_acceptance_std']:.6f}/"
+                        f"{ap_stcr_epoch_row['local_acceptance_p10']:.6f}/"
+                        f"{ap_stcr_epoch_row['local_acceptance_p50']:.6f}/"
+                        f"{ap_stcr_epoch_row['local_acceptance_p90']:.6f}"
+                    )
+                    logger.log(
+                        f"[AP-STCR-A1] epoch={epoch:03d} | "
+                        "global_teacher_ratio="
+                        f"{ap_stcr_epoch_row['global_teacher_ratio']:.9f} | "
+                        "effective_teacher_weight_mean="
+                        f"{ap_stcr_epoch_row['effective_teacher_weight_mean']:.6f} | "
+                        "effective_fixed_ratio_mean="
+                        f"{ap_stcr_epoch_row['effective_fixed_ratio_mean']:.6f}"
+                    )
+                    logger.log(
+                        f"[AP-STCR-A1] epoch={epoch:03d} | "
+                        "fixed/teacher/mixed_target/student_area="
+                        f"{ap_stcr_epoch_row['fixed_area_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['teacher_area_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['mixed_target_area_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['student_area_mean']:.6f}"
+                    )
+                else:
+                    logger.log(
+                        f"[AP-STCR] epoch={epoch:03d} | "
+                        f"phase={ap_stcr_checkpoint_phase(cfg, epoch)} | "
+                        f"global_teacher_ratio="
+                        f"{ap_stcr_epoch_row['global_teacher_ratio']:.9f} | "
+                        "fg/bg_anchor_count_mean="
+                        f"{ap_stcr_epoch_row['fg_anchor_count_mean']:.4f}/"
+                        f"{ap_stcr_epoch_row['bg_anchor_count_mean']:.4f} | "
+                        f"bg_anchor_source={ap_stcr_epoch_row['bg_anchor_source']} | "
+                        "semantic_margin mean/std="
+                        f"{ap_stcr_epoch_row['semantic_margin_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['semantic_margin_std']:.6f} | "
+                        "history_valid_ratio="
+                        f"{ap_stcr_epoch_row['history_valid_ratio']:.6f}"
+                    )
+                    logger.log(
+                        f"[AP-STCR] epoch={epoch:03d} | "
+                        "semantic_support p10/p50/p90="
+                        f"{ap_stcr_epoch_row['semantic_support_p10']:.6f}/"
+                        f"{ap_stcr_epoch_row['semantic_support_p50']:.6f}/"
+                        f"{ap_stcr_epoch_row['semantic_support_p90']:.6f} | "
+                        "temporal_support p10/p50/p90="
+                        f"{ap_stcr_epoch_row['temporal_support_p10']:.6f}/"
+                        f"{ap_stcr_epoch_row['temporal_support_p50']:.6f}/"
+                        f"{ap_stcr_epoch_row['temporal_support_p90']:.6f} | "
+                        "acceptance p10/p50/p90="
+                        f"{ap_stcr_epoch_row['local_acceptance_p10']:.6f}/"
+                        f"{ap_stcr_epoch_row['local_acceptance_p50']:.6f}/"
+                        f"{ap_stcr_epoch_row['local_acceptance_p90']:.6f}"
+                    )
+                    logger.log(
+                        f"[AP-STCR] epoch={epoch:03d} | "
+                        "effective_teacher_weight mean/std="
+                        f"{ap_stcr_epoch_row['effective_teacher_weight_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['effective_teacher_weight_std']:.6f} | "
+                        "teacher_correction_abs/accepted_abs="
+                        f"{ap_stcr_epoch_row['teacher_correction_abs_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['accepted_correction_abs_mean']:.6f} | "
+                        "fixed/teacher/target/student_area="
+                        f"{ap_stcr_epoch_row['fixed_area_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['teacher_area_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['target_area_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['student_area_mean']:.6f} | "
+                        "teacher_fixed_disagreement_ratio="
+                        f"{ap_stcr_epoch_row['teacher_fixed_disagreement_ratio']:.6f}"
+                    )
+                    logger.log(
+                        f"[AP-STCR] epoch={epoch:03d} | "
+                        "semantic_support agree/disagree="
+                        f"{ap_stcr_epoch_row['semantic_support_agree_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['semantic_support_disagree_mean']:.6f} | "
+                        "temporal_support agree/disagree="
+                        f"{ap_stcr_epoch_row['temporal_support_agree_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['temporal_support_disagree_mean']:.6f} | "
+                        "effective_teacher agree/disagree="
+                        f"{ap_stcr_epoch_row['effective_teacher_weight_agree_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['effective_teacher_weight_disagree_mean']:.6f} | "
+                        "loss final/coarse/base/group="
+                        f"{ap_stcr_loss_final_sum / stat_batches:.8f}/"
+                        f"{ap_stcr_loss_coarse_sum / stat_batches:.8f}/"
+                        f"{ap_stcr_loss_base_sum / stat_batches:.8f}/"
+                        f"{ap_stcr_loss_group_sum / stat_batches:.8f}"
+                    )
+                if (
+                    str(
+                        dict(getattr(cfg, "AP_STCR")).get(
+                            "version", ""
+                        )
+                    ).strip()
+                    == "ap_stcr_v3_soft_disagreement_bounded_continuation"
+                ):
+                    logger.log(
+                        f"[AP-STCR-v3] epoch={epoch:03d} | "
+                        "soft_deviation mean/std/p10/p50/p90="
+                        f"{ap_stcr_epoch_row['soft_deviation_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['soft_deviation_std']:.6f}/"
+                        f"{ap_stcr_epoch_row['soft_deviation_p10']:.6f}/"
+                        f"{ap_stcr_epoch_row['soft_deviation_p50']:.6f}/"
+                        f"{ap_stcr_epoch_row['soft_deviation_p90']:.6f} | "
+                        "fused_support mean/std/p10/p50/p90="
+                        f"{ap_stcr_epoch_row['fused_support_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['fused_support_std']:.6f}/"
+                        f"{ap_stcr_epoch_row['fused_support_p10']:.6f}/"
+                        f"{ap_stcr_epoch_row['fused_support_p50']:.6f}/"
+                        f"{ap_stcr_epoch_row['fused_support_p90']:.6f}"
+                    )
+                    logger.log(
+                        f"[AP-STCR-v3] epoch={epoch:03d} | "
+                        "support_deficiency_mean="
+                        f"{ap_stcr_epoch_row['support_deficiency_mean']:.6f} | "
+                        "soft_inertia_mean="
+                        f"{ap_stcr_epoch_row['soft_inertia_mean']:.6f} | "
+                        "local_acceptance mean/std/p10/p50/p90="
+                        f"{ap_stcr_epoch_row['local_acceptance_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['local_acceptance_std']:.6f}/"
+                        f"{ap_stcr_epoch_row['local_acceptance_p10']:.6f}/"
+                        f"{ap_stcr_epoch_row['local_acceptance_p50']:.6f}/"
+                        f"{ap_stcr_epoch_row['local_acceptance_p90']:.6f}"
+                    )
+                    logger.log(
+                        f"[AP-STCR-v3] epoch={epoch:03d} | "
+                        "effective_teacher_weight mean/std="
+                        f"{ap_stcr_epoch_row['effective_teacher_weight_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['effective_teacher_weight_std']:.6f} | "
+                        "effective_fixed_ratio_mean="
+                        f"{ap_stcr_epoch_row['effective_fixed_ratio_mean']:.6f} | "
+                        "source_conflict_ratio_diagnostic_only="
+                        f"{ap_stcr_epoch_row['source_conflict_ratio']:.6f}"
+                    )
+                if (
+                    str(
+                        dict(getattr(cfg, "AP_STCR")).get(
+                            "version", ""
+                        )
+                    ).strip()
+                    == "ap_stcr_v4_transition_envelope_non_compensatory"
+                ):
+                    logger.log(
+                        f"[AP-STCR-v4] epoch={epoch:03d} | "
+                        "semantic_contradiction mean/std/p10/p50/p90="
+                        f"{ap_stcr_epoch_row['semantic_contradiction_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['semantic_contradiction_std']:.6f}/"
+                        f"{ap_stcr_epoch_row['semantic_contradiction_p10']:.6f}/"
+                        f"{ap_stcr_epoch_row['semantic_contradiction_p50']:.6f}/"
+                        f"{ap_stcr_epoch_row['semantic_contradiction_p90']:.6f} | "
+                        "temporal_instability mean/std/p10/p50/p90="
+                        f"{ap_stcr_epoch_row['temporal_instability_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['temporal_instability_std']:.6f}/"
+                        f"{ap_stcr_epoch_row['temporal_instability_p10']:.6f}/"
+                        f"{ap_stcr_epoch_row['temporal_instability_p50']:.6f}/"
+                        f"{ap_stcr_epoch_row['temporal_instability_p90']:.6f}"
+                    )
+                    logger.log(
+                        f"[AP-STCR-v4] epoch={epoch:03d} | "
+                        "combined_negative_evidence mean/std="
+                        f"{ap_stcr_epoch_row['combined_negative_evidence_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['combined_negative_evidence_std']:.6f} | "
+                        "transition_envelope="
+                        f"{ap_stcr_epoch_row['transition_envelope']:.6f} | "
+                        "transition_penalty mean/std="
+                        f"{ap_stcr_epoch_row['transition_penalty_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['transition_penalty_std']:.6f} | "
+                        "soft_deviation_mean="
+                        f"{ap_stcr_epoch_row['soft_deviation_mean']:.6f}"
+                    )
+                    logger.log(
+                        f"[AP-STCR-v4] epoch={epoch:03d} | "
+                        "local_acceptance mean/std/p10/p50/p90="
+                        f"{ap_stcr_epoch_row['local_acceptance_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['local_acceptance_std']:.6f}/"
+                        f"{ap_stcr_epoch_row['local_acceptance_p10']:.6f}/"
+                        f"{ap_stcr_epoch_row['local_acceptance_p50']:.6f}/"
+                        f"{ap_stcr_epoch_row['local_acceptance_p90']:.6f} | "
+                        "global_teacher_ratio="
+                        f"{ap_stcr_epoch_row['global_teacher_ratio']:.9f} | "
+                        "effective_teacher/effective_fixed mean="
+                        f"{ap_stcr_epoch_row['effective_teacher_weight_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['effective_fixed_ratio_mean']:.6f}"
+                    )
+                    logger.log(
+                        f"[AP-STCR-v4] epoch={epoch:03d} | "
+                        "fixed/teacher/mixed_target/student_area="
+                        f"{ap_stcr_epoch_row['fixed_area_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['teacher_area_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['mixed_target_area_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['student_area_mean']:.6f} | "
+                        "history_valid_ratio="
+                        f"{ap_stcr_epoch_row['history_valid_ratio']:.6f}"
+                    )
+                    logger.log(
+                        f"[AP-STCR-v4] epoch={epoch:03d} | "
+                        "semantic_contradiction agree/disagree="
+                        f"{ap_stcr_epoch_row['semantic_contradiction_when_agree_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['semantic_contradiction_when_disagree_mean']:.6f} | "
+                        "temporal_instability agree/disagree="
+                        f"{ap_stcr_epoch_row['temporal_instability_when_agree_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['temporal_instability_when_disagree_mean']:.6f} | "
+                        "combined_negative_evidence agree/disagree="
+                        f"{ap_stcr_epoch_row['combined_negative_evidence_when_agree_mean']:.6f}/"
+                        f"{ap_stcr_epoch_row['combined_negative_evidence_when_disagree_mean']:.6f}"
+                    )
+                if bool(
+                    dict(getattr(cfg, "AP_STCR")).get(
+                        "conflict_only", False
+                    )
+                ):
+                    logger.log(
+                        f"[AP-STCR-v2] epoch={epoch:03d} | "
+                        "source_conflict_ratio="
+                        f"{ap_stcr_epoch_row['source_conflict_ratio']:.6f} | "
+                        "semantic_negative_mean="
+                        f"{ap_stcr_epoch_row['semantic_negative_mean']:.6f} | "
+                        "temporal_negative_mean="
+                        f"{ap_stcr_epoch_row['temporal_negative_mean']:.6f} | "
+                        "local_rejection_mean="
+                        f"{ap_stcr_epoch_row['local_rejection_mean']:.6f} | "
+                        "local_acceptance_on_conflict="
+                        f"{ap_stcr_epoch_row['local_acceptance_on_conflict_mean']:.6f} | "
+                        "local_acceptance_on_non_conflict="
+                        f"{ap_stcr_epoch_row['local_acceptance_on_non_conflict_mean']:.6f} | "
+                        "effective_teacher_weight_on_conflict="
+                        f"{ap_stcr_epoch_row['effective_teacher_weight_on_conflict_mean']:.6f} | "
+                        "effective_teacher_weight_on_non_conflict="
+                        f"{ap_stcr_epoch_row['effective_teacher_weight_on_non_conflict_mean']:.6f}"
+                    )
             if use_pssf_train:
                 pssf_epoch_row = finalize_pssf_epoch(
                     pssf_epoch_accumulator
@@ -23706,17 +27265,18 @@ def main():
                         f"{static_weight_row['static_gradient_active']}"
                     )
                 logger.log(
-                    f"[DABE-PU] epoch={epoch:03d} | "
-                    "use_dabe_pu=True | "
-                    f"dabe_pu_version={getattr(cfg, 'DABE_PU_VERSION', 'pu_v11')} | "
+                    f"[{'DABE-Clean' if use_dabe_clean else 'DABE-PU'}] epoch={epoch:03d} | "
+                    f"source={'independent_clean_cache' if use_dabe_clean else 'dabe_pu_cache'} | "
+                    f"version={getattr(cfg, 'DABE_CLEAN_VERSION', 'v1') if use_dabe_clean else getattr(cfg, 'DABE_PU_VERSION', 'pu_v11')} | "
                     f"p_init_mode={getattr(cfg, 'P_INIT_MODE', 'dabe_pu_v11')} | "
+                    f"target_mode={getattr(cfg, 'DABE_CLEAN_TARGET_MODE', 'legacy_pu') if use_dabe_clean else 'legacy_pu'} | "
                     f"static_weight={static_weight_log:.2f} | "
                     f"teacher_weight={teacher_weight_log:.2f} | "
-                    f"target_soft_mean={dabe_pu_target_mean_sum / stat_batches:.6f} | "
-                    f"weight_map_mean={dabe_pu_weight_mean_sum / stat_batches:.6f} | "
-                    f"fg_core_mean={dabe_pu_fg_core_mean_sum / stat_batches:.6f} | "
+                    f"target_mean={dabe_pu_target_mean_sum / stat_batches:.6f} | "
+                    f"diagnostic_weight_mean={dabe_pu_weight_mean_sum / stat_batches:.6f} | "
+                    f"foreground_evidence_mean={dabe_pu_fg_core_mean_sum / stat_batches:.6f} | "
                     f"fg_fallback_mean={dabe_pu_fg_fallback_mean_sum / stat_batches:.6f} | "
-                    f"bg_core_mean={dabe_pu_bg_core_mean_sum / stat_batches:.6f} | "
+                    f"background_evidence_mean={dabe_pu_bg_core_mean_sum / stat_batches:.6f} | "
                     f"extent_mean={dabe_pu_extent_mean_sum / stat_batches:.6f} | "
                     f"unknown_mean={dabe_pu_unknown_mean_sum / stat_batches:.6f} | "
                     f"loss_static_final={dabe_pu_static_final_loss_sum / stat_batches:.6f} | "
@@ -23730,6 +27290,7 @@ def main():
                     f"teacher_conf_ratio={dabe_pu_teacher_conf_ratio_sum / stat_batches:.6f} | "
                     f"teacher_fg_ratio={dabe_pu_teacher_fg_ratio_sum / stat_batches:.6f} | "
                     f"teacher_bg_ratio={dabe_pu_teacher_bg_ratio_sum / stat_batches:.6f} | "
+                    f"static_loss_unweighted_mean_bce={use_dabe_clean} | "
                     "fixed_used_for_training=False"
                 )
                 if use_dabe_pu_despl_sched:
@@ -23774,17 +27335,18 @@ def main():
                             f"extent_ratio={dabe_pu_extent_mean_sum / stat_batches:.6f} | "
                             f"unknown_ratio={dabe_pu_unknown_mean_sum / stat_batches:.6f}"
                         )
-                    if not use_ap_stcr_train:
+                    if not use_ap_stcr_train and not use_cvsa_train:
                         logger.log(
-                            f"[DABE-PU-DesplSched] epoch={epoch:03d} | "
+                            f"[{'DABE-Clean-Schedule' if use_dabe_clean else 'DABE-PU-DesplSched'}] epoch={epoch:03d} | "
                             f"static_target_mode={dabe_pu_despl_static_target_mode} | "
                             f"teacher_target_mode={dabe_pu_despl_teacher_target_mode} | "
                             f"static_weight={static_weight_log:.2f} | "
                             f"teacher_weight={teacher_weight_log:.2f} | "
                             f"is_teacher_only={bool(static_weight_log <= 1e-8 and teacher_weight_log >= 1.0 - 1e-8)} | "
-                            f"target_soft_mean={dabe_pu_target_mean_sum / stat_batches:.6f} | "
+                            f"target_mean={dabe_pu_target_mean_sum / stat_batches:.6f} | "
                             f"target_hard_area_mean={dabe_pu_target_hard_area_sum / stat_batches:.6f} | "
-                            f"weight_map_mean={dabe_pu_weight_mean_sum / stat_batches:.6f} | "
+                            f"diagnostic_weight_mean={dabe_pu_weight_mean_sum / stat_batches:.6f} | "
+                            f"static_cache_weight_map_present={not use_dabe_clean} | "
                             f"teacher_prob_mean={teacher_prob_mean_sum / max(num_batches, 1):.6f} | "
                             f"teacher_prob_min={(teacher_prob_min if teacher_prob_min is not None else 0.0):.6f} | "
                             f"teacher_prob_max={(teacher_prob_max if teacher_prob_max is not None else 0.0):.6f} | "
@@ -23805,6 +27367,7 @@ def main():
                     teacher_routing_mode != LEGACY_TEACHER_ROUTING_MODE
                     and not use_pssf_train
                     and not use_ap_stcr_train
+                    and not use_cvsa_train
                 ):
                     teacher_routing_row = finalize_teacher_routing(
                         teacher_routing_epoch_accumulator
@@ -23837,55 +27400,572 @@ def main():
                         f"{dabe_pu_teacher_coarse_loss_sum / stat_batches:.6f}/"
                         f"{dabe_pu_teacher_base_loss_sum / stat_batches:.6f}"
                     )
+                if use_bitc_train:
+                    bitc_row = finalize_bitc_epoch(bitc_epoch_accumulator)
+                    logger.log(
+                        f"[BITC] epoch={epoch:03d} | "
+                        f"mode={getattr(cfg, 'BITC_SUBSTITUTION_MODE')} | "
+                        "norm_original/substitute/ratio="
+                        f"{bitc_row['bitc_original_token_norm_mean']:.6f}/"
+                        f"{bitc_row['bitc_substitute_token_norm_mean']:.6f}/"
+                        f"{bitc_row['bitc_norm_ratio_mean']:.6f} | "
+                        "norm_ratio_p10/p50/p90/max_relerr="
+                        f"{bitc_row['bitc_norm_ratio_p10']:.6f}/"
+                        f"{bitc_row['bitc_norm_ratio_p50']:.6f}/"
+                        f"{bitc_row['bitc_norm_ratio_p90']:.6f}/"
+                        f"{bitc_row['bitc_norm_relative_error_max']:.9g} | "
+                        "response_raw_mean/std="
+                        f"{bitc_row['bitc_response_raw_mean']:.6f}/"
+                        f"{bitc_row['bitc_response_raw_std']:.6f} | "
+                        "response_centered_mean/median/p10/p90/positive="
+                        f"{bitc_row['bitc_response_centered_mean']:.6f}/"
+                        f"{bitc_row['bitc_response_centered_median']:.6f}/"
+                        f"{bitc_row['bitc_response_centered_p10']:.6f}/"
+                        f"{bitc_row['bitc_response_centered_p90']:.6f}/"
+                        f"{bitc_row['bitc_response_positive_ratio']:.6f} | "
+                        f"response_mad={bitc_row['bitc_response_mad']:.6f}"
+                    )
+                    logger.log(
+                        f"[BITC Map] epoch={epoch:03d} | "
+                        "evidence_mean/std/p10/p50/p90="
+                        f"{bitc_row['bitc_cf_evidence_mean']:.6f}/"
+                        f"{bitc_row['bitc_cf_evidence_std']:.6f}/"
+                        f"{bitc_row['bitc_cf_evidence_p10']:.6f}/"
+                        f"{bitc_row['bitc_cf_evidence_p50']:.6f}/"
+                        f"{bitc_row['bitc_cf_evidence_p90']:.6f} | "
+                        f"agreement_mean={bitc_row['bitc_teacher_agreement_mean']:.6f} | "
+                        "map_min/mean/max/p10/p50/p90="
+                        f"{bitc_row['bitc_teacher_map_min']:.6f}/"
+                        f"{bitc_row['bitc_teacher_map_mean']:.6f}/"
+                        f"{bitc_row['bitc_teacher_map_max']:.6f}/"
+                        f"{bitc_row['bitc_teacher_map_p10']:.6f}/"
+                        f"{bitc_row['bitc_teacher_map_p50']:.6f}/"
+                        f"{bitc_row['bitc_teacher_map_p90']:.6f} | "
+                        "map_teacher_fg/bg="
+                        f"{bitc_row['bitc_map_teacher_fg_mean']:.6f}/"
+                        f"{bitc_row['bitc_map_teacher_bg_mean']:.6f} | "
+                        "response_teacher_fg/bg="
+                        f"{bitc_row['bitc_response_teacher_fg_mean']:.6f}/"
+                        f"{bitc_row['bitc_response_teacher_bg_mean']:.6f} | "
+                        "spill_mean/median/p90="
+                        f"{bitc_row['bitc_spill_ratio_mean']:.6f}/"
+                        f"{bitc_row['bitc_spill_ratio_median']:.6f}/"
+                        f"{bitc_row['bitc_spill_ratio_p90']:.6f} | "
+                        "loss_teacher_final/coarse/base="
+                        f"{dabe_pu_teacher_final_loss_sum / stat_batches:.6f}/"
+                        f"{dabe_pu_teacher_coarse_loss_sum / stat_batches:.6f}/"
+                        f"{dabe_pu_teacher_base_loss_sum / stat_batches:.6f} | "
+                        "teacher_final_plain/bitc="
+                        f"{bitc_baseline_teacher_final_loss_sum / stat_batches:.6f}/"
+                        f"{dabe_pu_teacher_final_loss_sum / stat_batches:.6f}"
+                    )
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize(device)
+                        bitc_peak_allocated_mb = (
+                            torch.cuda.max_memory_allocated(device) / (1024.0 ** 2)
+                        )
+                        bitc_peak_reserved_mb = (
+                            torch.cuda.max_memory_reserved(device) / (1024.0 ** 2)
+                        )
+                    else:
+                        bitc_peak_allocated_mb = 0.0
+                        bitc_peak_reserved_mb = 0.0
+                    bitc_epoch_wall_seconds = (
+                        time.perf_counter() - bitc_epoch_start_time
+                    )
+                    logger.log(
+                        f"[BITC Resources] epoch={epoch:03d} | "
+                        f"epoch_wall_seconds={bitc_epoch_wall_seconds:.3f} | "
+                        "seconds_per_iteration="
+                        f"{bitc_epoch_wall_seconds / max(num_batches, 1):.6f} | "
+                        f"counterfactual_batches={num_batches} | "
+                        f"coarse_only_forward_equivalents={2 * num_batches} | "
+                        f"gpu_peak_allocated_mb={bitc_peak_allocated_mb:.2f} | "
+                        f"gpu_peak_reserved_mb={bitc_peak_reserved_mb:.2f}"
+                    )
                 if use_ecst:
                     ecst_batches = max(int(ecst_epoch_accumulator["batches"]), 1)
                     ecst_pixels = max(int(ecst_epoch_accumulator["map_pixels"]), 1)
                     prediction_pixels = max(
                         int(ecst_epoch_accumulator["prediction_pixels"]), 1
                     )
-                    ecst_state_means = {}
-                    ecst_state_valid = {}
-                    for name in ECST_STATE_KEYS:
-                        count = float(ecst_epoch_accumulator["state_counts"][name])
-                        ecst_state_valid[name] = count > 0.0
-                        ecst_state_means[name] = (
-                            float(ecst_epoch_accumulator["state_sums"][name]) / count
-                            if count > 0.0
-                            else 0.0
+                    if use_ecst_clean_train:
+                        schedule_scale = float(get_ecst_clean_scale(cfg, epoch))
+                        strength_mode = get_ecst_clean_strength_mode(cfg)
+                        if strength_mode == "directional":
+                            directional_strengths = (
+                                get_ecst_clean_directional_strengths(cfg)
+                            )
+                            strength_max = None
+                            effective_strength = None
+                            recovery_strength = None
+                        elif strength_mode == "directional_continuous":
+                            continuous_strengths = (
+                                get_ecst_clean_continuous_strengths(cfg)
+                            )
+                            strength_max = None
+                            effective_strength = None
+                            directional_strengths = {
+                                "erase": continuous_strengths["erase"],
+                                "add": continuous_strengths["add"],
+                                "ring_bg": None,
+                            }
+                            recovery_strength = continuous_strengths["recovery"]
+                        else:
+                            strength_max = float(
+                                get_ecst_clean_strength_max(cfg)
+                            )
+                            effective_strength = schedule_scale * strength_max
+                            directional_strengths = {
+                                "erase": strength_max,
+                                "add": strength_max,
+                                "ring_bg": strength_max,
+                            }
+                            recovery_strength = None
+                        raw_map_pixels = max(
+                            int(ecst_epoch_accumulator["clean_raw_map_pixels"]),
+                            1,
                         )
-                    logger.log(
-                        f"[ECST] epoch={epoch:03d} | "
-                        f"scale={float(get_ecst_scale(cfg, epoch)):.8f} | "
-                        f"memory_active_ratio={ecst_epoch_accumulator['memory_active_batches'] / ecst_batches:.6f} | "
-                        f"history_count_mean={ecst_epoch_accumulator['history_count_mean_sum'] / ecst_batches:.6f} | "
-                        f"history_valid_ratio={ecst_epoch_accumulator['history_valid_ratio_sum'] / ecst_batches:.6f} | "
-                        f"temporal_var_mean={ecst_epoch_accumulator['temporal_var_mean_sum'] / ecst_batches:.8f} | "
-                        f"reliability_mean={ecst_epoch_accumulator['temporal_reliability_mean_sum'] / ecst_batches:.6f} | "
-                        f"fg_core_conflict_ratio={ecst_epoch_accumulator['fg_core_conflict_count'] / max(ecst_epoch_accumulator['fg_core_count'], 1):.6f} | "
-                        f"bg_core_conflict_ratio={ecst_epoch_accumulator['bg_core_conflict_count'] / max(ecst_epoch_accumulator['bg_core_count'], 1):.6f} | "
-                        f"extent_teacher_fg/bg_ratio="
-                        f"{ecst_epoch_accumulator['extent_teacher_fg_count'] / max(ecst_epoch_accumulator['extent_count'], 1):.6f}/"
-                        f"{ecst_epoch_accumulator['extent_teacher_bg_count'] / max(ecst_epoch_accumulator['extent_count'], 1):.6f} | "
-                        f"map_min/mean/max="
-                        f"{(ecst_epoch_accumulator['map_min'] if ecst_epoch_accumulator['map_min'] is not None else 1.0):.6f}/"
-                        f"{ecst_epoch_accumulator['map_sum'] / ecst_pixels:.6f}/"
-                        f"{(ecst_epoch_accumulator['map_max'] if ecst_epoch_accumulator['map_max'] is not None else 1.0):.6f} | "
-                        f"map_core_conflict/extent_bg/unknown="
-                        f"{ecst_state_means['core_conflict_map']:.6f}/"
-                        f"{ecst_state_means['extent_teacher_bg_map']:.6f}/"
-                        f"{ecst_state_means['unknown_map']:.6f} | "
-                        f"student/teacher_area="
-                        f"{ecst_epoch_accumulator['student_pred_fg_count'] / prediction_pixels:.6f}/"
-                        f"{ecst_epoch_accumulator['teacher_pred_fg_count'] / prediction_pixels:.6f} | "
-                        f"teacher_loss_final/coarse/base="
-                        f"{dabe_pu_teacher_final_loss_sum / stat_batches:.6f}/"
-                        f"{dabe_pu_teacher_coarse_loss_sum / stat_batches:.6f}/"
-                        f"{dabe_pu_teacher_base_loss_sum / stat_batches:.6f} | "
-                        f"valid_core_conflict/extent_bg/unknown="
-                        f"{int(ecst_state_valid['core_conflict_map'])}/"
-                        f"{int(ecst_state_valid['extent_teacher_bg_map'])}/"
-                        f"{int(ecst_state_valid['unknown_map'])}"
-                    )
+                        student_area = (
+                            ecst_epoch_accumulator["student_pred_fg_count"]
+                            / prediction_pixels
+                        )
+                        teacher_area = (
+                            ecst_epoch_accumulator["teacher_pred_fg_count"]
+                            / prediction_pixels
+                        )
+                        clean_ecst_row = {
+                            "epoch": int(epoch),
+                            "scale": schedule_scale,
+                            "schedule_scale": schedule_scale,
+                            "strength_mode": strength_mode,
+                            "strength_max": strength_max,
+                            "effective_strength": effective_strength,
+                            "erase_strength": directional_strengths["erase"],
+                            "add_strength": directional_strengths["add"],
+                            "ring_bg_strength": directional_strengths["ring_bg"],
+                            "recovery_strength": recovery_strength,
+                            "memory_active_ratio": ecst_epoch_accumulator[
+                                "memory_active_batches"
+                            ]
+                            / ecst_batches,
+                            "history_count_mean": ecst_epoch_accumulator[
+                                "history_count_mean_sum"
+                            ]
+                            / ecst_batches,
+                            "history_valid_ratio": ecst_epoch_accumulator[
+                                "history_valid_ratio_sum"
+                            ]
+                            / ecst_batches,
+                            "support_area_mean": ecst_epoch_accumulator[
+                                "clean_support_area_sum"
+                            ]
+                            / ecst_batches,
+                            "ring_area_mean": ecst_epoch_accumulator[
+                                "clean_ring_area_sum"
+                            ]
+                            / ecst_batches,
+                            "static_strength_mean": ecst_epoch_accumulator[
+                                "clean_static_strength_sum"
+                            ]
+                            / ecst_batches,
+                            "conflict_ratio": ecst_epoch_accumulator[
+                                "clean_conflict_ratio_sum"
+                            ]
+                            / ecst_batches,
+                            "fg_erase_conflict_ratio": ecst_epoch_accumulator[
+                                "clean_fg_erase_conflict_sum"
+                            ]
+                            / ecst_batches,
+                            "bg_add_conflict_ratio": ecst_epoch_accumulator[
+                                "clean_bg_add_conflict_sum"
+                            ]
+                            / ecst_batches,
+                            "erase_conflict_ratio": ecst_epoch_accumulator[
+                                "clean_erase_conflict_sum"
+                            ]
+                            / ecst_batches,
+                            "add_conflict_ratio": ecst_epoch_accumulator[
+                                "clean_add_conflict_sum"
+                            ]
+                            / ecst_batches,
+                            "ring_teacher_fg_ratio": ecst_epoch_accumulator[
+                                "clean_ring_teacher_fg_sum"
+                            ]
+                            / ecst_batches,
+                            "ring_teacher_bg_ratio": ecst_epoch_accumulator[
+                                "clean_ring_teacher_bg_sum"
+                            ]
+                            / ecst_batches,
+                            "semantic_fg_tendency_mean": ecst_epoch_accumulator[
+                                "clean_semantic_fg_tendency_sum"
+                            ]
+                            / ecst_batches,
+                            "history_bg_reliability_mean": ecst_epoch_accumulator[
+                                "clean_history_bg_reliability_sum"
+                            ]
+                            / ecst_batches,
+                            "negative_weight_mean": ecst_epoch_accumulator[
+                                "clean_negative_weight_sum"
+                            ]
+                            / ecst_batches,
+                            "conflict_weight_mean": ecst_epoch_accumulator[
+                                "clean_conflict_weight_sum"
+                            ]
+                            / ecst_batches,
+                            "erase_effective_weight_mean": ecst_epoch_accumulator[
+                                "clean_erase_effective_weight_sum"
+                            ]
+                            / ecst_batches,
+                            "add_effective_weight_mean": ecst_epoch_accumulator[
+                                "clean_add_effective_weight_sum"
+                            ]
+                            / ecst_batches,
+                            "ring_bg_effective_weight_mean": ecst_epoch_accumulator[
+                                "clean_ring_bg_effective_weight_sum"
+                            ]
+                            / ecst_batches,
+                            "erase_suppression_mass": ecst_epoch_accumulator[
+                                "clean_erase_suppression_mass_sum"
+                            ]
+                            / ecst_batches,
+                            "add_suppression_mass": ecst_epoch_accumulator[
+                                "clean_add_suppression_mass_sum"
+                            ]
+                            / ecst_batches,
+                            "ring_bg_suppression_mass": ecst_epoch_accumulator[
+                                "clean_ring_bg_suppression_mass_sum"
+                            ]
+                            / ecst_batches,
+                            "erase_floor_saturation_ratio": ecst_epoch_accumulator[
+                                "clean_erase_floor_saturation_sum"
+                            ]
+                            / ecst_batches,
+                            "add_floor_saturation_ratio": ecst_epoch_accumulator[
+                                "clean_add_floor_saturation_sum"
+                            ]
+                            / ecst_batches,
+                            "ring_bg_floor_saturation_ratio": ecst_epoch_accumulator[
+                                "clean_ring_bg_floor_saturation_sum"
+                            ]
+                            / ecst_batches,
+                            "positive_static_evidence_mean": ecst_epoch_accumulator[
+                                "clean_positive_static_evidence_sum"
+                            ]
+                            / ecst_batches,
+                            "negative_static_evidence_mean": ecst_epoch_accumulator[
+                                "clean_negative_static_evidence_sum"
+                            ]
+                            / ecst_batches,
+                            "recoverability_mean": ecst_epoch_accumulator[
+                                "clean_recoverability_sum"
+                            ]
+                            / ecst_batches,
+                            "teacher_fg_ratio": ecst_epoch_accumulator[
+                                "clean_teacher_fg_ratio_sum"
+                            ]
+                            / ecst_batches,
+                            "teacher_bg_ratio": ecst_epoch_accumulator[
+                                "clean_teacher_bg_ratio_sum"
+                            ]
+                            / ecst_batches,
+                            "recovery_suppression_mass": ecst_epoch_accumulator[
+                                "clean_recovery_suppression_mass_sum"
+                            ]
+                            / ecst_batches,
+                            "combined_teacher_bg_suppression_mass": ecst_epoch_accumulator[
+                                "clean_combined_teacher_bg_suppression_mass_sum"
+                            ]
+                            / ecst_batches,
+                            "recovery_effective_weight_mean": ecst_epoch_accumulator[
+                                "clean_recovery_effective_weight_sum"
+                            ]
+                            / ecst_batches,
+                            "teacher_bg_effective_weight_mean": ecst_epoch_accumulator[
+                                "clean_teacher_bg_effective_weight_sum"
+                            ]
+                            / ecst_batches,
+                            "teacher_fg_effective_weight_mean": ecst_epoch_accumulator[
+                                "clean_teacher_fg_effective_weight_sum"
+                            ]
+                            / ecst_batches,
+                            "recovery_floor_saturation_ratio": ecst_epoch_accumulator[
+                                "clean_recovery_floor_saturation_sum"
+                            ]
+                            / ecst_batches,
+                            "teacher_bg_floor_saturation_ratio": ecst_epoch_accumulator[
+                                "clean_teacher_bg_floor_saturation_sum"
+                            ]
+                            / ecst_batches,
+                            "teacher_fg_floor_saturation_ratio": ecst_epoch_accumulator[
+                                "clean_teacher_fg_floor_saturation_sum"
+                            ]
+                            / ecst_batches,
+                            "erase_recovery_overlap_mass": ecst_epoch_accumulator[
+                                "clean_erase_recovery_overlap_mass_sum"
+                            ]
+                            / ecst_batches,
+                            "raw_map_min": (
+                                ecst_epoch_accumulator["clean_raw_map_min"]
+                                if ecst_epoch_accumulator["clean_raw_map_min"]
+                                is not None
+                                else 1.0
+                            ),
+                            "raw_map_mean": ecst_epoch_accumulator[
+                                "clean_raw_map_sum"
+                            ]
+                            / raw_map_pixels,
+                            "raw_map_max": (
+                                ecst_epoch_accumulator["clean_raw_map_max"]
+                                if ecst_epoch_accumulator["clean_raw_map_max"]
+                                is not None
+                                else 1.0
+                            ),
+                            "teacher_map_min": (
+                                ecst_epoch_accumulator["map_min"]
+                                if ecst_epoch_accumulator["map_min"] is not None
+                                else 1.0
+                            ),
+                            "teacher_map_mean": ecst_epoch_accumulator["map_sum"]
+                            / ecst_pixels,
+                            "teacher_map_max": (
+                                ecst_epoch_accumulator["map_max"]
+                                if ecst_epoch_accumulator["map_max"] is not None
+                                else 1.0
+                            ),
+                            "effective_map_min": (
+                                ecst_epoch_accumulator["map_min"]
+                                if ecst_epoch_accumulator["map_min"] is not None
+                                else 1.0
+                            ),
+                            "effective_map_mean": ecst_epoch_accumulator["map_sum"]
+                            / ecst_pixels,
+                            "effective_map_max": (
+                                ecst_epoch_accumulator["map_max"]
+                                if ecst_epoch_accumulator["map_max"] is not None
+                                else 1.0
+                            ),
+                            "student_pred_area": student_area,
+                            "teacher_pred_area": teacher_area,
+                            "student_prob_mean": ecst_epoch_accumulator[
+                                "clean_student_prob_sum"
+                            ]
+                            / prediction_pixels,
+                            "teacher_prob_mean": ecst_epoch_accumulator[
+                                "clean_teacher_prob_sum"
+                            ]
+                            / prediction_pixels,
+                            "teacher_loss_final": dabe_pu_teacher_final_loss_sum
+                            / stat_batches,
+                            "teacher_loss_coarse": dabe_pu_teacher_coarse_loss_sum
+                            / stat_batches,
+                            "teacher_loss_base": dabe_pu_teacher_base_loss_sum
+                            / stat_batches,
+                        }
+                        if strength_mode == "directional":
+                            epoch_strength_summary = (
+                                "strength_mode=directional | "
+                                "erase/add/ring_bg_strength="
+                                f"{clean_ecst_row['erase_strength']:.6f}/"
+                                f"{clean_ecst_row['add_strength']:.6f}/"
+                                f"{clean_ecst_row['ring_bg_strength']:.6f}"
+                            )
+                        elif strength_mode == "directional_continuous":
+                            epoch_strength_summary = (
+                                "strength_mode=directional_continuous | "
+                                "erase/add/recovery_strength="
+                                f"{clean_ecst_row['erase_strength']:.6f}/"
+                                f"{clean_ecst_row['add_strength']:.6f}/"
+                                f"{clean_ecst_row['recovery_strength']:.6f} | "
+                                "hard_ring_used=False"
+                            )
+                        else:
+                            epoch_strength_summary = (
+                                "strength_mode=uniform | "
+                                "strength_max/effective_strength="
+                                f"{clean_ecst_row['strength_max']:.6f}/"
+                                f"{clean_ecst_row['effective_strength']:.8f}"
+                            )
+                        if strength_mode != "directional_continuous":
+                            logger.log(
+                            f"[Clean-ECST] epoch={epoch:03d} | "
+                            f"schedule_scale={clean_ecst_row['schedule_scale']:.8f} | "
+                            f"{epoch_strength_summary} | "
+                            "memory_active_ratio/history_count_mean="
+                            f"{clean_ecst_row['memory_active_ratio']:.6f}/"
+                            f"{clean_ecst_row['history_count_mean']:.6f} | "
+                            "support_area/ring_area="
+                            f"{clean_ecst_row['support_area_mean']:.6f}/"
+                            f"{clean_ecst_row['ring_area_mean']:.6f} | "
+                            "conflict/fg_erase/bg_add="
+                            f"{clean_ecst_row['conflict_ratio']:.6f}/"
+                            f"{clean_ecst_row['fg_erase_conflict_ratio']:.6f}/"
+                            f"{clean_ecst_row['bg_add_conflict_ratio']:.6f} | "
+                            "erase_conflict_ratio/add_conflict_ratio="
+                            f"{clean_ecst_row['erase_conflict_ratio']:.6f}/"
+                            f"{clean_ecst_row['add_conflict_ratio']:.6f} | "
+                            "ring_teacher_fg_ratio/ring_teacher_bg_ratio="
+                            f"{clean_ecst_row['ring_teacher_fg_ratio']:.6f}/"
+                            f"{clean_ecst_row['ring_teacher_bg_ratio']:.6f} | "
+                            "semantic/history_bg="
+                            f"{clean_ecst_row['semantic_fg_tendency_mean']:.6f}/"
+                            f"{clean_ecst_row['history_bg_reliability_mean']:.6f} | "
+                            "negative/conflict_weight="
+                            f"{clean_ecst_row['negative_weight_mean']:.6f}/"
+                            f"{clean_ecst_row['conflict_weight_mean']:.6f} | "
+                            "raw_map_min/mean/max="
+                            f"{clean_ecst_row['raw_map_min']:.6f}/"
+                            f"{clean_ecst_row['raw_map_mean']:.6f}/"
+                            f"{clean_ecst_row['raw_map_max']:.6f} | "
+                            "effective_map_min/mean/max="
+                            f"{clean_ecst_row['effective_map_min']:.6f}/"
+                            f"{clean_ecst_row['effective_map_mean']:.6f}/"
+                            f"{clean_ecst_row['effective_map_max']:.6f} | "
+                            "erase/add/ring_bg_effective_weight_mean="
+                            f"{clean_ecst_row['erase_effective_weight_mean']:.6f}/"
+                            f"{clean_ecst_row['add_effective_weight_mean']:.6f}/"
+                            f"{clean_ecst_row['ring_bg_effective_weight_mean']:.6f} | "
+                            "erase/add/ring_bg_suppression_mass="
+                            f"{clean_ecst_row['erase_suppression_mass']:.6f}/"
+                            f"{clean_ecst_row['add_suppression_mass']:.6f}/"
+                            f"{clean_ecst_row['ring_bg_suppression_mass']:.6f} | "
+                            "erase/add/ring_bg_floor_saturation_ratio="
+                            f"{clean_ecst_row['erase_floor_saturation_ratio']:.6f}/"
+                            f"{clean_ecst_row['add_floor_saturation_ratio']:.6f}/"
+                            f"{clean_ecst_row['ring_bg_floor_saturation_ratio']:.6f} | "
+                            "student_pred_area/teacher_pred_area="
+                            f"{student_area:.6f}/{teacher_area:.6f} | "
+                            "teacher_loss_final/coarse/base="
+                            f"{clean_ecst_row['teacher_loss_final']:.6f}/"
+                            f"{clean_ecst_row['teacher_loss_coarse']:.6f}/"
+                            f"{clean_ecst_row['teacher_loss_base']:.6f} | "
+                            "legacy_pu_cache_used=False | legacy_regions_loaded=False"
+                        )
+                        if strength_mode == "directional_continuous":
+                            logger.log(
+                                f"[Clean-ECST v5] epoch={epoch:03d} | "
+                                f"schedule_scale={clean_ecst_row['schedule_scale']:.8f} | "
+                                "erase/add/recovery_strength="
+                                f"{clean_ecst_row['erase_strength']:.6f}/"
+                                f"{clean_ecst_row['add_strength']:.6f}/"
+                                f"{clean_ecst_row['recovery_strength']:.6f} | "
+                                "hard_ring_used=False | "
+                                "positive/negative_static_evidence_mean="
+                                f"{clean_ecst_row['positive_static_evidence_mean']:.6f}/"
+                                f"{clean_ecst_row['negative_static_evidence_mean']:.6f} | "
+                                f"recoverability_mean={clean_ecst_row['recoverability_mean']:.6f} | "
+                                "teacher_fg/bg_ratio="
+                                f"{clean_ecst_row['teacher_fg_ratio']:.6f}/"
+                                f"{clean_ecst_row['teacher_bg_ratio']:.6f} | "
+                                "erase/recovery/add/combined_bg_suppression_mass="
+                                f"{clean_ecst_row['erase_suppression_mass']:.6f}/"
+                                f"{clean_ecst_row['recovery_suppression_mass']:.6f}/"
+                                f"{clean_ecst_row['add_suppression_mass']:.6f}/"
+                                f"{clean_ecst_row['combined_teacher_bg_suppression_mass']:.6f} | "
+                                "overlap_mass="
+                                f"{clean_ecst_row['erase_recovery_overlap_mass']:.6f} | "
+                                "effective_map_min/mean/max="
+                                f"{clean_ecst_row['effective_map_min']:.6f}/"
+                                f"{clean_ecst_row['effective_map_mean']:.6f}/"
+                                f"{clean_ecst_row['effective_map_max']:.6f}"
+                            )
+                            logger.log(
+                                f"[Clean-ECST v5] epoch={epoch:03d} | "
+                                "erase/recovery/teacher_bg/teacher_fg_effective_weight_mean="
+                                f"{clean_ecst_row['erase_effective_weight_mean']:.6f}/"
+                                f"{clean_ecst_row['recovery_effective_weight_mean']:.6f}/"
+                                f"{clean_ecst_row['teacher_bg_effective_weight_mean']:.6f}/"
+                                f"{clean_ecst_row['teacher_fg_effective_weight_mean']:.6f} | "
+                                "floor_saturation="
+                                f"{clean_ecst_row['erase_floor_saturation_ratio']:.6f}/"
+                                f"{clean_ecst_row['recovery_floor_saturation_ratio']:.6f}/"
+                                f"{clean_ecst_row['teacher_bg_floor_saturation_ratio']:.6f}/"
+                                f"{clean_ecst_row['teacher_fg_floor_saturation_ratio']:.6f} | "
+                                "student/teacher_prob_mean="
+                                f"{clean_ecst_row['student_prob_mean']:.6f}/"
+                                f"{clean_ecst_row['teacher_prob_mean']:.6f} | "
+                                "student/teacher_pred_area="
+                                f"{clean_ecst_row['student_pred_area']:.6f}/"
+                                f"{clean_ecst_row['teacher_pred_area']:.6f}"
+                            )
+                        if clean_ecst_audit_path is None:
+                            raise RuntimeError("Clean-ECST audit CSV path is unavailable.")
+                        write_csv_row(
+                            clean_ecst_audit_path,
+                            CLEAN_ECST_AUDIT_HEADERS,
+                            clean_ecst_row,
+                        )
+                    elif use_ecst_minimal_train:
+                        logger.log(
+                            f"[ECST-Minimal] epoch={epoch:03d} | "
+                            f"scale={float(get_ecst_minimal_scale(cfg, epoch)):.8f} | "
+                            f"memory_active_ratio={ecst_epoch_accumulator['memory_active_batches'] / ecst_batches:.6f} | "
+                            f"history_count_mean={ecst_epoch_accumulator['history_count_mean_sum'] / ecst_batches:.6f} | "
+                            f"history_valid_ratio={ecst_epoch_accumulator['history_valid_ratio_sum'] / ecst_batches:.6f} | "
+                            "support/ring/strength/conflict="
+                            f"{ecst_epoch_accumulator['minimal_support_area_sum'] / ecst_batches:.6f}/"
+                            f"{ecst_epoch_accumulator['minimal_ring_area_sum'] / ecst_batches:.6f}/"
+                            f"{ecst_epoch_accumulator['minimal_static_strength_sum'] / ecst_batches:.6f}/"
+                            f"{ecst_epoch_accumulator['minimal_conflict_ratio_sum'] / ecst_batches:.6f} | "
+                            "ring_teacher_fg/bg="
+                            f"{ecst_epoch_accumulator['minimal_ring_teacher_fg_sum'] / ecst_batches:.6f}/"
+                            f"{ecst_epoch_accumulator['minimal_ring_teacher_bg_sum'] / ecst_batches:.6f} | "
+                            "protect/negative="
+                            f"{ecst_epoch_accumulator['minimal_protect_weight_sum'] / ecst_batches:.6f}/"
+                            f"{ecst_epoch_accumulator['minimal_negative_weight_sum'] / ecst_batches:.6f} | "
+                            "map_min/mean/max="
+                            f"{(ecst_epoch_accumulator['map_min'] if ecst_epoch_accumulator['map_min'] is not None else 1.0):.6f}/"
+                            f"{ecst_epoch_accumulator['map_sum'] / ecst_pixels:.6f}/"
+                            f"{(ecst_epoch_accumulator['map_max'] if ecst_epoch_accumulator['map_max'] is not None else 1.0):.6f} | "
+                            "student/teacher_area="
+                            f"{ecst_epoch_accumulator['student_pred_fg_count'] / prediction_pixels:.6f}/"
+                            f"{ecst_epoch_accumulator['teacher_pred_fg_count'] / prediction_pixels:.6f} | "
+                            "legacy_regions_read=False"
+                        )
+                    else:
+                        ecst_state_means = {}
+                        ecst_state_valid = {}
+                        for name in ECST_STATE_KEYS:
+                            count = float(ecst_epoch_accumulator["state_counts"][name])
+                            ecst_state_valid[name] = count > 0.0
+                            ecst_state_means[name] = (
+                                float(ecst_epoch_accumulator["state_sums"][name]) / count
+                                if count > 0.0
+                                else 0.0
+                            )
+                        logger.log(
+                            f"[ECST] epoch={epoch:03d} | "
+                            f"scale={float(get_ecst_scale(cfg, epoch)):.8f} | "
+                            f"memory_active_ratio={ecst_epoch_accumulator['memory_active_batches'] / ecst_batches:.6f} | "
+                            f"history_count_mean={ecst_epoch_accumulator['history_count_mean_sum'] / ecst_batches:.6f} | "
+                            f"history_valid_ratio={ecst_epoch_accumulator['history_valid_ratio_sum'] / ecst_batches:.6f} | "
+                            f"temporal_var_mean={ecst_epoch_accumulator['temporal_var_mean_sum'] / ecst_batches:.8f} | "
+                            f"reliability_mean={ecst_epoch_accumulator['temporal_reliability_mean_sum'] / ecst_batches:.6f} | "
+                            f"fg_core_conflict_ratio={ecst_epoch_accumulator['fg_core_conflict_count'] / max(ecst_epoch_accumulator['fg_core_count'], 1):.6f} | "
+                            f"bg_core_conflict_ratio={ecst_epoch_accumulator['bg_core_conflict_count'] / max(ecst_epoch_accumulator['bg_core_count'], 1):.6f} | "
+                            "extent_teacher_fg/bg_ratio="
+                            f"{ecst_epoch_accumulator['extent_teacher_fg_count'] / max(ecst_epoch_accumulator['extent_count'], 1):.6f}/"
+                            f"{ecst_epoch_accumulator['extent_teacher_bg_count'] / max(ecst_epoch_accumulator['extent_count'], 1):.6f} | "
+                            "map_min/mean/max="
+                            f"{(ecst_epoch_accumulator['map_min'] if ecst_epoch_accumulator['map_min'] is not None else 1.0):.6f}/"
+                            f"{ecst_epoch_accumulator['map_sum'] / ecst_pixels:.6f}/"
+                            f"{(ecst_epoch_accumulator['map_max'] if ecst_epoch_accumulator['map_max'] is not None else 1.0):.6f} | "
+                            "map_core_conflict/extent_bg/unknown="
+                            f"{ecst_state_means['core_conflict_map']:.6f}/"
+                            f"{ecst_state_means['extent_teacher_bg_map']:.6f}/"
+                            f"{ecst_state_means['unknown_map']:.6f} | "
+                            "student/teacher_area="
+                            f"{ecst_epoch_accumulator['student_pred_fg_count'] / prediction_pixels:.6f}/"
+                            f"{ecst_epoch_accumulator['teacher_pred_fg_count'] / prediction_pixels:.6f} | "
+                            "teacher_loss_final/coarse/base="
+                            f"{dabe_pu_teacher_final_loss_sum / stat_batches:.6f}/"
+                            f"{dabe_pu_teacher_coarse_loss_sum / stat_batches:.6f}/"
+                            f"{dabe_pu_teacher_base_loss_sum / stat_batches:.6f} | "
+                            "valid_core_conflict/extent_bg/unknown="
+                            f"{int(ecst_state_valid['core_conflict_map'])}/"
+                            f"{int(ecst_state_valid['extent_teacher_bg_map'])}/"
+                            f"{int(ecst_state_valid['unknown_map'])}"
+                        )
                 if use_tepr_lite:
                     tepr_batches = max(int(tepr_epoch_accumulator["batches"]), 1)
                     tepr_pixels = max(int(tepr_epoch_accumulator["map_pixels"]), 1)
@@ -25523,6 +29603,15 @@ def main():
                     runtime_path=pssf_runtime_path,
                     runtime_sha256=pssf_runtime_sha256,
                 )
+            elif use_cvsa_train:
+                epoch_checkpoint_extra = build_cvsa_checkpoint_extra(
+                    cfg=cfg,
+                    epoch=epoch,
+                    global_step=global_step,
+                    cvsa_router=cvsa_router,
+                    protocol_fingerprint=cvsa_fingerprint,
+                    train_loader_generator=train_loader_generator,
+                )
             elif use_ap_stcr_train:
                 epoch_checkpoint_extra = build_ap_stcr_checkpoint_extra(
                     cfg=cfg,
@@ -25681,15 +29770,39 @@ def main():
                     scheduler,
                     global_step,
                     lr_floor_activated_logged,
+                    cvsa_router=cvsa_router,
                 )
+                if use_cvsa_train:
+                    logger.log(
+                        f"[CVSA Reset] epoch={epoch:03d} | "
+                        f"next_epoch={epoch + 1:03d} | "
+                        "router_parameters_preserved=True | "
+                        f"router_in_optimizer={cvsa_router is not None} | "
+                        "router_optimizer_state_rebuilt=True | "
+                        "temporal_history_allocated=False | "
+                        "cross_reset_target_used=False"
+                    )
                 if use_ecst and bool(
-                    getattr(cfg, "ECST_RESET_MEMORY_AT_FINETUNE_RESET", True)
+                    getattr(
+                        cfg,
+                        "ECST_CLEAN_RESET_MEMORY_AT_FINETUNE_RESET"
+                        if use_ecst_clean_train
+                        else "ECST_RESET_MEMORY_AT_FINETUNE_RESET",
+                        True,
+                    )
                 ):
                     if ecst_memory is not None:
                         ecst_memory.clear()
                     ecst_memory = None
                     logger.log(
-                        "[ECST] temporal memory cleared and released at finetune reset | "
+                        (
+                            "[Clean-ECST] temporal memory cleared and released "
+                            "at finetune reset | "
+                            if use_ecst_clean_train
+                            else "[ECST] temporal memory cleared and released "
+                            "at finetune reset | "
+                        )
+                        +
                         f"epoch={epoch:03d}"
                     )
                 if use_source_arbiter_train:
@@ -25751,18 +29864,25 @@ def main():
                             "delayed_targets_resume_epoch="
                             f"{epoch + 1 + int(getattr(cfg, 'PSSF_HORIZON', 3)):03d}"
                         )
-                if use_ap_stcr_train and bool(
-                    getattr(cfg, "AP_STCR").get(
-                        "clear_history_on_reset", True
+                if use_ap_stcr_train:
+                    ap_history_allocated = (
+                        getattr(ap_stcr, "history_bank", None) is not None
                     )
-                ):
-                    ap_stcr.clear_temporal_history()
+                    clear_ap_history = (
+                        ap_history_allocated
+                        and ap_stcr_should_clear_history_on_reset(cfg)
+                    )
+                    if clear_ap_history:
+                        ap_stcr.clear_temporal_history()
                     logger.log(
                         f"[AP-STCR Reset] epoch={epoch:03d} | "
                         f"next_epoch={epoch + 1:03d} | "
                         "semantic_cache_preserved=True | "
-                        "history_cleared=True | "
-                        "cross_reset_history_used=False"
+                        f"teacher_reset={bool(getattr(cfg, 'FINETUNE_RESET_TEACHER', False))} | "
+                        f"temporal_history_allocated={ap_history_allocated} | "
+                        f"history_cleared={clear_ap_history} | "
+                        "cross_reset_history_used="
+                        f"{ap_history_allocated and not clear_ap_history}"
                     )
 
             if stop_after_epoch > 0 and int(epoch) == int(stop_after_epoch):

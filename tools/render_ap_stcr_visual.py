@@ -54,26 +54,103 @@ def _load_gt_68(cfg, payload):
 def _validate_payload(payload, path):
     if not isinstance(payload, dict):
         raise TypeError(f"AP-STCR diagnostic must be a dict: {path}")
-    if payload.get("schema_version") != "ap_stcr_diagnostic_v1":
+    schema_version = payload.get("schema_version")
+    if schema_version not in {
+        "ap_stcr_diagnostic_v1",
+        "ap_stcr_diagnostic_v2",
+        "ap_stcr_diagnostic_v3",
+        "ap_stcr_diagnostic_v4",
+        "ap_stcr_diagnostic_v4_semantic_only",
+    }:
         raise RuntimeError(f"AP-STCR diagnostic schema mismatch: {path}")
-    required = {
-        "epoch",
-        "dataset",
-        "stem",
-        "rgb",
-        "fixed_pseudo",
-        "fg_anchor_mask",
-        "bg_anchor_mask",
-        "semantic_margin",
-        "teacher_binary",
-        "teacher_correction",
-        "semantic_support",
-        "temporal_support",
-        "local_acceptance",
-        "effective_teacher_weight",
-        "mixed_target",
-        "student_prediction",
-    }
+    if schema_version == "ap_stcr_diagnostic_v4_semantic_only":
+        required = {
+            "epoch",
+            "dataset",
+            "stem",
+            "bg_anchor_source",
+            "rgb",
+            "fixed_pseudo",
+            "fg_anchor_mask",
+            "bg_anchor_mask",
+            "semantic_margin",
+            "teacher_soft",
+            "teacher_binary",
+            "soft_deviation",
+            "semantic_contradiction",
+            "transition_penalty",
+            "local_acceptance",
+            "effective_teacher_weight",
+            "mixed_target",
+            "student_prediction",
+            "global_teacher_ratio",
+            "transition_envelope",
+        }
+        forbidden = {
+            "teacher_correction",
+            "semantic_support",
+            "temporal_support",
+            "source_conflict",
+            "temporal_instability",
+            "combined_negative_evidence",
+            "fused_support",
+            "support_deficiency",
+            "soft_inertia",
+        }
+        forbidden.update(
+            name for name in payload if str(name).startswith("history_")
+        )
+        present_forbidden = sorted(forbidden.intersection(payload))
+        if present_forbidden:
+            raise RuntimeError(
+                "AP-STCR semantic-only diagnostic contains forbidden "
+                f"fields {present_forbidden}: {path}"
+            )
+    else:
+        required = {
+            "epoch",
+            "dataset",
+            "stem",
+            "rgb",
+            "fixed_pseudo",
+            "fg_anchor_mask",
+            "bg_anchor_mask",
+            "semantic_margin",
+            "teacher_binary",
+            "teacher_correction",
+            "semantic_support",
+            "temporal_support",
+            "local_acceptance",
+            "effective_teacher_weight",
+            "mixed_target",
+            "student_prediction",
+        }
+    if schema_version == "ap_stcr_diagnostic_v2":
+        required.add("source_conflict")
+    elif schema_version == "ap_stcr_diagnostic_v3":
+        required.update(
+            {
+                "teacher_soft",
+                "soft_deviation",
+                "source_conflict",
+                "fused_support",
+                "support_deficiency",
+                "soft_inertia",
+            }
+        )
+    elif schema_version == "ap_stcr_diagnostic_v4":
+        required.update(
+            {
+                "teacher_soft",
+                "soft_deviation",
+                "semantic_contradiction",
+                "temporal_instability",
+                "combined_negative_evidence",
+                "transition_penalty",
+                "global_teacher_ratio",
+                "transition_envelope",
+            }
+        )
     missing = sorted(required.difference(payload))
     if missing:
         raise RuntimeError(
@@ -83,7 +160,7 @@ def _validate_payload(payload, path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Render AP-STCR offline 14-panel diagnostics with GT."
+        description="Render AP-STCR offline diagnostics with GT."
     )
     parser.add_argument("--config", required=True)
     parser.add_argument(

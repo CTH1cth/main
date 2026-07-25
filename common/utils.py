@@ -517,6 +517,24 @@ def dabe_pu_manifest_path(cfg):
     return Path(root) / "manifest_train.jsonl"
 
 
+def dabe_clean_manifest_path(cfg):
+    root = getattr(
+        cfg,
+        "DABE_CLEAN_ROOT",
+        "../datasets/cache/dabe_clean_v1_pseudo_cache/dinov1-s8",
+    )
+    return Path(root) / "manifest_train.jsonl"
+
+
+def dabe_clean_legacy_region_manifest_path(cfg):
+    root = getattr(
+        cfg,
+        "DABE_CLEAN_LEGACY_REGION_ROOT",
+        "../datasets/cache/dabe_pu_v11_pseudo_cache/dinov1-s8",
+    )
+    return Path(root) / "manifest_train.jsonl"
+
+
 def tce_cover_manifest_path(cfg):
     root = getattr(cfg, "TCE_COVER_CACHE_ROOT", "../datasets/cache/tce_cover_cache/dinov1-s8/long35_epoch030")
     return Path(root) / "manifest_train.jsonl"
@@ -1625,6 +1643,18 @@ def check_dabe_pu_cache(cfg, max_samples=None):
         "extent_candidate_68",
         "unknown_68",
     ]
+    static_source = str(
+        getattr(cfg, "DABE_PU_STATIC_SOURCE", "target_soft_68")
+    ).strip().lower()
+    if static_source not in {"target_soft_68", "p_base_68"}:
+        raise RuntimeError(
+            _dabe_pu_error(
+                "unsupported DABE_PU_STATIC_SOURCE="
+                f"{static_source!r}; expected 'target_soft_68' or 'p_base_68'"
+            )
+        )
+    if static_source == "p_base_68":
+        required_fields.append("p_base_68")
     if use_oem:
         required_fields.extend(
             [
@@ -1677,6 +1707,14 @@ def check_dabe_pu_cache(cfg, max_samples=None):
         for tensor_key in required_fields:
             shape = expected_shape_37 if tensor_key.endswith("_37") else expected_shape
             _check_dabe_pu_tensor(payload, key, cache_path, tensor_key, shape)
+        if static_source == "p_base_68" and not bool(
+            torch.isfinite(payload["p_base_68"]).all().item()
+        ):
+            raise RuntimeError(
+                _dabe_pu_error(
+                    f"p_base_68 contains NaN/Inf for {key}: {cache_path}"
+                )
+            )
         if audit_arbiter_weight:
             weight = payload["weight_map_68"].float()
             if not bool(torch.isfinite(weight).all().item()):
@@ -1718,6 +1756,219 @@ def check_dabe_pu_cache(cfg, max_samples=None):
             f"{float(per_image_max.mean()):.8f}/"
             f"{float(per_image_max.max()):.8f}"
         )
+    return True, reason
+
+
+def check_dabe_clean_cache(cfg, max_samples=None, return_stats=False):
+    """Validate the independent Bridge/Clean cache without touching GT."""
+
+    manifest_path = dabe_clean_manifest_path(cfg)
+    if not manifest_path.exists():
+        raise RuntimeError(f"DABE-Clean cache manifest is missing: {manifest_path}")
+    expected_items = build_image_items(
+        cfg.DATA_ROOT, cfg.TRAIN_DATASETS, require_gt=False
+    )
+    if max_samples is not None and int(max_samples) >= 0:
+        expected_items = expected_items[: int(max_samples)]
+    expected_keys = [(item["dataset"], item["stem"]) for item in expected_items]
+    rows = read_jsonl(manifest_path)
+    row_map = {}
+    for row in rows:
+        key = (row.get("dataset"), row.get("stem"))
+        if None in key:
+            raise RuntimeError(f"Bad DABE-Clean manifest row: {row}")
+        if key in row_map:
+            raise RuntimeError(f"Duplicate DABE-Clean manifest key: {key}")
+        row_map[key] = row
+    missing = sorted(set(expected_keys) - set(row_map))
+    if missing:
+        raise RuntimeError(f"DABE-Clean cache missing first 10 keys: {missing[:10]}")
+    if max_samples is None or int(max_samples) < 0:
+        extra = sorted(set(row_map) - set(expected_keys))
+        if extra:
+            raise RuntimeError(
+                f"DABE-Clean cache has unexpected first 10 keys: {extra[:10]}"
+            )
+
+    mode = str(getattr(cfg, "DABE_CLEAN_TARGET_MODE", "dp")).strip().lower()
+    if mode not in {"dp", "diff", "bridge"}:
+        raise RuntimeError(f"Unsupported DABE_CLEAN_TARGET_MODE={mode!r}.")
+    configured_payload_version = str(
+        getattr(cfg, "DABE_CLEAN_EXPECTED_PAYLOAD_VERSION", "")
+    ).strip()
+    if mode == "bridge":
+        expected_version = "dabe_bridge_v1"
+    elif configured_payload_version:
+        expected_version = configured_payload_version
+    elif str(getattr(cfg, "DABE_CLEAN_VERSION", "v1")).lower() == "v2_contrec":
+        expected_version = "dabe_clean_v2_contrec"
+    else:
+        expected_version = "dabe_clean_v1"
+    is_contrec = expected_version == "dabe_clean_v2_contrec"
+    if is_contrec and (max_samples is None or int(max_samples) < 0):
+        if len(expected_keys) != 4040:
+            raise RuntimeError(
+                "DABE-Clean v2-contrec full training protocol requires exactly "
+                f"4040 rows, got {len(expected_keys)}."
+            )
+    expected_fields = (
+        [
+            "bridge_target_37",
+            "bridge_target_68",
+            "source_target_soft_37",
+            "source_target_soft_68",
+            "source_weight_map_37",
+            "source_weight_map_68",
+            "source_p_base_37",
+        ]
+        if mode == "bridge"
+        else ([
+            "foreground_evidence_37",
+            "foreground_evidence_68",
+            "background_evidence_37",
+            "background_evidence_68",
+            "target_dp_37",
+            "target_dp_68",
+            "p_rw_37",
+            "evidence_gate_37",
+            "semantic_fg_tendency_37",
+            "latent_rw_37",
+            "recoverability_37",
+            "recoverability_68",
+        ] if is_contrec else [
+            "foreground_evidence_37",
+            "foreground_evidence_68",
+            "background_evidence_37",
+            "background_evidence_68",
+            "target_dp_37",
+            "target_dp_68",
+            "target_diff_37",
+            "target_diff_68",
+            "source_p_base_37",
+            "source_p_base_68",
+            "source_bc_map_37",
+            "source_residual_37",
+        ])
+    )
+    distribution_fields = {
+        "p_rw": "p_rw_37",
+        "foreground_evidence": "foreground_evidence_37",
+        "latent_rw": "latent_rw_37",
+        "background_evidence": "background_evidence_37",
+        "semantic_fg_tendency": "semantic_fg_tendency_37",
+        "recoverability": "recoverability_37",
+    }
+    distribution_values = {name: [] for name in distribution_fields}
+    for key in expected_keys:
+        row = row_map[key]
+        cache_path = Path(row.get("cache_path", ""))
+        if not cache_path.is_file():
+            raise RuntimeError(f"DABE-Clean cache file is missing: {cache_path}")
+        payload = torch_load(cache_path, map_location="cpu")
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"DABE-Clean payload must be dict: {cache_path}")
+        if payload.get("dataset") != key[0] or payload.get("stem") != key[1]:
+            raise RuntimeError(f"DABE-Clean payload identity mismatch: {cache_path}")
+        if str(payload.get("version")) != expected_version:
+            raise RuntimeError(
+                f"DABE-Clean version mismatch: {payload.get('version')} != "
+                f"{expected_version} | {cache_path}"
+            )
+        if str(payload.get("backbone_key")) != str(cfg.BACKBONE_KEY):
+            raise RuntimeError(f"DABE-Clean backbone mismatch: {cache_path}")
+        if is_contrec:
+            if bool(payload.get("training_gt_read", True)):
+                raise RuntimeError(
+                    f"DABE-Clean contrec reports training_gt_read=True: {cache_path}"
+                )
+            if bool(payload.get("teacher_prediction_read", True)):
+                raise RuntimeError(
+                    f"DABE-Clean contrec reports Teacher access: {cache_path}"
+                )
+            forbidden = {
+                "gt",
+                "gt_path",
+                "weight_map",
+                "static_weight_map",
+                "hard_ring",
+                "extent",
+                "unknown",
+                "fg_core",
+                "bg_core",
+            }
+            leaked = sorted(forbidden.intersection(payload))
+            if leaked:
+                raise RuntimeError(
+                    f"DABE-Clean contrec payload leaked forbidden fields {leaked}: "
+                    f"{cache_path}"
+                )
+        for field in expected_fields:
+            value = payload.get(field)
+            if not torch.is_tensor(value):
+                raise RuntimeError(
+                    f"DABE-Clean payload is missing {field}: {cache_path}"
+                )
+            expected_shape = (1, 37, 37) if field.endswith("_37") else (
+                1,
+                int(cfg.LOSS_SIZE),
+                int(cfg.LOSS_SIZE),
+            )
+            if tuple(value.shape) != expected_shape:
+                raise RuntimeError(
+                    f"DABE-Clean {field} shape mismatch: {list(value.shape)} != "
+                    f"{list(expected_shape)} | {cache_path}"
+                )
+            if not bool(torch.isfinite(value).all().item()):
+                raise RuntimeError(f"DABE-Clean {field} contains NaN/Inf: {cache_path}")
+            if float(value.min()) < -1e-6 or float(value.max()) > 1.0 + 1e-6:
+                raise RuntimeError(f"DABE-Clean {field} is outside [0,1]: {cache_path}")
+        if is_contrec:
+            reconstruction_error = float(
+                (
+                    payload["p_rw_37"].float()
+                    * payload["evidence_gate_37"].float()
+                    - payload["foreground_evidence_37"].float()
+                ).abs().max().item()
+            )
+            if reconstruction_error >= 1e-5:
+                raise RuntimeError(
+                    "DABE-Clean contrec foreground regression failed: "
+                    f"error={reconstruction_error:.9g} | {cache_path}"
+                )
+            for name, field in distribution_fields.items():
+                distribution_values[name].append(
+                    payload[field].detach().cpu().float().reshape(-1)
+                )
+    stats = {}
+    if is_contrec:
+        for name, chunks in distribution_values.items():
+            values = torch.cat(chunks)
+            quantiles = torch.quantile(
+                values, torch.tensor([0.50, 0.90, 0.95], dtype=values.dtype)
+            )
+            stats[name] = {
+                "mean": float(values.mean().item()),
+                "std": float(values.std(unbiased=False).item()),
+                "p50": float(quantiles[0].item()),
+                "p90": float(quantiles[1].item()),
+                "p95": float(quantiles[2].item()),
+                "max": float(values.max().item()),
+            }
+            if name == "recoverability":
+                stats[name].update(
+                    {
+                        "zero_ratio": float((values == 0.0).float().mean().item()),
+                        "gt_0_1_ratio": float((values > 0.1).float().mean().item()),
+                        "gt_0_3_ratio": float((values > 0.3).float().mean().item()),
+                        "gt_0_5_ratio": float((values > 0.5).float().mean().item()),
+                    }
+                )
+    reason = (
+        f"complete: {manifest_path} | rows_checked={len(expected_keys)} | "
+        f"version={expected_version} | mode={mode} | training_gt_read=False"
+    )
+    if return_stats:
+        return True, reason, stats
     return True, reason
 
 

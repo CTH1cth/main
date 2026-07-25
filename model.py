@@ -1915,6 +1915,85 @@ class DAGPSafeHead(nn.Module):
         epoch = int(self.current_epoch_tensor.item())
         return self.esa_ber_start_epoch <= epoch < self.esa_ber_stop_epoch
 
+    @torch.no_grad()
+    def forward_coarse_only(self, feat, epoch=None, return_logits_37=True):
+        """Run only the native base projection and DAGP coarse path.
+
+        This read-only interface is used by BITC counterfactual feature
+        interventions.  It deliberately skips RGB/Sobel inputs, NDR and every
+        final-refinement branch while sharing the current EMA-Teacher weights.
+        """
+        if not bool(return_logits_37):
+            raise ValueError("forward_coarse_only requires return_logits_37=True")
+        if self.training:
+            raise RuntimeError(
+                "forward_coarse_only is a read-only EMA-Teacher eval interface"
+            )
+        if feat.ndim != 4:
+            raise RuntimeError(
+                f"forward_coarse_only expects [B,C,H,W], got {list(feat.shape)}"
+            )
+        current_epoch = int(self.current_epoch_tensor.item())
+        if epoch is not None and int(epoch) != current_epoch:
+            raise RuntimeError(
+                f"forward_coarse_only epoch mismatch: requested={int(epoch)}, "
+                f"model={current_epoch}"
+            )
+        batch_size, _, height, width = feat.shape
+        base_logits = self.base_head(feat)
+        scale = self._ramp_scale()
+        alpha_eff = self.alpha_max * scale
+        gamma_eff = self.gamma_max * scale
+        if alpha_eff == 0.0 or gamma_eff == 0.0:
+            return base_logits.detach()
+
+        attn, topk_idx = self._topk_affinity(feat)
+        if self.use_prob_gate:
+            attn = self._apply_prob_gate(attn, topk_idx, base_logits)
+        if self.pa_dagp is not None:
+            edge_scale = self.pa_dagp.edge_scale(current_epoch)
+            if edge_scale > 0.0:
+                pa_state = self.pa_dagp(
+                    feat,
+                    base_logits,
+                    topk_idx=topk_idx,
+                    edge_scale=edge_scale,
+                )
+                polarity_gate = pa_state["polarity_gate"]
+                if polarity_gate is None or polarity_gate.shape != attn.shape:
+                    raise RuntimeError(
+                        "forward_coarse_only PA-DAGP polarity gate shape mismatch"
+                    )
+                attn = attn * polarity_gate.to(dtype=attn.dtype)
+                attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(
+                    self.prob_gate_eps
+                )
+
+        projected = self.proj(feat)
+        projected_nodes = projected.flatten(2).transpose(1, 2)
+        value = self.value(projected_nodes)
+        neighbor_value = self._gather_neighbors(value, topk_idx)
+        aggregate = (
+            attn.to(dtype=value.dtype).unsqueeze(-1) * neighbor_value
+        ).sum(dim=2)
+        propagated = projected_nodes + value.new_tensor(float(gamma_eff)) * aggregate
+        propagated_map = propagated.transpose(1, 2).reshape(
+            batch_size, self.hidden, height, width
+        )
+        graph_logits = self.graph_pred(propagated_map)
+        uncertainty_gate = self._uncertainty_output_gate(base_logits)
+        graph_residual = (
+            graph_logits
+            if uncertainty_gate is None
+            else uncertainty_gate * graph_logits
+        )
+        coarse_logits = base_logits + graph_logits.new_tensor(
+            float(alpha_eff)
+        ) * graph_residual
+        if coarse_logits.requires_grad:
+            coarse_logits = coarse_logits.detach()
+        return coarse_logits
+
     @staticmethod
     def _attach_ber_graph_aux(output, topk_idx, semantic_weight):
         if topk_idx is None or semantic_weight is None:

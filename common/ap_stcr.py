@@ -406,6 +406,38 @@ class AnchorPropagatedSemanticTemporalCorrection:
     def __init__(self, config, sample_keys):
         self.config = dict(config)
         self.enabled = bool(self.config.get("enabled", True))
+        self.version = str(
+            self.config.get("version", "ap_stcr_v1_full_pixel_37_to_68")
+        ).strip()
+        supported_versions = {
+            "ap_stcr_v1_full_pixel_37_to_68",
+            "ap_stcr_v2_conflict_only_pass_through",
+            "ap_stcr_v3_soft_disagreement_bounded_continuation",
+            "ap_stcr_v4_transition_envelope_non_compensatory",
+            "ap_stcr_v4_semantic_only_ablation",
+        }
+        if self.version not in supported_versions:
+            raise RuntimeError(
+                f"Unsupported AP-STCR version={self.version!r}; "
+                f"expected one of {sorted(supported_versions)}."
+            )
+        self.conflict_only = bool(
+            self.config.get("conflict_only", False)
+        )
+        self.is_v2 = (
+            self.version == "ap_stcr_v2_conflict_only_pass_through"
+        )
+        self.is_v3 = (
+            self.version
+            == "ap_stcr_v3_soft_disagreement_bounded_continuation"
+        )
+        self.is_v4 = (
+            self.version
+            == "ap_stcr_v4_transition_envelope_non_compensatory"
+        )
+        self.is_semantic_only = (
+            self.version == "ap_stcr_v4_semantic_only_ablation"
+        )
         self.evidence_resolution = int(
             self.config.get("evidence_resolution", 37)
         )
@@ -431,12 +463,95 @@ class AnchorPropagatedSemanticTemporalCorrection:
         self.tau_temporal = float(
             self.config.get("tau_temporal", 0.20)
         )
-        self.lambda_semantic = float(
-            self.config.get("lambda_semantic", 1.0)
+        self.temporal_empty_support = float(
+            self.config.get("temporal_empty_support", 1.0)
         )
-        self.lambda_temporal = float(
-            self.config.get("lambda_temporal", 1.0)
+        self.rejection_max = float(
+            self.config.get("rejection_max", 0.35)
         )
+        self.support_neutral_point = float(
+            self.config.get("support_neutral_point", 0.50)
+        )
+        self.use_soft_deviation = True
+        self.use_soft_correction_for_semantic = True
+        self.soft_rejection_strength = 0.35
+        self.evidence_fusion = "negative_soft_or"
+        self.use_temporal_evidence = True
+        self.temporal_history_enabled = True
+        self.use_transition_envelope = True
+        self.evidence_rejection_strength = 0.35
+        self.min_local_acceptance = 0.65
+        if self.is_v3:
+            self.use_soft_deviation = bool(
+                self.config.get("use_soft_deviation", True)
+            )
+            self.use_soft_correction_for_semantic = bool(
+                self.config.get("use_soft_correction_for_semantic", True)
+            )
+            self.soft_rejection_strength = float(
+                self.config.get("soft_rejection_strength", 0.35)
+            )
+            self.min_local_acceptance = float(
+                self.config.get("min_local_acceptance", 0.65)
+            )
+        elif self.is_v4:
+            self.use_soft_deviation = bool(
+                self.config.get("use_soft_deviation", True)
+            )
+            self.use_soft_correction_for_semantic = bool(
+                self.config.get("use_soft_correction_for_semantic", True)
+            )
+            self.evidence_fusion = str(
+                self.config.get("evidence_fusion", "negative_soft_or")
+            ).strip()
+            self.use_transition_envelope = bool(
+                self.config.get("use_transition_envelope", True)
+            )
+            self.evidence_rejection_strength = float(
+                self.config.get("evidence_rejection_strength", 0.35)
+            )
+            self.min_local_acceptance = float(
+                self.config.get("min_local_acceptance", 0.65)
+            )
+        elif self.is_semantic_only:
+            self.use_soft_deviation = bool(
+                self.config.get("use_soft_deviation", True)
+            )
+            self.use_soft_correction_for_semantic = bool(
+                self.config.get("use_soft_correction_for_semantic", True)
+            )
+            self.evidence_fusion = str(
+                self.config.get("evidence_fusion", "semantic_only")
+            ).strip()
+            self.use_temporal_evidence = bool(
+                self.config.get("use_temporal_evidence", False)
+            )
+            self.temporal_history_enabled = bool(
+                self.config.get("temporal_history_enabled", False)
+            )
+            self.use_transition_envelope = bool(
+                self.config.get("use_transition_envelope", True)
+            )
+            self.evidence_rejection_strength = float(
+                self.config.get("evidence_rejection_strength", 0.35)
+            )
+            self.min_local_acceptance = float(
+                self.config.get("min_local_acceptance", 0.65)
+            )
+        self.lambda_semantic = None
+        self.lambda_temporal = None
+        if not (
+            self.is_v2
+            or self.is_v3
+            or self.is_v4
+            or self.is_semantic_only
+        ):
+            self.lambda_semantic = float(
+                self.config.get("lambda_semantic", 1.0)
+            )
+            self.lambda_temporal = float(
+                self.config.get("lambda_temporal", 1.0)
+            )
         self.eps = float(self.config.get("eps", 1e-6))
         if not self.enabled:
             raise RuntimeError("AP-STCR module requires enabled=True.")
@@ -446,10 +561,20 @@ class AnchorPropagatedSemanticTemporalCorrection:
             "tau_delta": self.tau_delta,
             "tau_margin": self.tau_margin,
             "tau_temporal": self.tau_temporal,
-            "lambda_semantic": self.lambda_semantic,
-            "lambda_temporal": self.lambda_temporal,
             "eps": self.eps,
         }
+        if not (
+            self.is_v2
+            or self.is_v3
+            or self.is_v4
+            or self.is_semantic_only
+        ):
+            positive_values.update(
+                {
+                    "lambda_semantic": self.lambda_semantic,
+                    "lambda_temporal": self.lambda_temporal,
+                }
+            )
         invalid = {
             name: value
             for name, value in positive_values.items()
@@ -460,21 +585,228 @@ class AnchorPropagatedSemanticTemporalCorrection:
                 f"Invalid AP-STCR positive configuration values: {invalid}."
             )
         if self.evidence_resolution != 37 or self.loss_resolution != 68:
-            raise RuntimeError("AP-STCR v1 requires 37 evidence and 68 loss.")
+            raise RuntimeError("AP-STCR requires 37 evidence and 68 loss.")
+        if not 0.0 <= self.temporal_empty_support <= 1.0:
+            raise RuntimeError(
+                "AP-STCR temporal_empty_support must be in [0,1]."
+            )
+        if self.is_v2:
+            if not self.conflict_only:
+                raise RuntimeError(
+                    "AP-STCR v2 requires conflict_only=True."
+                )
+            if "lambda_semantic" in self.config or "lambda_temporal" in self.config:
+                raise RuntimeError(
+                    "AP-STCR v2 must not configure lambda_semantic or "
+                    "lambda_temporal."
+                )
+            if (
+                not math.isfinite(self.rejection_max)
+                or not 0.0 <= self.rejection_max <= 1.0
+            ):
+                raise RuntimeError(
+                    "AP-STCR v2 rejection_max must be in [0,1]."
+                )
+            if (
+                not math.isfinite(self.support_neutral_point)
+                or not 0.0 < self.support_neutral_point < 1.0
+            ):
+                raise RuntimeError(
+                    "AP-STCR v2 support_neutral_point must be in (0,1)."
+                )
+        elif self.is_v3:
+            forbidden = {
+                "conflict_only",
+                "rejection_max",
+                "support_neutral_point",
+                "lambda_semantic",
+                "lambda_temporal",
+            }.intersection(self.config)
+            if forbidden:
+                raise RuntimeError(
+                    "AP-STCR v3 must not configure legacy conflict/lambda "
+                    f"fields: {sorted(forbidden)}."
+                )
+            if not self.use_soft_deviation:
+                raise RuntimeError(
+                    "AP-STCR v3 requires use_soft_deviation=True."
+                )
+            if not self.use_soft_correction_for_semantic:
+                raise RuntimeError(
+                    "AP-STCR v3 requires "
+                    "use_soft_correction_for_semantic=True."
+                )
+            if (
+                not math.isfinite(self.soft_rejection_strength)
+                or not 0.0 <= self.soft_rejection_strength <= 1.0
+            ):
+                raise RuntimeError(
+                    "AP-STCR v3 soft_rejection_strength must be in [0,1]."
+                )
+            if (
+                not math.isfinite(self.min_local_acceptance)
+                or not 0.0 <= self.min_local_acceptance <= 1.0
+            ):
+                raise RuntimeError(
+                    "AP-STCR v3 min_local_acceptance must be in [0,1]."
+                )
+            if not math.isclose(
+                self.min_local_acceptance,
+                1.0 - self.soft_rejection_strength,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise RuntimeError(
+                    "AP-STCR v3 requires min_local_acceptance == "
+                    "1 - soft_rejection_strength."
+                )
+        elif self.is_v4:
+            forbidden = {
+                "conflict_only",
+                "rejection_max",
+                "support_neutral_point",
+                "lambda_semantic",
+                "lambda_temporal",
+                "soft_rejection_strength",
+                "fused_support",
+                "support_deficiency",
+                "soft_inertia",
+            }.intersection(self.config)
+            if forbidden:
+                raise RuntimeError(
+                    "AP-STCR v4 must not configure legacy conflict/fused "
+                    f"fields: {sorted(forbidden)}."
+                )
+            if not self.use_soft_deviation:
+                raise RuntimeError(
+                    "AP-STCR v4 requires use_soft_deviation=True."
+                )
+            if not self.use_soft_correction_for_semantic:
+                raise RuntimeError(
+                    "AP-STCR v4 requires "
+                    "use_soft_correction_for_semantic=True."
+                )
+            if self.evidence_fusion != "negative_soft_or":
+                raise RuntimeError(
+                    "AP-STCR v4 requires "
+                    "evidence_fusion='negative_soft_or'."
+                )
+            if not self.use_transition_envelope:
+                raise RuntimeError(
+                    "AP-STCR v4 requires use_transition_envelope=True."
+                )
+            if (
+                not math.isfinite(self.evidence_rejection_strength)
+                or not 0.0 <= self.evidence_rejection_strength <= 1.0
+            ):
+                raise RuntimeError(
+                    "AP-STCR v4 evidence_rejection_strength must be in "
+                    "[0,1]."
+                )
+            if (
+                not math.isfinite(self.min_local_acceptance)
+                or not 0.0 <= self.min_local_acceptance <= 1.0
+            ):
+                raise RuntimeError(
+                    "AP-STCR v4 min_local_acceptance must be in [0,1]."
+                )
+            if not math.isclose(
+                self.min_local_acceptance,
+                1.0 - self.evidence_rejection_strength,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise RuntimeError(
+                    "AP-STCR v4 requires min_local_acceptance == "
+                    "1 - evidence_rejection_strength."
+                )
+        elif self.is_semantic_only:
+            forbidden = {
+                "conflict_only",
+                "rejection_max",
+                "support_neutral_point",
+                "lambda_semantic",
+                "lambda_temporal",
+                "soft_rejection_strength",
+                "fused_support",
+                "support_deficiency",
+                "soft_inertia",
+            }.intersection(self.config)
+            if forbidden:
+                raise RuntimeError(
+                    "AP-STCR A1 must not configure legacy conflict/fused "
+                    f"fields: {sorted(forbidden)}."
+                )
+            if not self.use_soft_deviation:
+                raise RuntimeError(
+                    "AP-STCR A1 requires use_soft_deviation=True."
+                )
+            if not self.use_soft_correction_for_semantic:
+                raise RuntimeError(
+                    "AP-STCR A1 requires "
+                    "use_soft_correction_for_semantic=True."
+                )
+            if self.evidence_fusion != "semantic_only":
+                raise RuntimeError(
+                    "AP-STCR A1 requires evidence_fusion='semantic_only'."
+                )
+            if self.use_temporal_evidence:
+                raise RuntimeError(
+                    "AP-STCR A1 requires use_temporal_evidence=False."
+                )
+            if self.temporal_history_enabled:
+                raise RuntimeError(
+                    "AP-STCR A1 requires temporal_history_enabled=False."
+                )
+            if not self.use_transition_envelope:
+                raise RuntimeError(
+                    "AP-STCR A1 requires use_transition_envelope=True."
+                )
+            if (
+                not math.isfinite(self.evidence_rejection_strength)
+                or not 0.0 <= self.evidence_rejection_strength <= 1.0
+            ):
+                raise RuntimeError(
+                    "AP-STCR A1 evidence_rejection_strength must be in "
+                    "[0,1]."
+                )
+            if (
+                not math.isfinite(self.min_local_acceptance)
+                or not 0.0 <= self.min_local_acceptance <= 1.0
+            ):
+                raise RuntimeError(
+                    "AP-STCR A1 min_local_acceptance must be in [0,1]."
+                )
+            if not math.isclose(
+                self.min_local_acceptance,
+                1.0 - self.evidence_rejection_strength,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise RuntimeError(
+                    "AP-STCR A1 requires min_local_acceptance == "
+                    "1 - evidence_rejection_strength."
+                )
+        elif self.conflict_only:
+            raise RuntimeError(
+                "AP-STCR v1 cannot enable conflict_only routing."
+            )
         self.semantic_cache = APSTCRSemanticCache(
             sample_keys,
             height=self.evidence_resolution,
             width=self.evidence_resolution,
         )
-        self.history_bank = APSTCRTemporalHistoryBank(
-            sample_keys,
-            window=self.temporal_window,
-            height=self.evidence_resolution,
-            width=self.evidence_resolution,
-        )
         self.manifest_hash = self.semantic_cache.manifest_hash
-        if self.history_bank.manifest_hash != self.manifest_hash:
-            raise RuntimeError("AP-STCR cache/history manifest mismatch.")
+        self.history_bank = None
+        if not self.is_semantic_only:
+            self.history_bank = APSTCRTemporalHistoryBank(
+                sample_keys,
+                window=self.temporal_window,
+                height=self.evidence_resolution,
+                width=self.evidence_resolution,
+            )
+            if self.history_bank.manifest_hash != self.manifest_hash:
+                raise RuntimeError("AP-STCR cache/history manifest mismatch.")
 
     @torch.no_grad()
     def build_anchor_masks(
@@ -685,6 +1017,63 @@ class AnchorPropagatedSemanticTemporalCorrection:
         return support.clamp(0.0, 1.0).detach(), delta.detach()
 
     @torch.no_grad()
+    def compute_soft_semantic_support(
+        self,
+        semantic_margin,
+        teacher_soft,
+        fixed_pseudo,
+    ):
+        semantic_margin = _require_map(
+            "semantic_margin", semantic_margin
+        ).detach().float()
+        teacher_soft = _require_unit_map(
+            "teacher_soft",
+            teacher_soft,
+            shape=semantic_margin.shape,
+        ).detach().float()
+        fixed_pseudo = _require_unit_map(
+            "fixed_pseudo",
+            fixed_pseudo,
+            shape=semantic_margin.shape,
+        ).detach().float()
+        soft_correction = teacher_soft - fixed_pseudo
+        correction_direction = torch.tanh(
+            soft_correction / self.tau_delta
+        )
+        semantic_direction = torch.tanh(
+            semantic_margin / self.tau_margin
+        )
+        support = 0.5 * (
+            1.0 + semantic_direction * correction_direction
+        )
+        return support.clamp(0.0, 1.0).detach(), soft_correction.detach()
+
+    @torch.no_grad()
+    def compute_semantic_contradiction(
+        self,
+        semantic_margin,
+        soft_correction,
+    ):
+        semantic_margin = _require_map(
+            "semantic_margin", semantic_margin
+        ).detach().float()
+        soft_correction = _require_map(
+            "soft_correction",
+            soft_correction,
+            shape=semantic_margin.shape,
+        ).detach().float()
+        semantic_direction = torch.tanh(
+            semantic_margin / self.tau_margin
+        )
+        correction_direction = torch.tanh(
+            soft_correction / self.tau_delta
+        )
+        semantic_contradiction = torch.relu(
+            -semantic_direction * correction_direction
+        ).clamp(0.0, 1.0)
+        return semantic_contradiction.detach()
+
+    @torch.no_grad()
     def compute_temporal_support(
         self,
         teacher_soft,
@@ -693,6 +1082,10 @@ class AnchorPropagatedSemanticTemporalCorrection:
         datasets,
         stems,
     ):
+        if self.history_bank is None:
+            raise RuntimeError(
+                "AP-STCR A1 has temporal evidence/history disabled."
+            )
         history = self.history_bank.fetch(
             sample_indices,
             datasets,
@@ -713,7 +1106,10 @@ class AnchorPropagatedSemanticTemporalCorrection:
         )
         support = (direction_support * deviation_support).clamp(0.0, 1.0)
         valid = history["history_valid"][:, None, None, None]
-        support = torch.where(valid, support, torch.ones_like(support))
+        empty_support = torch.full_like(
+            support, self.temporal_empty_support
+        )
+        support = torch.where(valid, support, empty_support)
         history.update(
             {
                 "temporal_support": support.detach(),
@@ -728,12 +1124,312 @@ class AnchorPropagatedSemanticTemporalCorrection:
         self,
         semantic_support,
         temporal_support,
+        source_conflict=None,
     ):
+        if self.is_v2:
+            if source_conflict is None:
+                raise RuntimeError(
+                    "AP-STCR v2 local acceptance requires source_conflict."
+                )
+            return self.compute_conflict_only_acceptance(
+                semantic_support,
+                temporal_support,
+                source_conflict,
+            )["local_acceptance_37"]
         evidence = (
             self.lambda_semantic * (1.0 - semantic_support.detach().float())
             + self.lambda_temporal * (1.0 - temporal_support.detach().float())
         )
         return (1.0 / (1.0 + evidence)).clamp(0.0, 1.0).detach()
+
+    @torch.no_grad()
+    def compute_source_conflict(
+        self,
+        fixed_pseudo_37,
+        teacher_binary_37,
+    ):
+        fixed_pseudo_37 = _require_unit_map(
+            "fixed_pseudo_37", fixed_pseudo_37
+        ).detach()
+        teacher_binary_37 = _require_unit_map(
+            "teacher_binary_37",
+            teacher_binary_37,
+            shape=fixed_pseudo_37.shape,
+        ).detach()
+        fixed_hard_37 = (fixed_pseudo_37.float() > 0.5).float()
+        teacher_hard_37 = (teacher_binary_37.float() > 0.5).float()
+        source_conflict_37 = (
+            fixed_hard_37 != teacher_hard_37
+        ).float()
+        return {
+            "fixed_hard_37": fixed_hard_37.detach(),
+            "teacher_binary_37": teacher_hard_37.detach(),
+            "source_conflict_37": source_conflict_37.detach(),
+        }
+
+    @torch.no_grad()
+    def compute_conflict_only_acceptance(
+        self,
+        semantic_support,
+        temporal_support,
+        source_conflict,
+    ):
+        semantic_support = _require_unit_map(
+            "semantic_support", semantic_support
+        ).detach().float()
+        temporal_support = _require_unit_map(
+            "temporal_support",
+            temporal_support,
+            shape=semantic_support.shape,
+        ).detach().float()
+        source_conflict = _require_unit_map(
+            "source_conflict",
+            source_conflict,
+            shape=semantic_support.shape,
+        ).detach().float()
+        if not bool(
+            ((source_conflict == 0.0) | (source_conflict == 1.0))
+            .all()
+            .item()
+        ):
+            raise RuntimeError(
+                "AP-STCR v2 source_conflict must be binary."
+            )
+        neutral = self.support_neutral_point
+        semantic_negative = (
+            (neutral - semantic_support) / neutral
+        ).clamp(0.0, 1.0)
+        temporal_negative = (
+            (neutral - temporal_support) / neutral
+        ).clamp(0.0, 1.0)
+        negative_evidence = 0.5 * (
+            semantic_negative + temporal_negative
+        )
+        local_rejection = (
+            self.rejection_max * negative_evidence
+        ).clamp(0.0, self.rejection_max)
+        local_acceptance = (
+            1.0 - source_conflict * local_rejection
+        ).clamp(0.0, 1.0)
+
+        minimum = 1.0 - self.rejection_max
+        if (
+            float(local_acceptance.min().item()) < minimum - 1e-6
+            or float(local_acceptance.max().item()) > 1.0 + 1e-6
+        ):
+            raise RuntimeError(
+                "AP-STCR v2 local acceptance escaped its configured bounds."
+            )
+        non_conflict = source_conflict == 0.0
+        if bool(non_conflict.any().item()) and not torch.equal(
+            local_acceptance[non_conflict],
+            torch.ones_like(local_acceptance[non_conflict]),
+        ):
+            raise RuntimeError(
+                "AP-STCR v2 must pass every non-conflict pixel unchanged."
+            )
+        return {
+            "semantic_negative_37": semantic_negative.detach(),
+            "temporal_negative_37": temporal_negative.detach(),
+            "negative_evidence_37": negative_evidence.detach(),
+            "local_rejection_37": local_rejection.detach(),
+            "local_acceptance_37": local_acceptance.detach(),
+        }
+
+    @torch.no_grad()
+    def compute_soft_disagreement_acceptance(
+        self,
+        semantic_support,
+        temporal_support,
+        history_valid,
+        soft_deviation,
+    ):
+        semantic_support = _require_unit_map(
+            "semantic_support", semantic_support
+        ).detach().float()
+        temporal_support = _require_unit_map(
+            "temporal_support",
+            temporal_support,
+            shape=semantic_support.shape,
+        ).detach().float()
+        soft_deviation = _require_unit_map(
+            "soft_deviation",
+            soft_deviation,
+            shape=semantic_support.shape,
+        ).detach().float()
+        if not torch.is_tensor(history_valid):
+            raise TypeError("AP-STCR history_valid must be a tensor.")
+        history_valid = history_valid.detach().to(
+            device=semantic_support.device
+        )
+        batch_size = int(semantic_support.shape[0])
+        if tuple(history_valid.shape) == (batch_size,):
+            history_valid = history_valid[:, None, None, None]
+        elif tuple(history_valid.shape) != (batch_size, 1, 1, 1):
+            raise RuntimeError(
+                "AP-STCR history_valid must be [B] or [B,1,1,1], got "
+                f"{list(history_valid.shape)}."
+            )
+        history_valid = history_valid.bool()
+        fused_support = torch.where(
+            history_valid,
+            0.5 * (semantic_support + temporal_support),
+            semantic_support,
+        ).clamp(0.0, 1.0)
+        support_deficiency = (1.0 - fused_support).clamp(0.0, 1.0)
+        soft_inertia = (
+            soft_deviation * support_deficiency
+        ).clamp(0.0, 1.0)
+        local_acceptance = (
+            1.0 - self.soft_rejection_strength * soft_inertia
+        ).clamp(self.min_local_acceptance, 1.0)
+        if (
+            float(local_acceptance.min().item())
+            < self.min_local_acceptance - 1e-6
+            or float(local_acceptance.max().item()) > 1.0 + 1e-6
+        ):
+            raise RuntimeError(
+                "AP-STCR v3 local acceptance escaped its configured bounds."
+            )
+        return {
+            "fused_support_37": fused_support.detach(),
+            "support_deficiency_37": support_deficiency.detach(),
+            "soft_inertia_37": soft_inertia.detach(),
+            "local_acceptance_37": local_acceptance.detach(),
+        }
+
+    @torch.no_grad()
+    def compute_non_compensatory_acceptance(
+        self,
+        semantic_contradiction,
+        temporal_support,
+        history_valid,
+        soft_deviation,
+        global_teacher_ratio,
+    ):
+        semantic_contradiction = _require_unit_map(
+            "semantic_contradiction", semantic_contradiction
+        ).detach().float()
+        temporal_support = _require_unit_map(
+            "temporal_support",
+            temporal_support,
+            shape=semantic_contradiction.shape,
+        ).detach().float()
+        soft_deviation = _require_unit_map(
+            "soft_deviation",
+            soft_deviation,
+            shape=semantic_contradiction.shape,
+        ).detach().float()
+        if not torch.is_tensor(history_valid):
+            raise TypeError("AP-STCR history_valid must be a tensor.")
+        history_valid = history_valid.detach().to(
+            device=semantic_contradiction.device
+        )
+        batch_size = int(semantic_contradiction.shape[0])
+        if tuple(history_valid.shape) == (batch_size,):
+            history_valid = history_valid[:, None, None, None]
+        elif tuple(history_valid.shape) != (batch_size, 1, 1, 1):
+            raise RuntimeError(
+                "AP-STCR history_valid must be [B] or [B,1,1,1], got "
+                f"{list(history_valid.shape)}."
+            )
+        history_valid = history_valid.bool()
+        temporal_instability = torch.where(
+            history_valid,
+            (1.0 - temporal_support).clamp(0.0, 1.0),
+            torch.zeros_like(temporal_support),
+        )
+        combined_negative_evidence = (
+            1.0
+            - (1.0 - semantic_contradiction)
+            * (1.0 - temporal_instability)
+        ).clamp(0.0, 1.0)
+        alpha = float(global_teacher_ratio)
+        if not math.isfinite(alpha) or not 0.0 <= alpha <= 1.0:
+            raise RuntimeError(
+                "AP-STCR global teacher ratio must be in [0,1], got "
+                f"{alpha}."
+            )
+        transition_envelope = float(
+            max(0.0, min(1.0, 4.0 * alpha * (1.0 - alpha)))
+        )
+        transition_penalty = (
+            transition_envelope
+            * soft_deviation
+            * combined_negative_evidence
+        ).clamp(0.0, 1.0)
+        local_acceptance = (
+            1.0
+            - self.evidence_rejection_strength * transition_penalty
+        ).clamp(self.min_local_acceptance, 1.0)
+        if (
+            float(local_acceptance.min().item())
+            < self.min_local_acceptance - 1e-6
+            or float(local_acceptance.max().item()) > 1.0 + 1e-6
+        ):
+            raise RuntimeError(
+                "AP-STCR v4 local acceptance escaped its configured bounds."
+            )
+        return {
+            "temporal_instability_37": temporal_instability.detach(),
+            "combined_negative_evidence_37": (
+                combined_negative_evidence.detach()
+            ),
+            "transition_envelope": transition_envelope,
+            "transition_penalty_37": transition_penalty.detach(),
+            "local_acceptance_37": local_acceptance.detach(),
+        }
+
+    @torch.no_grad()
+    def compute_semantic_only_acceptance(
+        self,
+        semantic_contradiction,
+        soft_deviation,
+        global_teacher_ratio,
+    ):
+        semantic_contradiction = _require_unit_map(
+            "semantic_contradiction", semantic_contradiction
+        ).detach().float()
+        soft_deviation = _require_unit_map(
+            "soft_deviation",
+            soft_deviation,
+            shape=semantic_contradiction.shape,
+        ).detach().float()
+        alpha = float(global_teacher_ratio)
+        if not math.isfinite(alpha) or not 0.0 <= alpha <= 1.0:
+            raise RuntimeError(
+                "AP-STCR global teacher ratio must be in [0,1], got "
+                f"{alpha}."
+            )
+        combined_negative_evidence = semantic_contradiction
+        transition_envelope = float(
+            max(0.0, min(1.0, 4.0 * alpha * (1.0 - alpha)))
+        )
+        transition_penalty = (
+            transition_envelope
+            * soft_deviation
+            * combined_negative_evidence
+        ).clamp(0.0, 1.0)
+        local_acceptance = (
+            1.0
+            - self.evidence_rejection_strength * transition_penalty
+        ).clamp(self.min_local_acceptance, 1.0)
+        if (
+            float(local_acceptance.min().item())
+            < self.min_local_acceptance - 1e-6
+            or float(local_acceptance.max().item()) > 1.0 + 1e-6
+        ):
+            raise RuntimeError(
+                "AP-STCR A1 local acceptance escaped its configured bounds."
+            )
+        return {
+            "combined_negative_evidence_37": (
+                combined_negative_evidence.detach()
+            ),
+            "transition_envelope": transition_envelope,
+            "transition_penalty_37": transition_penalty.detach(),
+            "local_acceptance_37": local_acceptance.detach(),
+        }
 
     @torch.no_grad()
     def build_target(
@@ -751,13 +1447,27 @@ class AnchorPropagatedSemanticTemporalCorrection:
             teacher_binary_68,
             shape=fixed_pseudo_68.shape,
         ).detach().float()
+        if (self.is_v3 or self.is_v4 or self.is_semantic_only) and not bool(
+            ((teacher_binary_68 == 0.0) | (teacher_binary_68 == 1.0))
+            .all()
+            .item()
+        ):
+            raise RuntimeError(
+                "AP-STCR "
+                f"{'A1' if self.is_semantic_only else ('v4' if self.is_v4 else 'v3')} "
+                "final teacher target "
+                "must be binary."
+            )
         alpha = float(global_teacher_ratio)
         if not math.isfinite(alpha) or not 0.0 <= alpha <= 1.0:
             raise RuntimeError(
                 f"AP-STCR global teacher ratio must be in [0,1], got {alpha}."
             )
+        local_acceptance_37 = _require_unit_map(
+            "local_acceptance_37", local_acceptance_37
+        ).detach().float()
         local_acceptance_68 = F.interpolate(
-            local_acceptance_37.detach().float(),
+            local_acceptance_37,
             size=(self.loss_resolution, self.loss_resolution),
             mode="bilinear",
             align_corners=False,
@@ -770,6 +1480,9 @@ class AnchorPropagatedSemanticTemporalCorrection:
             + effective_teacher_weight * teacher_binary_68
         ).clamp(0.0, 1.0)
         return {
+            "effective_teacher_weight_37": (
+                alpha * local_acceptance_37
+            ).clamp(0.0, 1.0).detach(),
             "local_acceptance_68": local_acceptance_68.detach(),
             "effective_teacher_weight_68": effective_teacher_weight.detach(),
             "fixed_weight_68": (1.0 - effective_teacher_weight).detach(),
@@ -824,27 +1537,123 @@ class AnchorPropagatedSemanticTemporalCorrection:
             mode="bilinear",
             align_corners=False,
         ).clamp(0.0, 1.0)
-        teacher_binary_37 = F.interpolate(
-            teacher_binary_68,
-            size=(self.evidence_resolution, self.evidence_resolution),
-            mode="nearest",
-        )
-        semantic_support, correction_37 = self.compute_semantic_support(
-            semantic["semantic_margin"],
+        if (
+            self.is_v2
+            or self.is_v3
+            or self.is_v4
+            or self.is_semantic_only
+        ):
+            teacher_binary_37 = strict_teacher_binary(
+                teacher_soft_37,
+                threshold=0.5,
+            )
+        else:
+            teacher_binary_37 = F.interpolate(
+                teacher_binary_68,
+                size=(self.evidence_resolution, self.evidence_resolution),
+                mode="nearest",
+            )
+        conflict = self.compute_source_conflict(
+            fixed_pseudo_37,
             teacher_binary_37,
-            fixed_pseudo_37,
         )
-        temporal = self.compute_temporal_support(
-            teacher_soft_37,
-            fixed_pseudo_37,
-            sample_indices,
-            datasets,
-            stems,
+        teacher_binary_37 = conflict["teacher_binary_37"]
+        if self.is_v3 or self.is_v4 or self.is_semantic_only:
+            semantic_support, soft_correction_37 = (
+                self.compute_soft_semantic_support(
+                    semantic["semantic_margin"],
+                    teacher_soft_37,
+                    fixed_pseudo_37,
+                )
+            )
+        else:
+            semantic_support, correction_37 = self.compute_semantic_support(
+                semantic["semantic_margin"],
+                teacher_binary_37,
+                fixed_pseudo_37,
+            )
+            soft_correction_37 = None
+        correction_37 = (
+            teacher_binary_37.detach().float()
+            - fixed_pseudo_37.detach().float()
         )
-        local_acceptance = self.compute_local_acceptance(
-            semantic_support,
-            temporal["temporal_support"],
-        )
+        temporal = None
+        if not self.is_semantic_only:
+            temporal = self.compute_temporal_support(
+                teacher_soft_37,
+                fixed_pseudo_37,
+                sample_indices,
+                datasets,
+                stems,
+            )
+        if self.is_v2:
+            acceptance = self.compute_conflict_only_acceptance(
+                semantic_support,
+                temporal["temporal_support"],
+                conflict["source_conflict_37"],
+            )
+            local_acceptance = acceptance["local_acceptance_37"]
+        elif self.is_v3:
+            soft_deviation_37 = soft_correction_37.abs().clamp(0.0, 1.0)
+            acceptance = self.compute_soft_disagreement_acceptance(
+                semantic_support,
+                temporal["temporal_support"],
+                temporal["history_valid"],
+                soft_deviation_37,
+            )
+            local_acceptance = acceptance["local_acceptance_37"]
+        elif self.is_v4:
+            soft_deviation_37 = soft_correction_37.abs().clamp(0.0, 1.0)
+            semantic_contradiction_37 = (
+                self.compute_semantic_contradiction(
+                    semantic["semantic_margin"],
+                    soft_correction_37,
+                )
+            )
+            acceptance = self.compute_non_compensatory_acceptance(
+                semantic_contradiction_37,
+                temporal["temporal_support"],
+                temporal["history_valid"],
+                soft_deviation_37,
+                global_teacher_ratio,
+            )
+            local_acceptance = acceptance["local_acceptance_37"]
+        elif self.is_semantic_only:
+            soft_deviation_37 = soft_correction_37.abs().clamp(0.0, 1.0)
+            semantic_contradiction_37 = (
+                self.compute_semantic_contradiction(
+                    semantic["semantic_margin"],
+                    soft_correction_37,
+                )
+            )
+            acceptance = self.compute_semantic_only_acceptance(
+                semantic_contradiction_37,
+                soft_deviation_37,
+                global_teacher_ratio,
+            )
+            local_acceptance = acceptance["local_acceptance_37"]
+        else:
+            local_acceptance = self.compute_local_acceptance(
+                semantic_support,
+                temporal["temporal_support"],
+            )
+            semantic_negative = (
+                (0.5 - semantic_support.detach().float()) / 0.5
+            ).clamp(0.0, 1.0)
+            temporal_negative = (
+                (0.5 - temporal["temporal_support"].detach().float()) / 0.5
+            ).clamp(0.0, 1.0)
+            acceptance = {
+                "semantic_negative_37": semantic_negative.detach(),
+                "temporal_negative_37": temporal_negative.detach(),
+                "negative_evidence_37": (
+                    0.5 * (semantic_negative + temporal_negative)
+                ).detach(),
+                "local_rejection_37": (
+                    1.0 - local_acceptance
+                ).clamp(0.0, 1.0).detach(),
+                "local_acceptance_37": local_acceptance.detach(),
+            }
         target = self.build_target(
             fixed_pseudo_68,
             teacher_binary_68,
@@ -852,6 +1661,8 @@ class AnchorPropagatedSemanticTemporalCorrection:
             local_acceptance,
         )
         result = {
+            "version": self.version,
+            "conflict_only": self.conflict_only,
             "sample_indices": torch.as_tensor(
                 sample_indices, dtype=torch.long, device="cpu"
             ).flatten(),
@@ -863,6 +1674,10 @@ class AnchorPropagatedSemanticTemporalCorrection:
             "teacher_soft_68": teacher_soft_68.detach(),
             "teacher_binary_37": teacher_binary_37.detach(),
             "teacher_binary_68": teacher_binary_68.detach(),
+            "fixed_hard_37": conflict["fixed_hard_37"].detach(),
+            "source_conflict_37": conflict[
+                "source_conflict_37"
+            ].detach(),
             "teacher_correction_37": correction_37.detach(),
             "teacher_correction_68": (
                 teacher_binary_68 - fixed_pseudo_68
@@ -872,13 +1687,126 @@ class AnchorPropagatedSemanticTemporalCorrection:
             "bg_anchor_mask_37": semantic["bg_anchor_mask"].detach(),
             "bg_anchor_source": list(semantic["bg_anchor_source"]),
             "semantic_support_37": semantic_support.detach(),
-            "temporal_support_37": temporal["temporal_support"].detach(),
-            "history_mean_37": temporal["history_mean"].detach(),
-            "history_count": temporal["history_count"].detach(),
-            "history_valid": temporal["history_valid"].detach(),
-            "local_acceptance_37": local_acceptance.detach(),
         }
+        if not self.is_semantic_only:
+            result.update(
+                {
+                    "temporal_support_37": temporal[
+                        "temporal_support"
+                    ].detach(),
+                    "history_mean_37": temporal["history_mean"].detach(),
+                    "history_count": temporal["history_count"].detach(),
+                    "history_valid": temporal["history_valid"].detach(),
+                }
+            )
+        result["local_acceptance_37"] = local_acceptance.detach()
+        if self.is_v3:
+            result.update(
+                {
+                    "soft_correction_37": soft_correction_37.detach(),
+                    "soft_deviation_37": soft_deviation_37.detach(),
+                    "fused_support_37": acceptance[
+                        "fused_support_37"
+                    ].detach(),
+                    "support_deficiency_37": acceptance[
+                        "support_deficiency_37"
+                    ].detach(),
+                    "soft_inertia_37": acceptance[
+                        "soft_inertia_37"
+                    ].detach(),
+                }
+            )
+        elif self.is_v4:
+            result.update(
+                {
+                    "soft_correction_37": soft_correction_37.detach(),
+                    "soft_deviation_37": soft_deviation_37.detach(),
+                    "semantic_contradiction_37": (
+                        semantic_contradiction_37.detach()
+                    ),
+                    "temporal_instability_37": acceptance[
+                        "temporal_instability_37"
+                    ].detach(),
+                    "combined_negative_evidence_37": acceptance[
+                        "combined_negative_evidence_37"
+                    ].detach(),
+                    "transition_envelope": acceptance[
+                        "transition_envelope"
+                    ],
+                    "transition_penalty_37": acceptance[
+                        "transition_penalty_37"
+                    ].detach(),
+                }
+            )
+        elif self.is_semantic_only:
+            result.update(
+                {
+                    "soft_correction_37": soft_correction_37.detach(),
+                    "soft_deviation_37": soft_deviation_37.detach(),
+                    "semantic_contradiction_37": (
+                        semantic_contradiction_37.detach()
+                    ),
+                    "combined_negative_evidence_37": acceptance[
+                        "combined_negative_evidence_37"
+                    ].detach(),
+                    "transition_envelope": acceptance[
+                        "transition_envelope"
+                    ],
+                    "transition_penalty_37": acceptance[
+                        "transition_penalty_37"
+                    ].detach(),
+                }
+            )
+        else:
+            result.update(
+                {
+                    "semantic_negative_37": acceptance[
+                        "semantic_negative_37"
+                    ].detach(),
+                    "temporal_negative_37": acceptance[
+                        "temporal_negative_37"
+                    ].detach(),
+                    "negative_evidence_37": acceptance[
+                        "negative_evidence_37"
+                    ].detach(),
+                    "local_rejection_37": acceptance[
+                        "local_rejection_37"
+                    ].detach(),
+                }
+            )
         result.update(target)
+        if (
+            self.is_v2
+            or self.is_v3
+            or self.is_v4
+            or self.is_semantic_only
+        ):
+            version_label = (
+                "A1"
+                if self.is_semantic_only
+                else ("v4" if self.is_v4 else ("v3" if self.is_v3 else "v2"))
+            )
+            if (
+                float(result["effective_teacher_weight_68"].min().item())
+                < -1e-6
+                or float(
+                    result["effective_teacher_weight_68"].max().item()
+                )
+                > 1.0 + 1e-6
+            ):
+                raise RuntimeError(
+                    "AP-STCR "
+                    f"{version_label} effective teacher weight is outside "
+                    "[0,1]."
+                )
+            if (
+                float(result["mixed_target_68"].min().item()) < -1e-6
+                or float(result["mixed_target_68"].max().item())
+                > 1.0 + 1e-6
+            ):
+                raise RuntimeError(
+                    f"AP-STCR {version_label} mixed target is outside [0,1]."
+                )
         for name, value in result.items():
             if torch.is_tensor(value) and value.requires_grad:
                 raise RuntimeError(
@@ -895,6 +1823,8 @@ class AnchorPropagatedSemanticTemporalCorrection:
         teacher_soft_37,
         epoch,
     ):
+        if self.history_bank is None:
+            return
         self.history_bank.update(
             sample_indices,
             datasets,
@@ -904,6 +1834,8 @@ class AnchorPropagatedSemanticTemporalCorrection:
         )
 
     def clear_temporal_history(self):
+        if self.history_bank is None:
+            return
         self.history_bank.clear()
 
     def state_dict(self):
@@ -911,7 +1843,11 @@ class AnchorPropagatedSemanticTemporalCorrection:
             "schema_version": "ap_stcr_runtime_v1",
             "manifest_hash": self.manifest_hash,
             "semantic_cache": self.semantic_cache.state_dict(),
-            "history_bank": self.history_bank.state_dict(),
+            "history_bank": (
+                None
+                if self.history_bank is None
+                else self.history_bank.state_dict()
+            ),
         }
 
     def load_state_dict(self, state):
@@ -920,7 +1856,16 @@ class AnchorPropagatedSemanticTemporalCorrection:
         if state.get("manifest_hash") != self.manifest_hash:
             raise RuntimeError("AP-STCR runtime manifest mismatch.")
         self.semantic_cache.load_state_dict(state["semantic_cache"])
-        self.history_bank.load_state_dict(state["history_bank"])
+        history_state = state.get("history_bank")
+        if self.history_bank is None:
+            if history_state is not None:
+                raise RuntimeError(
+                    "AP-STCR A1 runtime must not contain temporal history."
+                )
+            return
+        if history_state is None:
+            raise RuntimeError("AP-STCR runtime temporal history is missing.")
+        self.history_bank.load_state_dict(history_state)
 
 
 def _new_moments():
@@ -984,6 +1929,9 @@ def new_ap_stcr_epoch_accumulator(histogram_bins=1000):
         "semantic_margin",
         "semantic_support",
         "temporal_support",
+        "semantic_negative",
+        "temporal_negative",
+        "local_rejection",
         "local_acceptance",
         "effective_teacher_weight",
         "fixed_weight",
@@ -999,6 +1947,10 @@ def new_ap_stcr_epoch_accumulator(histogram_bins=1000):
         "temporal_support_disagree",
         "effective_teacher_weight_agree",
         "effective_teacher_weight_disagree",
+        "local_acceptance_on_conflict",
+        "local_acceptance_on_non_conflict",
+        "effective_teacher_weight_on_conflict",
+        "effective_teacher_weight_on_non_conflict",
     )
     return {
         "moments": {name: _new_moments() for name in moment_names},
@@ -1015,6 +1967,8 @@ def new_ap_stcr_epoch_accumulator(histogram_bins=1000):
         "image_count": 0,
         "history_valid_images": 0,
         "disagreement_pixels": 0,
+        "source_conflict_pixels": 0,
+        "evidence_pixel_count": 0,
         "pixel_count": 0,
         "bg_sources": {},
         "global_teacher_ratio_sum": 0.0,
@@ -1023,11 +1977,105 @@ def new_ap_stcr_epoch_accumulator(histogram_bins=1000):
 
 
 def accumulate_ap_stcr_epoch(accumulator, result, student_prob_68):
+    version = str(result.get("version", ""))
+    is_v3 = (
+        version == "ap_stcr_v3_soft_disagreement_bounded_continuation"
+    )
+    is_v4 = (
+        version == "ap_stcr_v4_transition_envelope_non_compensatory"
+    )
+    is_semantic_only = (
+        version == "ap_stcr_v4_semantic_only_ablation"
+    )
+    if is_v3:
+        for name in (
+            "soft_deviation",
+            "fused_support",
+            "support_deficiency",
+            "soft_inertia",
+            "effective_teacher_ratio",
+            "effective_fixed_ratio",
+        ):
+            accumulator["moments"].setdefault(name, _new_moments())
+        histogram_template = accumulator["histograms"][
+            "local_acceptance"
+        ]
+        for name in ("soft_deviation", "fused_support"):
+            accumulator["histograms"].setdefault(
+                name, torch.zeros_like(histogram_template)
+            )
+    if is_v4:
+        for name in (
+            "soft_deviation",
+            "semantic_contradiction",
+            "temporal_instability",
+            "combined_negative_evidence",
+            "transition_penalty",
+            "effective_teacher_ratio",
+            "effective_fixed_ratio",
+            "mixed_target_area",
+            "semantic_contradiction_when_agree",
+            "semantic_contradiction_when_disagree",
+            "temporal_instability_when_agree",
+            "temporal_instability_when_disagree",
+            "combined_negative_evidence_when_agree",
+            "combined_negative_evidence_when_disagree",
+        ):
+            accumulator["moments"].setdefault(name, _new_moments())
+        histogram_template = accumulator["histograms"][
+            "local_acceptance"
+        ]
+        for name in (
+            "semantic_contradiction",
+            "temporal_instability",
+        ):
+            accumulator["histograms"].setdefault(
+                name, torch.zeros_like(histogram_template)
+            )
+        accumulator.setdefault("transition_envelope_sum", 0.0)
+        accumulator.setdefault("transition_envelope_count", 0)
+    if is_semantic_only:
+        for name in (
+            "temporal_support",
+            "temporal_negative",
+            "temporal_support_agree",
+            "temporal_support_disagree",
+            "semantic_negative",
+            "local_rejection",
+        ):
+            accumulator["moments"].pop(name, None)
+        accumulator["histograms"].pop("temporal_support", None)
+        for name in (
+            "soft_deviation",
+            "semantic_contradiction",
+            "combined_negative_evidence",
+            "transition_penalty",
+            "effective_teacher_ratio",
+            "effective_fixed_ratio",
+            "mixed_target_area",
+            "semantic_contradiction_when_agree",
+            "semantic_contradiction_when_disagree",
+            "combined_negative_evidence_when_agree",
+            "combined_negative_evidence_when_disagree",
+        ):
+            accumulator["moments"].setdefault(name, _new_moments())
+        histogram_template = accumulator["histograms"][
+            "local_acceptance"
+        ]
+        accumulator["histograms"].setdefault(
+            "semantic_contradiction",
+            torch.zeros_like(histogram_template),
+        )
+        accumulator["report_history_stats"] = False
+        accumulator.setdefault("transition_envelope_sum", 0.0)
+        accumulator.setdefault("transition_envelope_count", 0)
     batch_size = int(result["fixed_pseudo_68"].shape[0])
     fixed_binary = result["fixed_pseudo_68"] > 0.5
     teacher_binary = result["teacher_binary_68"] > 0.5
     disagree = fixed_binary != teacher_binary
     agree = ~disagree
+    source_conflict = result["source_conflict_37"].detach().bool()
+    source_non_conflict = ~source_conflict
     accepted_correction = (
         result["effective_teacher_weight_68"]
         * result["teacher_correction_68"]
@@ -1035,7 +2083,6 @@ def accumulate_ap_stcr_epoch(accumulator, result, student_prob_68):
     values = {
         "semantic_margin": result["semantic_margin_37"],
         "semantic_support": result["semantic_support_37"],
-        "temporal_support": result["temporal_support_37"],
         "local_acceptance": result["local_acceptance_37"],
         "effective_teacher_weight": result[
             "effective_teacher_weight_68"
@@ -1048,6 +2095,76 @@ def accumulate_ap_stcr_epoch(accumulator, result, student_prob_68):
         "teacher_area": result["teacher_binary_68"],
         "student_area": student_prob_68.detach(),
     }
+    if not is_semantic_only:
+        values["temporal_support"] = result["temporal_support_37"]
+    if is_v3:
+        values.update(
+            {
+                "soft_deviation": result["soft_deviation_37"],
+                "fused_support": result["fused_support_37"],
+                "support_deficiency": result[
+                    "support_deficiency_37"
+                ],
+                "soft_inertia": result["soft_inertia_37"],
+                "effective_teacher_ratio": result[
+                    "effective_teacher_weight_37"
+                ],
+                "effective_fixed_ratio": (
+                    1.0 - result["effective_teacher_weight_37"]
+                ),
+            }
+        )
+    elif is_v4:
+        values.update(
+            {
+                "soft_deviation": result["soft_deviation_37"],
+                "semantic_contradiction": result[
+                    "semantic_contradiction_37"
+                ],
+                "temporal_instability": result[
+                    "temporal_instability_37"
+                ],
+                "combined_negative_evidence": result[
+                    "combined_negative_evidence_37"
+                ],
+                "transition_penalty": result["transition_penalty_37"],
+                "effective_teacher_ratio": result[
+                    "effective_teacher_weight_37"
+                ],
+                "effective_fixed_ratio": (
+                    1.0 - result["effective_teacher_weight_37"]
+                ),
+                "mixed_target_area": result["mixed_target_68"],
+            }
+        )
+    elif is_semantic_only:
+        values.update(
+            {
+                "soft_deviation": result["soft_deviation_37"],
+                "semantic_contradiction": result[
+                    "semantic_contradiction_37"
+                ],
+                "combined_negative_evidence": result[
+                    "combined_negative_evidence_37"
+                ],
+                "transition_penalty": result["transition_penalty_37"],
+                "effective_teacher_ratio": result[
+                    "effective_teacher_weight_37"
+                ],
+                "effective_fixed_ratio": (
+                    1.0 - result["effective_teacher_weight_37"]
+                ),
+                "mixed_target_area": result["mixed_target_68"],
+            }
+        )
+    else:
+        values.update(
+            {
+                "semantic_negative": result["semantic_negative_37"],
+                "temporal_negative": result["temporal_negative_37"],
+                "local_rejection": result["local_rejection_37"],
+            }
+        )
     for name, value in values.items():
         _add_moments(accumulator["moments"][name], value)
     conditional = {
@@ -1069,24 +2186,6 @@ def accumulate_ap_stcr_epoch(accumulator, result, student_prob_68):
             ),
             disagree,
         ),
-        "temporal_support_agree": (
-            F.interpolate(
-                result["temporal_support_37"],
-                size=(68, 68),
-                mode="bilinear",
-                align_corners=False,
-            ),
-            agree,
-        ),
-        "temporal_support_disagree": (
-            F.interpolate(
-                result["temporal_support_37"],
-                size=(68, 68),
-                mode="bilinear",
-                align_corners=False,
-            ),
-            disagree,
-        ),
         "effective_teacher_weight_agree": (
             result["effective_teacher_weight_68"],
             agree,
@@ -1095,7 +2194,100 @@ def accumulate_ap_stcr_epoch(accumulator, result, student_prob_68):
             result["effective_teacher_weight_68"],
             disagree,
         ),
+        "local_acceptance_on_conflict": (
+            result["local_acceptance_37"],
+            source_conflict,
+        ),
+        "local_acceptance_on_non_conflict": (
+            result["local_acceptance_37"],
+            source_non_conflict,
+        ),
+        "effective_teacher_weight_on_conflict": (
+            result["effective_teacher_weight_37"],
+            source_conflict,
+        ),
+        "effective_teacher_weight_on_non_conflict": (
+            result["effective_teacher_weight_37"],
+            source_non_conflict,
+        ),
     }
+    if not is_semantic_only:
+        temporal_support_68 = F.interpolate(
+            result["temporal_support_37"],
+            size=(68, 68),
+            mode="bilinear",
+            align_corners=False,
+        )
+        conditional.update(
+            {
+                "temporal_support_agree": (
+                    temporal_support_68,
+                    agree,
+                ),
+                "temporal_support_disagree": (
+                    temporal_support_68,
+                    disagree,
+                ),
+            }
+        )
+    if is_v4:
+        v4_conditionals = {
+            "semantic_contradiction_when_agree": result[
+                "semantic_contradiction_37"
+            ],
+            "semantic_contradiction_when_disagree": result[
+                "semantic_contradiction_37"
+            ],
+            "temporal_instability_when_agree": result[
+                "temporal_instability_37"
+            ],
+            "temporal_instability_when_disagree": result[
+                "temporal_instability_37"
+            ],
+            "combined_negative_evidence_when_agree": result[
+                "combined_negative_evidence_37"
+            ],
+            "combined_negative_evidence_when_disagree": result[
+                "combined_negative_evidence_37"
+            ],
+        }
+        for name, value in v4_conditionals.items():
+            value_68 = F.interpolate(
+                value,
+                size=(68, 68),
+                mode="bilinear",
+                align_corners=False,
+            )
+            conditional[name] = (
+                value_68,
+                disagree if name.endswith("_disagree") else agree,
+            )
+    elif is_semantic_only:
+        semantic_only_conditionals = {
+            "semantic_contradiction_when_agree": result[
+                "semantic_contradiction_37"
+            ],
+            "semantic_contradiction_when_disagree": result[
+                "semantic_contradiction_37"
+            ],
+            "combined_negative_evidence_when_agree": result[
+                "combined_negative_evidence_37"
+            ],
+            "combined_negative_evidence_when_disagree": result[
+                "combined_negative_evidence_37"
+            ],
+        }
+        for name, value in semantic_only_conditionals.items():
+            value_68 = F.interpolate(
+                value,
+                size=(68, 68),
+                mode="bilinear",
+                align_corners=False,
+            )
+            conditional[name] = (
+                value_68,
+                disagree if name.endswith("_disagree") else agree,
+            )
     for name, (value, mask) in conditional.items():
         _add_moments(accumulator["moments"][name], value, mask=mask)
     for name in accumulator["histograms"]:
@@ -1110,10 +2302,15 @@ def accumulate_ap_stcr_epoch(accumulator, result, student_prob_68):
         result["bg_anchor_mask_37"].flatten(1).sum(dim=1).sum().item()
     )
     accumulator["image_count"] += batch_size
-    accumulator["history_valid_images"] += int(
-        result["history_valid"].sum().item()
-    )
+    if not is_semantic_only:
+        accumulator["history_valid_images"] += int(
+            result["history_valid"].sum().item()
+        )
     accumulator["disagreement_pixels"] += int(disagree.sum().item())
+    accumulator["source_conflict_pixels"] += int(
+        source_conflict.sum().item()
+    )
+    accumulator["evidence_pixel_count"] += int(source_conflict.numel())
     accumulator["pixel_count"] += int(disagree.numel())
     for source in result["bg_anchor_source"]:
         accumulator["bg_sources"][source] = (
@@ -1122,6 +2319,11 @@ def accumulate_ap_stcr_epoch(accumulator, result, student_prob_68):
     accumulator["global_teacher_ratio_sum"] += float(
         result["global_teacher_ratio"]
     )
+    if is_v4 or is_semantic_only:
+        accumulator["transition_envelope_sum"] += float(
+            result["transition_envelope"]
+        )
+        accumulator["transition_envelope_count"] += 1
     accumulator["batch_count"] += 1
 
 
@@ -1139,6 +2341,9 @@ def finalize_ap_stcr_epoch(accumulator):
             )
     image_count = max(1, int(accumulator["image_count"]))
     pixel_count = max(1, int(accumulator["pixel_count"]))
+    evidence_pixel_count = max(
+        1, int(accumulator["evidence_pixel_count"])
+    )
     batch_count = max(1, int(accumulator["batch_count"]))
     result.update(
         {
@@ -1159,12 +2364,25 @@ def finalize_ap_stcr_epoch(accumulator):
                 accumulator["disagreement_pixels"]
             )
             / pixel_count,
+            "source_conflict_ratio": float(
+                accumulator["source_conflict_pixels"]
+            )
+            / evidence_pixel_count,
             "global_teacher_ratio": float(
                 accumulator["global_teacher_ratio_sum"]
             )
             / batch_count,
         }
     )
+    transition_envelope_count = int(
+        accumulator.get("transition_envelope_count", 0)
+    )
+    if transition_envelope_count > 0:
+        result["transition_envelope"] = float(
+            accumulator["transition_envelope_sum"]
+        ) / float(transition_envelope_count)
+    if not bool(accumulator.get("report_history_stats", True)):
+        result.pop("history_valid_ratio", None)
     return result
 
 
@@ -1188,8 +2406,40 @@ def build_ap_stcr_diagnostic_payload(
         size=(68, 68),
         mode="nearest",
     )[0].cpu()
-    return {
-        "schema_version": "ap_stcr_diagnostic_v1",
+    ap_stcr_version = str(
+        result.get("version", "ap_stcr_v1_full_pixel_37_to_68")
+    )
+    is_v2 = bool(result.get("conflict_only", False))
+    is_v3 = (
+        ap_stcr_version
+        == "ap_stcr_v3_soft_disagreement_bounded_continuation"
+    )
+    is_v4 = (
+        ap_stcr_version
+        == "ap_stcr_v4_transition_envelope_non_compensatory"
+    )
+    is_semantic_only = (
+        ap_stcr_version == "ap_stcr_v4_semantic_only_ablation"
+    )
+    payload = {
+        "schema_version": (
+            "ap_stcr_diagnostic_v4_semantic_only"
+            if is_semantic_only
+            else (
+                "ap_stcr_diagnostic_v4"
+                if is_v4
+                else (
+                    "ap_stcr_diagnostic_v3"
+                    if is_v3
+                    else (
+                        "ap_stcr_diagnostic_v2"
+                        if is_v2
+                        else "ap_stcr_diagnostic_v1"
+                    )
+                )
+            )
+        ),
+        "ap_stcr_version": ap_stcr_version,
         "epoch": int(epoch),
         "sample_index": int(batch["sample_index"][index]),
         "dataset": str(batch["dataset"][index]),
@@ -1202,25 +2452,107 @@ def build_ap_stcr_diagnostic_payload(
         "bg_anchor_mask": resize_nearest(result["bg_anchor_mask_37"]),
         "semantic_margin": resize_bilinear(result["semantic_margin_37"]),
         "teacher_binary": result["teacher_binary_68"][index].cpu(),
-        "teacher_correction": result["teacher_correction_68"][index].cpu(),
-        "semantic_support": resize_bilinear(
-            result["semantic_support_37"]
-        ),
-        "temporal_support": resize_bilinear(
-            result["temporal_support_37"]
-        ),
-        "local_acceptance": resize_bilinear(
-            result["local_acceptance_37"]
-        ),
-        "effective_teacher_weight": result[
-            "effective_teacher_weight_68"
-        ][index].cpu(),
-        "mixed_target": result["mixed_target_68"][index].cpu(),
-        "student_prediction": student_prob_68[index]
-        .detach()
-        .float()
-        .cpu(),
     }
+    if not is_semantic_only:
+        payload.update(
+            {
+                "teacher_correction": result[
+                    "teacher_correction_68"
+                ][index].cpu(),
+                "semantic_support": resize_bilinear(
+                    result["semantic_support_37"]
+                ),
+                "temporal_support": resize_bilinear(
+                    result["temporal_support_37"]
+                ),
+            }
+        )
+    payload.update(
+        {
+            "local_acceptance": resize_bilinear(
+                result["local_acceptance_37"]
+            ),
+            "effective_teacher_weight": result[
+                "effective_teacher_weight_68"
+            ][index].cpu(),
+            "mixed_target": result["mixed_target_68"][index].cpu(),
+            "student_prediction": student_prob_68[index]
+            .detach()
+            .float()
+            .cpu(),
+        }
+    )
+    if is_v2 or is_v3 or is_v4:
+        payload["source_conflict"] = resize_nearest(
+            result["source_conflict_37"]
+        )
+    if is_v3:
+        payload.update(
+            {
+                "teacher_soft": result["teacher_soft_68"][index].cpu(),
+                "soft_deviation": resize_bilinear(
+                    result["soft_deviation_37"]
+                ),
+                "fused_support": resize_bilinear(
+                    result["fused_support_37"]
+                ),
+                "support_deficiency": resize_bilinear(
+                    result["support_deficiency_37"]
+                ),
+                "soft_inertia": resize_bilinear(
+                    result["soft_inertia_37"]
+                ),
+            }
+        )
+    elif is_v4:
+        payload.update(
+            {
+                "teacher_soft": result["teacher_soft_68"][index].cpu(),
+                "soft_deviation": resize_bilinear(
+                    result["soft_deviation_37"]
+                ),
+                "semantic_contradiction": resize_bilinear(
+                    result["semantic_contradiction_37"]
+                ),
+                "temporal_instability": resize_bilinear(
+                    result["temporal_instability_37"]
+                ),
+                "combined_negative_evidence": resize_bilinear(
+                    result["combined_negative_evidence_37"]
+                ),
+                "transition_penalty": resize_bilinear(
+                    result["transition_penalty_37"]
+                ),
+                "global_teacher_ratio": float(
+                    result["global_teacher_ratio"]
+                ),
+                "transition_envelope": float(
+                    result["transition_envelope"]
+                ),
+            }
+        )
+    elif is_semantic_only:
+        payload.update(
+            {
+                "teacher_soft": result["teacher_soft_68"][index].cpu(),
+                "soft_deviation": resize_bilinear(
+                    result["soft_deviation_37"]
+                ),
+                "semantic_contradiction": resize_bilinear(
+                    result["semantic_contradiction_37"]
+                ),
+                "transition_penalty": resize_bilinear(
+                    result["transition_penalty_37"]
+                ),
+                "global_teacher_ratio": float(
+                    result["global_teacher_ratio"]
+                ),
+                "transition_envelope": float(
+                    result["transition_envelope"]
+                ),
+            }
+        )
+    return payload
 
 
 def render_ap_stcr_diagnostic(payload, output_path, gt=None):
@@ -1235,15 +2567,87 @@ def render_ap_stcr_diagnostic(payload, output_path, gt=None):
         ("FG anchors", payload["fg_anchor_mask"], "gray", 0.0, 1.0),
         ("BG anchors", payload["bg_anchor_mask"], "gray", 0.0, 1.0),
         ("DINO margin", payload["semantic_margin"], "coolwarm", -1.0, 1.0),
-        ("EMA teacher binary", payload["teacher_binary"], "gray", 0.0, 1.0),
-        ("Teacher correction", payload["teacher_correction"], "coolwarm", -1.0, 1.0),
-        ("Semantic support", payload["semantic_support"], "viridis", 0.0, 1.0),
-        ("Temporal support", payload["temporal_support"], "viridis", 0.0, 1.0),
-        ("Local acceptance", payload["local_acceptance"], "viridis", 0.0, 1.0),
-        ("Effective teacher weight", payload["effective_teacher_weight"], "viridis", 0.0, 1.0),
-        ("Mixed target", payload["mixed_target"], "gray", 0.0, 1.0),
-        ("Student prediction", payload["student_prediction"], "gray", 0.0, 1.0),
     ]
+    schema_version = payload.get("schema_version")
+    is_v3 = schema_version == "ap_stcr_diagnostic_v3"
+    is_v4 = schema_version == "ap_stcr_diagnostic_v4"
+    is_semantic_only = (
+        schema_version == "ap_stcr_diagnostic_v4_semantic_only"
+    )
+    if is_semantic_only:
+        panels.extend(
+            [
+                ("EMA teacher soft probability", payload["teacher_soft"], "gray", 0.0, 1.0),
+                ("EMA teacher binary", payload["teacher_binary"], "gray", 0.0, 1.0),
+                ("Soft teacher deviation", payload["soft_deviation"], "magma", 0.0, 1.0),
+                ("Semantic contradiction", payload["semantic_contradiction"], "magma", 0.0, 1.0),
+                ("Transition penalty", payload["transition_penalty"], "magma", 0.0, 1.0),
+                ("Local acceptance", payload["local_acceptance"], "viridis", 0.0, 1.0),
+                ("Effective teacher weight", payload["effective_teacher_weight"], "viridis", 0.0, 1.0),
+                ("Mixed target", payload["mixed_target"], "gray", 0.0, 1.0),
+                ("Student prediction", payload["student_prediction"], "gray", 0.0, 1.0),
+            ]
+        )
+    elif is_v4:
+        panels.extend(
+            [
+                ("EMA teacher soft probability", payload["teacher_soft"], "gray", 0.0, 1.0),
+                ("EMA teacher binary", payload["teacher_binary"], "gray", 0.0, 1.0),
+                ("Soft teacher deviation", payload["soft_deviation"], "magma", 0.0, 1.0),
+                ("Semantic contradiction", payload["semantic_contradiction"], "magma", 0.0, 1.0),
+                ("Temporal instability", payload["temporal_instability"], "magma", 0.0, 1.0),
+                ("Combined negative evidence", payload["combined_negative_evidence"], "magma", 0.0, 1.0),
+                ("Transition penalty", payload["transition_penalty"], "magma", 0.0, 1.0),
+                ("Local acceptance", payload["local_acceptance"], "viridis", 0.0, 1.0),
+                ("Effective teacher weight", payload["effective_teacher_weight"], "viridis", 0.0, 1.0),
+                ("Mixed target", payload["mixed_target"], "gray", 0.0, 1.0),
+                ("Student prediction", payload["student_prediction"], "gray", 0.0, 1.0),
+            ]
+        )
+    else:
+        if is_v3:
+            panels.append(
+                ("EMA teacher soft probability", payload["teacher_soft"], "gray", 0.0, 1.0)
+            )
+        panels.extend(
+            [
+                ("EMA teacher binary", payload["teacher_binary"], "gray", 0.0, 1.0),
+                ("Teacher correction", payload["teacher_correction"], "coolwarm", -1.0, 1.0),
+            ]
+        )
+        if "source_conflict" in payload:
+            panels.append(
+                (
+                    (
+                        "Source conflict (diagnostic only)"
+                        if is_v3
+                        else "Source conflict"
+                    ),
+                    payload["source_conflict"],
+                    "gray",
+                    0.0,
+                    1.0,
+                )
+            )
+        panels.extend(
+            [
+                ("Semantic support", payload["semantic_support"], "viridis", 0.0, 1.0),
+                ("Temporal support", payload["temporal_support"], "viridis", 0.0, 1.0),
+                ("Local acceptance", payload["local_acceptance"], "viridis", 0.0, 1.0),
+                ("Effective teacher weight", payload["effective_teacher_weight"], "viridis", 0.0, 1.0),
+                ("Mixed target", payload["mixed_target"], "gray", 0.0, 1.0),
+                ("Student prediction", payload["student_prediction"], "gray", 0.0, 1.0),
+            ]
+        )
+        if is_v3:
+            panels.extend(
+                [
+                    ("Soft teacher deviation", payload["soft_deviation"], "magma", 0.0, 1.0),
+                    ("Fused support", payload["fused_support"], "viridis", 0.0, 1.0),
+                    ("Support deficiency", payload["support_deficiency"], "magma", 0.0, 1.0),
+                    ("Soft inertia", payload["soft_inertia"], "magma", 0.0, 1.0),
+                ]
+            )
     if gt is not None:
         panels.append(("GT (offline only)", gt, "gray", 0.0, 1.0))
     columns = 4
@@ -1271,11 +2675,25 @@ def render_ap_stcr_diagnostic(payload, output_path, gt=None):
         axis.axis("off")
     for axis in axes[len(panels) :]:
         axis.axis("off")
-    figure.suptitle(
+    title = (
         f"{payload['dataset']}/{payload['stem']} | "
-        f"epoch={int(payload['epoch']):03d} | "
-        f"bg={payload['bg_anchor_source']}"
+        f"epoch={int(payload['epoch']):03d}"
     )
+    if is_v4:
+        title += (
+            f" | alpha={float(payload['global_teacher_ratio']):.4f}"
+            " | transition_envelope="
+            f"{float(payload['transition_envelope']):.4f}"
+        )
+    elif is_semantic_only:
+        title = "AP-STCR A1: Semantic Only | " + title
+        title += (
+            f" | alpha={float(payload['global_teacher_ratio']):.4f}"
+            " | transition_envelope="
+            f"{float(payload['transition_envelope']):.4f}"
+        )
+    title += f" | bg={payload['bg_anchor_source']}"
+    figure.suptitle(title)
     figure.tight_layout()
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
