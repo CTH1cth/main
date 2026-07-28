@@ -8,6 +8,20 @@ import numpy as np
 import torch
 import yaml
 
+from common.dabe_clean_offline import (
+    DABE_CLEAN_OFFLINE_FORMULA_FINGERPRINT,
+    DABE_CLEAN_OFFLINE_MODES,
+    DABE_CLEAN_OFFLINE_PAYLOAD_VERSION,
+)
+from common.found_static import (
+    FOUND_STATIC_NATIVE_SHAPE,
+    FOUND_STATIC_RESIZE_MODE,
+    FOUND_STATIC_SOURCE,
+    build_found_static_target,
+    found_static_enabled,
+    found_static_manifest_path,
+)
+
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 
@@ -1762,6 +1776,106 @@ def check_dabe_pu_cache(cfg, max_samples=None):
 def check_dabe_clean_cache(cfg, max_samples=None, return_stats=False):
     """Validate the independent Bridge/Clean cache without touching GT."""
 
+    if found_static_enabled(cfg):
+        manifest_path = found_static_manifest_path(cfg)
+        if not manifest_path.exists():
+            raise RuntimeError(
+                f"FOUND static cache manifest is missing: {manifest_path}"
+            )
+        expected_items = build_image_items(
+            cfg.DATA_ROOT, cfg.TRAIN_DATASETS, require_gt=False
+        )
+        if max_samples is not None and int(max_samples) >= 0:
+            expected_items = expected_items[: int(max_samples)]
+        expected_keys = [
+            (item["dataset"], item["stem"]) for item in expected_items
+        ]
+        rows = read_jsonl(manifest_path)
+        row_map = {}
+        for row in rows:
+            key = (row.get("dataset"), row.get("stem"))
+            if None in key:
+                raise RuntimeError(f"Bad FOUND static manifest row: {row}")
+            if key in row_map:
+                raise RuntimeError(f"Duplicate FOUND static manifest key: {key}")
+            row_map[key] = row
+        missing = sorted(set(expected_keys) - set(row_map))
+        if missing:
+            raise RuntimeError(
+                f"FOUND static cache missing first 10 keys: {missing[:10]}"
+            )
+        if max_samples is None or int(max_samples) < 0:
+            extra = sorted(set(row_map) - set(expected_keys))
+            if extra:
+                raise RuntimeError(
+                    f"FOUND static cache has unexpected first 10 keys: {extra[:10]}"
+                )
+            if len(expected_keys) != 4040:
+                raise RuntimeError(
+                    "FOUND static full training protocol requires exactly "
+                    f"4040 rows, got {len(expected_keys)}."
+                )
+
+        value_sum = 0.0
+        value_sq_sum = 0.0
+        hard_sum = 0.0
+        value_count = 0
+        native_fg_sum = 0.0
+        native_count = 0
+        for key in expected_keys:
+            row = row_map[key]
+            if list(row.get("shape", [])) != list(FOUND_STATIC_NATIVE_SHAPE):
+                raise RuntimeError(
+                    f"FOUND static manifest shape mismatch for {key}: "
+                    f"{row.get('shape')} != {list(FOUND_STATIC_NATIVE_SHAPE)}."
+                )
+            cache_path = Path(str(row.get("cache_path", "")))
+            if not cache_path.is_file():
+                raise RuntimeError(f"FOUND static cache is missing: {cache_path}")
+            payload = torch_load(cache_path, map_location="cpu")
+            if not isinstance(payload, dict):
+                raise RuntimeError(
+                    f"FOUND static payload must be a dict: {cache_path}"
+                )
+            if payload.get("dataset") != key[0] or payload.get("stem") != key[1]:
+                raise RuntimeError(
+                    f"FOUND static payload identity mismatch: {cache_path}"
+                )
+            native = payload.get("tensor")
+            target = build_found_static_target(native, cfg.LOSS_SIZE)
+            flat = target.reshape(-1).double()
+            value_sum += float(flat.sum().item())
+            value_sq_sum += float((flat * flat).sum().item())
+            hard_sum += float((flat > 0.5).sum().item())
+            value_count += int(flat.numel())
+            native_fg_sum += float(native.double().sum().item())
+            native_count += int(native.numel())
+        target_mean = value_sum / max(value_count, 1)
+        target_variance = max(
+            value_sq_sum / max(value_count, 1) - target_mean * target_mean,
+            0.0,
+        )
+        stats = {
+            "target_offline": {
+                "mean": target_mean,
+                "std": target_variance ** 0.5,
+                "hard_area": hard_sum / max(value_count, 1),
+            },
+            "offline_evidence": {
+                "found_native_hard_area": native_fg_sum / max(native_count, 1),
+            },
+        }
+        reason = (
+            f"complete: {manifest_path} | rows_checked={len(expected_keys)} | "
+            f"source={FOUND_STATIC_SOURCE} | native_shape="
+            f"{list(FOUND_STATIC_NATIVE_SHAPE)} | resize={FOUND_STATIC_RESIZE_MODE} | "
+            f"target_shape=[1,{int(cfg.LOSS_SIZE)},{int(cfg.LOSS_SIZE)}] | "
+            "training_gt_read=False | Dataset_target=target_offline_68"
+        )
+        if return_stats:
+            return True, reason, stats
+        return True, reason
+
     manifest_path = dabe_clean_manifest_path(cfg)
     if not manifest_path.exists():
         raise RuntimeError(f"DABE-Clean cache manifest is missing: {manifest_path}")
@@ -1789,6 +1903,195 @@ def check_dabe_clean_cache(cfg, max_samples=None, return_stats=False):
             raise RuntimeError(
                 f"DABE-Clean cache has unexpected first 10 keys: {extra[:10]}"
             )
+
+    is_offline_v3 = str(
+        getattr(cfg, "DABE_CLEAN_VERSION", "")
+    ).strip().lower() == "v3_offline_consolidation"
+    if is_offline_v3:
+        mode = str(getattr(cfg, "DABE_CLEAN_OFFLINE_MODE", "")).strip().lower()
+        if mode not in DABE_CLEAN_OFFLINE_MODES:
+            raise RuntimeError(f"Unsupported DABE_CLEAN_OFFLINE_MODE={mode!r}.")
+        if max_samples is None or int(max_samples) < 0:
+            if len(expected_keys) != 4040:
+                raise RuntimeError(
+                    "DABE-Clean v3 full training protocol requires exactly "
+                    f"4040 rows, got {len(expected_keys)}."
+                )
+        fields_37 = (
+            "residual_37",
+            "bc_map_37",
+            "p_rw_37",
+            "evidence_37",
+            "primary_fg_37",
+            "background_evidence_37",
+            "semantic_fg_tendency_37",
+            "latent_support_37",
+            "complementary_fg_37",
+            "complementary_increment_37",
+            "consolidated_fg_37",
+            "conflict_37",
+            "commitment_37",
+            "target_offline_37",
+        )
+        target_values = []
+        offline_manifest_stat_fields = (
+            "primary_fg_mean",
+            "primary_fg_hard_area",
+            "complementary_fg_mean",
+            "consolidated_fg_mean",
+            "consolidated_fg_hard_area",
+            "background_mean",
+            "conflict_mean",
+            "commitment_mean",
+        )
+        offline_manifest_stats = {
+            field: [] for field in offline_manifest_stat_fields
+        }
+        for key in expected_keys:
+            row = row_map[key]
+            for row_field, expected in (
+                ("payload_version", DABE_CLEAN_OFFLINE_PAYLOAD_VERSION),
+                ("version", DABE_CLEAN_OFFLINE_PAYLOAD_VERSION),
+                ("offline_mode", mode),
+                ("formula_fingerprint", DABE_CLEAN_OFFLINE_FORMULA_FINGERPRINT),
+                ("cache_kind", "offline_consolidation"),
+            ):
+                if str(row.get(row_field)) != expected:
+                    raise RuntimeError(
+                        f"DABE-Clean offline manifest {row_field} mismatch for "
+                        f"{key}: {row.get(row_field)!r} != {expected!r}."
+                    )
+            if list(row.get("target_shape", [])) != [1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE)]:
+                raise RuntimeError(
+                    f"DABE-Clean offline manifest target_shape mismatch for {key}."
+                )
+            for field in offline_manifest_stat_fields:
+                try:
+                    value = float(row[field])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"DABE-Clean offline manifest has invalid {field} for {key}."
+                    ) from exc
+                if not np.isfinite(value) or value < -1e-6 or value > 1.0 + 1e-6:
+                    raise RuntimeError(
+                        f"DABE-Clean offline manifest {field} is outside [0,1] "
+                        f"for {key}: {value}."
+                    )
+                offline_manifest_stats[field].append(value)
+            for flag in (
+                "training_gt_read",
+                "teacher_prediction_read",
+                "teacher_checkpoint_read",
+                "student_checkpoint_read",
+                "epoch_dependent",
+                "history_read",
+                "static_weight_map_written",
+                "routing_map_written",
+            ):
+                if bool(row.get(flag, True)):
+                    raise RuntimeError(
+                        f"DABE-Clean offline manifest forbids {flag}=True for {key}."
+                    )
+            cache_path = Path(row.get("cache_path", ""))
+            if not cache_path.is_file():
+                raise RuntimeError(f"DABE-Clean offline cache is missing: {cache_path}")
+            payload = torch_load(cache_path, map_location="cpu")
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"DABE-Clean offline payload must be dict: {cache_path}")
+            if payload.get("dataset") != key[0] or payload.get("stem") != key[1]:
+                raise RuntimeError(f"DABE-Clean offline identity mismatch: {cache_path}")
+            if str(payload.get("backbone_key")) != str(cfg.BACKBONE_KEY):
+                raise RuntimeError(f"DABE-Clean offline backbone mismatch: {cache_path}")
+            for payload_field, expected in (
+                ("payload_version", DABE_CLEAN_OFFLINE_PAYLOAD_VERSION),
+                ("version", DABE_CLEAN_OFFLINE_PAYLOAD_VERSION),
+                ("offline_mode", mode),
+                ("formula_fingerprint", DABE_CLEAN_OFFLINE_FORMULA_FINGERPRINT),
+            ):
+                if str(payload.get(payload_field)) != expected:
+                    raise RuntimeError(
+                        f"DABE-Clean offline payload {payload_field} mismatch: "
+                        f"{cache_path}"
+                    )
+            for flag in (
+                "training_gt_read",
+                "teacher_prediction_read",
+                "teacher_checkpoint_read",
+                "student_checkpoint_read",
+                "epoch_dependent",
+                "history_read",
+                "static_weight_map_written",
+                "routing_map_written",
+            ):
+                if bool(payload.get(flag, True)):
+                    raise RuntimeError(
+                        f"DABE-Clean offline payload forbids {flag}=True: {cache_path}"
+                    )
+            forbidden_payload_fields = {
+                "gt",
+                "gt_path",
+                "static_weight_map",
+                "weight_map",
+                "recovery_map",
+                "routing_map",
+                "teacher_region_map",
+                "history",
+                "epoch",
+            }.intersection(payload)
+            if forbidden_payload_fields:
+                raise RuntimeError(
+                    "DABE-Clean offline payload leaked forbidden fields "
+                    f"{sorted(forbidden_payload_fields)}: {cache_path}"
+                )
+            for field in (*fields_37, "target_offline_68"):
+                value = payload.get(field)
+                if not torch.is_tensor(value):
+                    raise RuntimeError(
+                        f"DABE-Clean offline payload is missing {field}: {cache_path}"
+                    )
+                expected_shape = (
+                    (1, 37, 37)
+                    if field.endswith("_37")
+                    else (1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE))
+                )
+                if tuple(value.shape) != expected_shape:
+                    raise RuntimeError(
+                        f"DABE-Clean offline {field} shape mismatch: "
+                        f"{list(value.shape)} != {list(expected_shape)} | {cache_path}"
+                    )
+                if value.dtype != torch.float32 or value.requires_grad:
+                    raise RuntimeError(
+                        f"DABE-Clean offline {field} must be detached float32: {cache_path}"
+                    )
+                if not bool(torch.isfinite(value).all().item()):
+                    raise RuntimeError(
+                        f"DABE-Clean offline {field} contains NaN/Inf: {cache_path}"
+                    )
+                if float(value.min()) < -1e-6 or float(value.max()) > 1.0 + 1e-6:
+                    raise RuntimeError(
+                        f"DABE-Clean offline {field} is outside [0,1]: {cache_path}"
+                    )
+            target_values.append(payload["target_offline_68"].reshape(-1))
+        targets = torch.cat(target_values)
+        stats = {
+            "target_offline": {
+                "mean": float(targets.mean().item()),
+                "std": float(targets.std(unbiased=False).item()),
+                "hard_area": float((targets > 0.5).float().mean().item()),
+            },
+            "offline_evidence": {
+                field: float(np.mean(values))
+                for field, values in offline_manifest_stats.items()
+            },
+        }
+        reason = (
+            f"complete: {manifest_path} | rows_checked={len(expected_keys)} | "
+            f"version={DABE_CLEAN_OFFLINE_PAYLOAD_VERSION} | offline_mode={mode} | "
+            "training_gt_read=False | Dataset_target=target_offline_68"
+        )
+        if return_stats:
+            return True, reason, stats
+        return True, reason
 
     mode = str(getattr(cfg, "DABE_CLEAN_TARGET_MODE", "dp")).strip().lower()
     if mode not in {"dp", "diff", "bridge"}:

@@ -13,6 +13,7 @@ import torch.nn.functional as F
 DABE_BRIDGE_VERSION = "dabe_bridge_v1"
 DABE_CLEAN_VERSION = "dabe_clean_v1"
 DABE_CLEAN_CONTREC_VERSION = "dabe_clean_v2_contrec"
+DABE_CLEAN_OFFLINE_VERSION = "dabe_clean_v3_offline_consolidation"
 DABE_CLEAN_TARGET_MODES = {"dp", "diff", "bridge"}
 
 
@@ -32,6 +33,8 @@ def expected_dabe_clean_payload_version(cfg, mode=None):
         return DABE_CLEAN_VERSION
     if version == "v2_contrec":
         return DABE_CLEAN_CONTREC_VERSION
+    if version == "v3_offline_consolidation":
+        return DABE_CLEAN_OFFLINE_VERSION
     raise RuntimeError(f"Unsupported DABE_CLEAN_VERSION={version!r}.")
 
 

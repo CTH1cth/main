@@ -35,6 +35,20 @@ from common.bitc import (
     validate_bitc_config,
 )
 from common.dataset import CachedEvalDataset, CachedTrainDataset
+from common.dabe_clean_offline import (
+    DABE_CLEAN_OFFLINE_MODES,
+    DABE_CLEAN_OFFLINE_PAYLOAD_VERSION,
+)
+from common.found_static import (
+    FOUND_STATIC_RESIZE_MODE,
+    FOUND_STATIC_SOURCE,
+    found_static_enabled,
+    found_static_root,
+)
+from common.teacher_only import (
+    TEACHER_ONLY_NO_OFFLINE_PSEUDO_SOURCE,
+    teacher_only_no_offline_pseudo_enabled,
+)
 from common.ecst import (
     TemporalTeacherMemory as ECSTTemporalTeacherMemory,
     build_ecst_evidence_states,
@@ -4920,6 +4934,12 @@ def weighted_bce_with_logits(logits, target, weight_map, eps=1e-6):
 def dabe_static_bce_with_logits(logits, target, weight_map, cfg, eps=1e-6):
     """Keep legacy PU weighting intact while making Clean BCE truly unweighted."""
     if bool(getattr(cfg, "USE_DABE_CLEAN", False)):
+        if str(getattr(cfg, "DABE_CLEAN_VERSION", "")) == "v3_offline_consolidation":
+            if weight_map is not None:
+                raise RuntimeError(
+                    "Pure-offline DABE-Clean must not construct a static pixel map."
+                )
+            return F.binary_cross_entropy_with_logits(logits, target, reduction="mean")
         if weight_map is None:
             raise RuntimeError("DABE-Clean requires an internal all-one diagnostic map.")
         if weight_map.requires_grad:
@@ -15097,6 +15117,17 @@ def main():
     ecst_minimal_enabled = validate_ecst_minimal_config(cfg)
     ecst_clean_enabled = validate_ecst_clean_config(cfg)
     dabe_clean_enabled = bool(getattr(cfg, "USE_DABE_CLEAN", False))
+    dabe_clean_offline_enabled = dabe_clean_enabled and str(
+        getattr(cfg, "DABE_CLEAN_VERSION", "")
+    ).strip().lower() == "v3_offline_consolidation"
+    found_static_train = (
+        dabe_clean_offline_enabled and found_static_enabled(cfg)
+    )
+    if dabe_clean_offline_enabled and args.pseudo_cache_override:
+        raise RuntimeError(
+            "Pure-offline DABE-Clean forbids --pseudo_cache_override; use the "
+            "mode-bound DABE_CLEAN_ROOT so payload version/mode can be audited."
+        )
     if pssf_enabled or cvsa_enabled:
         supervision_handover_mode = (
             "disabled_by_pssf" if pssf_enabled else "disabled_by_cvsa"
@@ -15540,7 +15571,7 @@ def main():
                 "additional teacher routers."
             )
         clean_version = str(getattr(cfg, "DABE_CLEAN_VERSION", ""))
-        if clean_version not in {"v1", "v2_contrec"}:
+        if clean_version not in {"v1", "v2_contrec", "v3_offline_consolidation"}:
             raise RuntimeError(
                 f"Unsupported DABE_CLEAN_VERSION={clean_version!r}."
             )
@@ -15550,6 +15581,125 @@ def main():
             raise RuntimeError(
                 "DABE-Clean v2-contrec is reserved for Clean-ECST v5."
             )
+        if clean_version == "v3_offline_consolidation":
+            training_target_source = str(
+                getattr(
+                    cfg,
+                    "DABE_CLEAN_TRAINING_TARGET_SOURCE",
+                    "target_offline_68",
+                )
+            ).strip().lower()
+            if training_target_source not in {
+                "target_offline_68",
+                FOUND_STATIC_SOURCE,
+                TEACHER_ONLY_NO_OFFLINE_PSEUDO_SOURCE,
+            }:
+                raise RuntimeError(
+                    "Unsupported DABE_CLEAN_TRAINING_TARGET_SOURCE="
+                    f"{training_target_source!r}."
+                )
+            offline_mode = str(
+                getattr(cfg, "DABE_CLEAN_OFFLINE_MODE", "")
+            ).strip().lower()
+            if offline_mode not in DABE_CLEAN_OFFLINE_MODES:
+                raise RuntimeError(
+                    f"Unsupported DABE_CLEAN_OFFLINE_MODE={offline_mode!r}."
+                )
+            if training_target_source == TEACHER_ONLY_NO_OFFLINE_PSEUDO_SOURCE:
+                for root_field in (
+                    "FOUND_STATIC_ROOT",
+                    "DABE_CLEAN_ROOT",
+                    "DABE_CLEAN_SOURCE_ROOT",
+                    "DABE_CLEAN_OFFLINE_SOURCE_ROOT",
+                    "DABE_CLEAN_OFFLINE_SEMANTIC_ROOT",
+                ):
+                    if str(getattr(cfg, root_field, "")).strip():
+                        raise RuntimeError(
+                            "Teacher-only no-offline-pseudo requires "
+                            f"{root_field}='' to prevent pseudo-label access."
+                        )
+                expected_teacher_only_schedule = {
+                    "DABE_PU_DESPL_STATIC_START": 0.0,
+                    "DABE_PU_DESPL_STATIC_END": 0.0,
+                    "DABE_PU_DESPL_TEACHER_START": 1.0,
+                    "DABE_PU_DESPL_TEACHER_END": 1.0,
+                }
+                schedule_mismatch = {
+                    name: getattr(cfg, name, None)
+                    for name, expected in expected_teacher_only_schedule.items()
+                    if abs(float(getattr(cfg, name, float("nan"))) - expected)
+                    > 1e-12
+                }
+                if schedule_mismatch:
+                    raise RuntimeError(
+                        "Teacher-only supervision schedule mismatch: "
+                        f"{schedule_mismatch}."
+                    )
+            elif training_target_source == FOUND_STATIC_SOURCE:
+                if offline_mode != "complementary_fg":
+                    raise RuntimeError(
+                        "FOUND-static ablation must inherit the V1 "
+                        "complementary_fg protocol."
+                    )
+                if str(
+                    getattr(cfg, "FOUND_STATIC_RESIZE_MODE", "")
+                ).strip().lower() != FOUND_STATIC_RESIZE_MODE:
+                    raise RuntimeError(
+                        "FOUND-static ablation requires bilinear 28x28->68x68 resize."
+                    )
+                found_static_root(cfg)
+                if str(getattr(cfg, "DABE_CLEAN_ROOT", "")).strip():
+                    raise RuntimeError(
+                        "FOUND-static ablation requires DABE_CLEAN_ROOT='' so the "
+                        "V1 formula cache cannot be read."
+                    )
+            elif str(
+                getattr(cfg, "DABE_CLEAN_EXPECTED_PAYLOAD_VERSION", "")
+            ) != DABE_CLEAN_OFFLINE_PAYLOAD_VERSION:
+                raise RuntimeError(
+                    "Pure-offline DABE-Clean payload version must be "
+                    f"{DABE_CLEAN_OFFLINE_PAYLOAD_VERSION!r}."
+                )
+            forbidden_offline = {
+                "USE_ECST": bool(getattr(cfg, "USE_ECST", False)),
+                "USE_ECST_MINIMAL": bool(getattr(cfg, "USE_ECST_MINIMAL", False)),
+                "USE_ECST_CLEAN": bool(getattr(cfg, "USE_ECST_CLEAN", False)),
+                "USE_RAST": bool(getattr(cfg, "USE_RAST", False)),
+                "USE_ESA_ASYM": bool(getattr(cfg, "USE_ESA_ASYM", False)),
+                "USE_ESA_BER": bool(getattr(cfg, "USE_ESA_BER", False)),
+                "DABE_CLEAN_USE_LEGACY_ECST_REGIONS": bool(
+                    getattr(cfg, "DABE_CLEAN_USE_LEGACY_ECST_REGIONS", False)
+                ),
+                "DABE_CLEAN_LEGACY_ROUTING_ONLY": bool(
+                    getattr(cfg, "DABE_CLEAN_LEGACY_ROUTING_ONLY", False)
+                ),
+            }
+            enabled_offline = [
+                name for name, enabled in forbidden_offline.items() if enabled
+            ]
+            if enabled_offline:
+                raise RuntimeError(
+                    "Pure-offline DABE-Clean forbids online/region routers: "
+                    f"{enabled_offline}."
+                )
+            if teacher_routing_mode != "none":
+                raise RuntimeError(
+                    "Pure-offline DABE-Clean requires TEACHER_ROUTING_MODE='none'."
+                )
+            if ecst_clean_enabled or ecst_minimal_enabled:
+                raise RuntimeError(
+                    "Pure-offline DABE-Clean must skip all Clean/Minimal ECST paths."
+                )
+            if float(getattr(cfg, "DABE_BC_LAMBDA", -1.0)) != 0.0:
+                raise RuntimeError(
+                    "Pure-offline DABE-Clean requires A1 DABE_BC_LAMBDA=0.0."
+                )
+            for root_field in ("DABE_PU_ROOT", "DABE_CLEAN_LEGACY_REGION_ROOT"):
+                if str(getattr(cfg, root_field, "")).strip():
+                    raise RuntimeError(
+                        f"Pure-offline DABE-Clean requires {root_field}='' to "
+                        "exclude legacy cache access."
+                    )
         expected_clean = {
             "P_INIT_MODE": "dabe_clean_v1_desplsched",
             "TEACHER_FUSION_MODE": "dabe_clean_despl_sched",
@@ -15578,7 +15728,11 @@ def main():
         ):
             raise RuntimeError("DABE-Clean requires the full binary EMA Teacher target.")
         mode = str(getattr(cfg, "DABE_CLEAN_TARGET_MODE", "")).lower()
-        if mode not in {"dp", "diff", "bridge"}:
+        if clean_version != "v3_offline_consolidation" and mode not in {
+            "dp",
+            "diff",
+            "bridge",
+        }:
             raise RuntimeError(f"Unsupported DABE_CLEAN_TARGET_MODE={mode!r}.")
         legacy_regions = bool(
             getattr(cfg, "DABE_CLEAN_USE_LEGACY_ECST_REGIONS", False)
@@ -17398,9 +17552,40 @@ def main():
         logger.log(f"dabe_pu_root = {getattr(cfg, 'DABE_PU_ROOT', '')}")
         logger.log(f"USE_DABE_CLEAN = {bool(getattr(cfg, 'USE_DABE_CLEAN', False))}")
         if bool(getattr(cfg, "USE_DABE_CLEAN", False)):
-            logger.log(
-                f"DABE_CLEAN_TARGET_MODE = {getattr(cfg, 'DABE_CLEAN_TARGET_MODE', '')}"
-            )
+            if dabe_clean_offline_enabled:
+                logger.log("[Pure Offline Supervision]")
+                logger.log(
+                    "training_target_source = "
+                    f"{getattr(cfg, 'DABE_CLEAN_TRAINING_TARGET_SOURCE', 'target_offline_68')}"
+                )
+                if found_static_train:
+                    logger.log("source_protocol = V1 complementary_fg Long45")
+                    logger.log(f"FOUND_STATIC_ROOT = {found_static_root(cfg)}")
+                    logger.log("FOUND_STATIC_NATIVE_SHAPE = [1,28,28]")
+                    logger.log(
+                        f"FOUND_STATIC_RESIZE_MODE = {FOUND_STATIC_RESIZE_MODE}"
+                    )
+                    logger.log("V1_formula_cache_read = False")
+                else:
+                    logger.log(
+                        "offline_mode = "
+                        f"{getattr(cfg, 'DABE_CLEAN_OFFLINE_MODE', '')}"
+                    )
+                logger.log(f"clean_ecst_enabled = {bool(ecst_clean_enabled)}")
+                logger.log(f"legacy_ecst_enabled = {bool(getattr(cfg, 'USE_ECST', False))}")
+                logger.log(f"teacher_routing_mode = {teacher_routing_mode}")
+                logger.log("temporal_memory_initialized = False")
+                logger.log("static_weight_map_used = False")
+                logger.log("training_target = target_offline_68")
+                if not found_static_train:
+                    logger.log(
+                        "DABE_CLEAN_OFFLINE_PAYLOAD_VERSION = "
+                        f"{DABE_CLEAN_OFFLINE_PAYLOAD_VERSION}"
+                    )
+            else:
+                logger.log(
+                    f"DABE_CLEAN_TARGET_MODE = {getattr(cfg, 'DABE_CLEAN_TARGET_MODE', '')}"
+                )
             logger.log(
                 f"DABE_CLEAN_ROOT = {getattr(cfg, 'DABE_CLEAN_ROOT', '')}"
             )
@@ -17535,12 +17720,36 @@ def main():
             logger.log("use_fixed_in_pseudo = False")
             logger.log("fixed_used_for_training = False")
         if str(getattr(cfg, "P_INIT_MODE", "")) == "dabe_clean_v1_desplsched":
-            clean_mode = str(getattr(cfg, "DABE_CLEAN_TARGET_MODE", "")).lower()
-            logger.log(f"pseudo final candidate = dabe_clean_{clean_mode}_68")
-            logger.log(
-                "p_init_formula = direct mean BCE(single continuous Clean target) "
-                "+ full teacher binary BCE"
-            )
+            if teacher_only_no_offline_pseudo_enabled(cfg):
+                logger.log("pseudo final candidate = binary EMA Teacher only")
+                logger.log(
+                    "p_init_formula = full teacher binary BCE; "
+                    "offline/static pseudo target absent"
+                )
+            else:
+                clean_mode = str(
+                    getattr(
+                        cfg,
+                        "DABE_CLEAN_OFFLINE_MODE"
+                        if dabe_clean_offline_enabled
+                        else "DABE_CLEAN_TARGET_MODE",
+                        "",
+                    )
+                ).lower()
+                clean_candidate = (
+                    (
+                        "FOUND fixed 28x28 -> bilinear target_offline_68"
+                        if found_static_train
+                        else "target_offline_68"
+                    )
+                    if dabe_clean_offline_enabled
+                    else f"dabe_clean_{clean_mode}_68"
+                )
+                logger.log(f"pseudo final candidate = {clean_candidate}")
+                logger.log(
+                    "p_init_formula = direct mean BCE(single continuous Clean target) "
+                    "+ full teacher binary BCE"
+                )
             logger.log("legacy_static_weight_map_used_for_training = False")
             logger.log("fixed_used_for_training = False")
 
@@ -17550,6 +17759,9 @@ def main():
         use_dabe = bool(getattr(cfg, "USE_DABE_PSEUDO", False))
         use_dabe_pu_cache = bool(getattr(cfg, "USE_DABE_PU", False))
         use_dabe_clean = bool(getattr(cfg, "USE_DABE_CLEAN", False))
+        teacher_only_no_offline_pseudo = (
+            teacher_only_no_offline_pseudo_enabled(cfg)
+        )
         # Downstream DESPL scheduling is intentionally shared; cache/data access
         # remains split by the two explicit flags above.
         use_dabe_pu = use_dabe_pu_cache or use_dabe_clean
@@ -17755,6 +17967,7 @@ def main():
                     max_samples=sample_limit if sample_limit >= 0 else None,
                 )
                 logger.log(f"[Cache] CACD F10/F11:val ready | {cacd_val_reason}")
+        offline_cache_stats = {}
         if cfg.PSEUDO_CACHE_OVERRIDE:
             logger.log(
                 "[Cache] pseudo override enabled | "
@@ -17807,23 +18020,24 @@ def main():
                 max_samples=sample_limit if sample_limit >= 0 else None,
             )
             logger.log(f"[Cache] DABE-PU cache ready | {dabe_pu_reason}")
-        elif use_dabe_clean:
+        elif use_dabe_clean and not teacher_only_no_offline_pseudo:
             is_contrec_cache = str(
                 getattr(cfg, "DABE_CLEAN_VERSION", "")
             ) == "v2_contrec"
+            is_offline_cache = dabe_clean_offline_enabled
             dabe_clean_check = check_dabe_clean_cache(
                 cfg,
                 max_samples=sample_limit if sample_limit >= 0 else None,
-                return_stats=is_contrec_cache,
+                return_stats=is_contrec_cache or is_offline_cache,
             )
-            if is_contrec_cache:
+            if is_contrec_cache or is_offline_cache:
                 _, dabe_clean_reason, contrec_stats = dabe_clean_check
             else:
                 _, dabe_clean_reason = dabe_clean_check
                 contrec_stats = {}
-            logger.log(
-                f"[Cache] DABE-Clean independent cache ready | {dabe_clean_reason}"
-            )
+                logger.log(
+                    f"[Cache] DABE-Clean independent cache ready | {dabe_clean_reason}"
+                )
             if is_contrec_cache:
                 for name in (
                     "p_rw",
@@ -17859,6 +18073,24 @@ def main():
                     f"{recovery_stats['gt_0_3_ratio']:.8f}/"
                     f"{recovery_stats['gt_0_5_ratio']:.8f}"
                 )
+            elif is_offline_cache:
+                offline_cache_stats = dict(contrec_stats["offline_evidence"])
+                target_stats = contrec_stats["target_offline"]
+                logger.log(
+                    "[Pure Offline Cache] source="
+                    f"{getattr(cfg, 'DABE_CLEAN_TRAINING_TARGET_SOURCE', 'target_offline_68')} | "
+                    "target mean/std/hard_area="
+                    f"{target_stats['mean']:.8f}/"
+                    f"{target_stats['std']:.8f}/"
+                    f"{target_stats['hard_area']:.8f} | "
+                    "training_batch_diagnostics_loaded=False"
+                )
+        elif teacher_only_no_offline_pseudo:
+            logger.log(
+                "[Cache] offline pseudo labels skipped | "
+                "source=teacher_only_no_offline_pseudo | "
+                "FOUND/DABE-Clean/DABE-PU/original-pseudo manifests read=False"
+            )
         else:
             ensure_cache_available(cfg, "pseudo", logger=logger.log)
         if use_cvsa_train:
@@ -18964,6 +19196,21 @@ def main():
                 "[TeacherRouting] mode=none | ECST temporal memory "
                 "initialized=False | evidence_builder_used=False | "
                 "dino_margin_used=False"
+            )
+        if dabe_clean_offline_enabled:
+            if (
+                use_ecst
+                or use_ecst_clean_train
+                or use_ecst_minimal_train
+                or ecst_memory is not None
+                or clean_ecst_audit_path is not None
+            ):
+                raise RuntimeError(
+                    "Pure-offline runtime isolation failed: an ECST path was initialized."
+                )
+            logger.log(
+                "[Pure Offline Runtime] temporal_memory_initialized=False | "
+                "clean_ecst_audit_created=False | teacher_route=identity_ones"
             )
 
         if use_source_arbiter_train:
@@ -20141,31 +20388,96 @@ def main():
                         "weight_map",
                         "dabe_clean_static_weight_map",
                     }.intersection(batch)
+                    if dabe_clean_offline_enabled:
+                        forbidden_clean_batch_keys.update(
+                            {
+                                "dabe_clean_target_37",
+                                "dabe_clean_target_68",
+                                "dabe_clean_fg_evidence_37",
+                                "dabe_clean_fg_evidence_68",
+                                "dabe_clean_bg_evidence_37",
+                                "dabe_clean_bg_evidence_68",
+                                "dabe_clean_p_rw_37",
+                                "dabe_clean_evidence_gate_37",
+                                "dabe_clean_semantic_fg_tendency_37",
+                                "dabe_clean_latent_rw_37",
+                                "dabe_clean_recoverability_37",
+                                "dabe_clean_recoverability_68",
+                                "complementary_fg_68",
+                                "background_evidence_68",
+                                "commitment_68",
+                                "conflict_68",
+                                "latent_support_68",
+                                "legacy_ecst_fg_core",
+                                "legacy_ecst_fg_fallback",
+                                "legacy_ecst_bg_core",
+                                "legacy_ecst_extent",
+                                "legacy_ecst_unknown",
+                            }.intersection(batch)
+                        )
                     if forbidden_clean_batch_keys:
                         raise RuntimeError(
                             "DABE-Clean batch must not carry a static weight map: "
                             f"{sorted(forbidden_clean_batch_keys)}"
                         )
-                    pu_target_soft = batch["dabe_clean_target_68"].to(
-                        device, non_blocking=True
-                    ).float().detach()
+                    clean_training_target_key = (
+                        "none"
+                        if teacher_only_no_offline_pseudo
+                        else (
+                            "target_offline_68"
+                            if dabe_clean_offline_enabled
+                            else "dabe_clean_target_68"
+                        )
+                    )
+                    if teacher_only_no_offline_pseudo:
+                        if "target_offline_68" in batch:
+                            raise RuntimeError(
+                                "Teacher-only batch leaked target_offline_68."
+                            )
+                        pu_target_soft = torch.zeros_like(
+                            pseudo_68, requires_grad=False
+                        )
+                    else:
+                        if dabe_clean_offline_enabled and not torch.equal(
+                            batch["pseudo"].float(),
+                            batch[clean_training_target_key].float(),
+                        ):
+                            raise RuntimeError(
+                                "Pure-offline supervision requires pseudo == "
+                                "batch['target_offline_68']."
+                            )
+                        pu_target_soft = batch[clean_training_target_key].to(
+                            device, non_blocking=True
+                        ).float().detach()
                     pu_static_source_target = pu_target_soft
                     pu_static_target = pu_target_soft
-                    # Internal diagnostic only. It is not read from cache/batch,
-                    # and dabe_static_bce_with_logits uses direct mean BCE.
-                    pu_static_weight_map = torch.ones_like(
-                        pu_static_target, requires_grad=False
-                    )
-                    batch_static_weight_mode = "clean_internal_ones_diagnostic"
+                    if dabe_clean_offline_enabled:
+                        pu_static_weight_map = None
+                        batch_static_weight_mode = "pure_offline_no_static_map"
+                    else:
+                        # Legacy Clean diagnostic only. It is not read from
+                        # cache/batch, and the loss remains direct mean BCE.
+                        pu_static_weight_map = torch.ones_like(
+                            pu_static_target, requires_grad=False
+                        )
+                        batch_static_weight_mode = "clean_internal_ones_diagnostic"
                     hard_thresh = float(getattr(cfg, "DABE_PU_HARD_THRESH", 0.5))
                     pu_target_hard = (pu_target_soft > hard_thresh).float()
                     dabe_pu_static_source = (
-                        f"dabe_clean_{str(getattr(cfg, 'DABE_CLEAN_TARGET_MODE', '')).lower()}_68"
+                        "none_teacher_only"
+                        if teacher_only_no_offline_pseudo
+                        else (
+                            "target_offline_68"
+                            if dabe_clean_offline_enabled
+                            else f"dabe_clean_{str(getattr(cfg, 'DABE_CLEAN_TARGET_MODE', '')).lower()}_68"
+                        )
                     )
-                    for tensor_name, tensor in (
-                        ("target", pu_static_target),
-                        ("diagnostic_weight", pu_static_weight_map),
-                    ):
+                    clean_tensors = [("target", pu_static_target)]
+                    if pu_static_weight_map is not None:
+                        clean_tensors.append(
+                            ("diagnostic_weight", pu_static_weight_map)
+                        )
+                    for tensor_name, tensor in clean_tensors:
                         if tensor.requires_grad or not bool(torch.isfinite(tensor).all().item()):
                             raise RuntimeError(
                                 f"DABE-Clean {tensor_name} must be finite and detached."
@@ -20252,31 +20564,40 @@ def main():
                         ).float()
                 if use_dabe_clean and iter_idx == 0:
                     evidence_parts = []
-                    for clean_key in (
-                        "dabe_clean_fg_evidence_37",
-                        "dabe_clean_bg_evidence_37",
-                    ):
-                        clean_value = batch[clean_key]
-                        if int(clean_value.numel()) == 0:
-                            evidence_parts.append(f"{clean_key}=not_available")
-                        else:
-                            clean_value = clean_value.float()
-                            evidence_parts.append(
-                                f"{clean_key}[min/mean/max]="
-                                f"{float(clean_value.min()):.6f}/"
-                                f"{float(clean_value.mean()):.6f}/"
-                                f"{float(clean_value.max()):.6f}"
-                            )
+                    if dabe_clean_offline_enabled:
+                        evidence_parts.append(
+                            "offline_evidence_maps_in_batch=False"
+                        )
+                    else:
+                        for clean_key in (
+                            "dabe_clean_fg_evidence_37",
+                            "dabe_clean_bg_evidence_37",
+                        ):
+                            clean_value = batch[clean_key]
+                            if int(clean_value.numel()) == 0:
+                                evidence_parts.append(f"{clean_key}=not_available")
+                            else:
+                                clean_value = clean_value.float()
+                                evidence_parts.append(
+                                    f"{clean_key}[min/mean/max]="
+                                    f"{float(clean_value.min()):.6f}/"
+                                    f"{float(clean_value.mean()):.6f}/"
+                                    f"{float(clean_value.max()):.6f}"
+                                )
                     logger.log(
                         f"[DABE-Clean FirstBatch] epoch={epoch:03d} | "
-                        f"mode={getattr(cfg, 'DABE_CLEAN_TARGET_MODE')} | "
+                        "mode="
+                        f"{FOUND_STATIC_SOURCE if found_static_train else (getattr(cfg, 'DABE_CLEAN_OFFLINE_MODE') if dabe_clean_offline_enabled else getattr(cfg, 'DABE_CLEAN_TARGET_MODE'))} | "
+                        f"target_source_key={clean_training_target_key} | "
+                        f"payload_version={'legacy_found_binary_v1' if found_static_train else getattr(cfg, 'DABE_CLEAN_EXPECTED_PAYLOAD_VERSION', '')} | "
+                        f"cache_root={found_static_root(cfg) if found_static_train else getattr(cfg, 'DABE_CLEAN_ROOT', '')} | "
                         f"target_shape={list(pu_static_target.shape)} | "
                         "target_min/mean/max="
                         f"{float(pu_static_target.min()):.6f}/"
                         f"{float(pu_static_target.mean()):.6f}/"
                         f"{float(pu_static_target.max()):.6f} | "
-                        "static_map_from_batch=False | internal_map_all_ones="
-                        f"{bool(torch.all(pu_static_weight_map == 1.0).item())} | "
+                        "static_map_from_batch=False | internal_static_map="
+                        f"{'not_constructed' if pu_static_weight_map is None else 'all_ones_diagnostic'} | "
                         f"legacy_routing_namespace={'legacy_ecst' if bool(getattr(cfg, 'DABE_CLEAN_USE_LEGACY_ECST_REGIONS', False)) else 'disabled'} | "
                         f"stems={list(batch.get('stem', []))} | "
                         + " | ".join(evidence_parts)
@@ -23199,12 +23520,16 @@ def main():
                         )
                     elif use_dabe_pu_despl_sched:
                         eps = float(getattr(cfg, "DABE_PU_WEIGHTED_BCE_EPS", 1e-6))
-                        loss_pu_static_final = dabe_static_bce_with_logits(
-                            student_logits,
-                            pu_static_target,
-                            pu_static_weight_map,
-                            cfg,
-                            eps=eps,
+                        loss_pu_static_final = (
+                            zero_loss
+                            if teacher_only_no_offline_pseudo
+                            else dabe_static_bce_with_logits(
+                                student_logits,
+                                pu_static_target,
+                                pu_static_weight_map,
+                                cfg,
+                                eps=eps,
+                            )
                         )
                         if use_source_arbiter_train:
                             if teacher_source_weight is None:
@@ -23247,7 +23572,11 @@ def main():
                         pu_static_loss_weight, pu_teacher_loss_weight = get_dabe_pu_despl_schedule(epoch, cfg)
                         loss_pu_static_group = loss_pu_static_final
                         loss_pu_teacher_group = loss_pu_teacher_final
-                        loss_final_bce = loss_pu_static_final
+                        loss_final_bce = (
+                            loss_pu_teacher_final
+                            if teacher_only_no_offline_pseudo
+                            else loss_pu_static_final
+                        )
                         loss_tversky = student_logits.sum() * 0.0
                         loss_base = (
                             pu_static_loss_weight * loss_pu_static_group
@@ -23800,12 +24129,16 @@ def main():
                             pu_aux_weights = [1.0]
                             if decoder_coarse_aux_enabled:
                                 coarse_logits = resize_logits_for_loss(student_out["coarse_logits_68"], cfg)
-                                loss_pu_static_coarse = dabe_static_bce_with_logits(
-                                    coarse_logits,
-                                    pu_static_target,
-                                    pu_static_weight_map,
-                                    cfg,
-                                    eps=eps,
+                                loss_pu_static_coarse = (
+                                    zero_loss
+                                    if teacher_only_no_offline_pseudo
+                                    else dabe_static_bce_with_logits(
+                                        coarse_logits,
+                                        pu_static_target,
+                                        pu_static_weight_map,
+                                        cfg,
+                                        eps=eps,
+                                    )
                                 )
                                 if lceg_teacher_map_coarse is not None and bool(getattr(cfg, "LCEG_APPLY_TO_COARSE_AUX", True)):
                                     loss_pu_teacher_coarse = lceg_teacher_bce_with_logits(
@@ -23845,12 +24178,16 @@ def main():
                                     else float(getattr(cfg, "LAMBDA_BASE_AUX_AFTER_RESET", 0.1))
                                 )
                                 base_logits = resize_logits_for_loss(student_out["base_logits"], cfg)
-                                loss_pu_static_base = dabe_static_bce_with_logits(
-                                    base_logits,
-                                    pu_static_target,
-                                    pu_static_weight_map,
-                                    cfg,
-                                    eps=eps,
+                                loss_pu_static_base = (
+                                    zero_loss
+                                    if teacher_only_no_offline_pseudo
+                                    else dabe_static_bce_with_logits(
+                                        base_logits,
+                                        pu_static_target,
+                                        pu_static_weight_map,
+                                        cfg,
+                                        eps=eps,
+                                    )
                                 )
                                 loss_pu_teacher_base = teacher_route_bce_with_logits(
                                     base_logits,
@@ -25483,29 +25820,30 @@ def main():
                     dabe_pu_target_mean_sum += float(pu_target_soft.detach().mean().item())
                     if use_dabe_clean:
                         dabe_pu_weight_mean_sum += 1.0
-                        fg_evidence = batch["dabe_clean_fg_evidence_37"].float()
-                        bg_evidence = batch["dabe_clean_bg_evidence_37"].float()
-                        dabe_pu_fg_core_mean_sum += (
-                            float(fg_evidence.mean().item())
-                            if int(fg_evidence.numel()) > 0
-                            else 0.0
-                        )
-                        dabe_pu_bg_core_mean_sum += (
-                            float(bg_evidence.mean().item())
-                            if int(bg_evidence.numel()) > 0
-                            else 0.0
-                        )
-                        dabe_pu_fg_fallback_mean_sum += 0.0
-                        dabe_pu_extent_mean_sum += (
-                            float(batch["legacy_ecst_extent"].float().mean().item())
-                            if "legacy_ecst_extent" in batch
-                            else 0.0
-                        )
-                        dabe_pu_unknown_mean_sum += (
-                            float(batch["legacy_ecst_unknown"].float().mean().item())
-                            if "legacy_ecst_unknown" in batch
-                            else 0.0
-                        )
+                        if not dabe_clean_offline_enabled:
+                            fg_evidence = batch["dabe_clean_fg_evidence_37"].float()
+                            bg_evidence = batch["dabe_clean_bg_evidence_37"].float()
+                            dabe_pu_fg_core_mean_sum += (
+                                float(fg_evidence.mean().item())
+                                if int(fg_evidence.numel()) > 0
+                                else 0.0
+                            )
+                            dabe_pu_bg_core_mean_sum += (
+                                float(bg_evidence.mean().item())
+                                if int(bg_evidence.numel()) > 0
+                                else 0.0
+                            )
+                            dabe_pu_fg_fallback_mean_sum += 0.0
+                            dabe_pu_extent_mean_sum += (
+                                float(batch["legacy_ecst_extent"].float().mean().item())
+                                if "legacy_ecst_extent" in batch
+                                else 0.0
+                            )
+                            dabe_pu_unknown_mean_sum += (
+                                float(batch["legacy_ecst_unknown"].float().mean().item())
+                                if "legacy_ecst_unknown" in batch
+                                else 0.0
+                            )
                     else:
                         dabe_pu_weight_mean_sum += float(
                             (
@@ -27264,35 +27602,101 @@ def main():
                         "static_gradient_active="
                         f"{static_weight_row['static_gradient_active']}"
                     )
-                logger.log(
-                    f"[{'DABE-Clean' if use_dabe_clean else 'DABE-PU'}] epoch={epoch:03d} | "
-                    f"source={'independent_clean_cache' if use_dabe_clean else 'dabe_pu_cache'} | "
-                    f"version={getattr(cfg, 'DABE_CLEAN_VERSION', 'v1') if use_dabe_clean else getattr(cfg, 'DABE_PU_VERSION', 'pu_v11')} | "
-                    f"p_init_mode={getattr(cfg, 'P_INIT_MODE', 'dabe_pu_v11')} | "
-                    f"target_mode={getattr(cfg, 'DABE_CLEAN_TARGET_MODE', 'legacy_pu') if use_dabe_clean else 'legacy_pu'} | "
-                    f"static_weight={static_weight_log:.2f} | "
-                    f"teacher_weight={teacher_weight_log:.2f} | "
-                    f"target_mean={dabe_pu_target_mean_sum / stat_batches:.6f} | "
-                    f"diagnostic_weight_mean={dabe_pu_weight_mean_sum / stat_batches:.6f} | "
-                    f"foreground_evidence_mean={dabe_pu_fg_core_mean_sum / stat_batches:.6f} | "
-                    f"fg_fallback_mean={dabe_pu_fg_fallback_mean_sum / stat_batches:.6f} | "
-                    f"background_evidence_mean={dabe_pu_bg_core_mean_sum / stat_batches:.6f} | "
-                    f"extent_mean={dabe_pu_extent_mean_sum / stat_batches:.6f} | "
-                    f"unknown_mean={dabe_pu_unknown_mean_sum / stat_batches:.6f} | "
-                    f"loss_static_final={dabe_pu_static_final_loss_sum / stat_batches:.6f} | "
-                    f"loss_static_coarse={dabe_pu_static_coarse_loss_sum / stat_batches:.6f} | "
-                    f"loss_static_base={dabe_pu_static_base_loss_sum / stat_batches:.6f} | "
-                    f"loss_static_group={dabe_pu_static_group_loss_sum / stat_batches:.6f} | "
-                    f"loss_teacher_final={dabe_pu_teacher_final_loss_sum / stat_batches:.6f} | "
-                    f"loss_teacher_coarse={dabe_pu_teacher_coarse_loss_sum / stat_batches:.6f} | "
-                    f"loss_teacher_base={dabe_pu_teacher_base_loss_sum / stat_batches:.6f} | "
-                    f"loss_teacher_group={dabe_pu_teacher_group_loss_sum / stat_batches:.6f} | "
-                    f"teacher_conf_ratio={dabe_pu_teacher_conf_ratio_sum / stat_batches:.6f} | "
-                    f"teacher_fg_ratio={dabe_pu_teacher_fg_ratio_sum / stat_batches:.6f} | "
-                    f"teacher_bg_ratio={dabe_pu_teacher_bg_ratio_sum / stat_batches:.6f} | "
-                    f"static_loss_unweighted_mean_bce={use_dabe_clean} | "
-                    "fixed_used_for_training=False"
-                )
+                if teacher_only_no_offline_pseudo:
+                    logger.log(
+                        f"[Teacher-Only No-Offline-Pseudo] epoch={epoch:03d} | "
+                        "offline_pseudo_read=False | static_target=none | "
+                        f"static_weight={static_weight_log:.2f} | "
+                        f"teacher_weight={teacher_weight_log:.2f} | "
+                        f"student_prob_mean={student_prob_mean_sum / max(num_batches, 1):.6f} | "
+                        f"teacher_prob_mean={teacher_prob_mean_sum / max(num_batches, 1):.6f} | "
+                        f"student_pred_area={student_pred_area_sum / max(num_batches, 1):.6f} | "
+                        f"teacher_pred_area={teacher_pred_area_sum / max(num_batches, 1):.6f} | "
+                        f"loss_teacher_final={dabe_pu_teacher_final_loss_sum / stat_batches:.6f} | "
+                        f"loss_teacher_coarse={dabe_pu_teacher_coarse_loss_sum / stat_batches:.6f} | "
+                        f"loss_teacher_base={dabe_pu_teacher_base_loss_sum / stat_batches:.6f}"
+                    )
+                elif found_static_train:
+                    logger.log(
+                        f"[FOUND Static Supervision] epoch={epoch:03d} | "
+                        "source=found_fixed | native_shape=[1,28,28] | "
+                        "resize=bilinear | training_target=target_offline_68 | "
+                        f"static_weight={static_weight_log:.2f} | "
+                        f"teacher_weight={teacher_weight_log:.2f} | "
+                        f"target_mean={dabe_pu_target_mean_sum / stat_batches:.6f} | "
+                        f"target_hard_area={dabe_pu_target_hard_area_sum / stat_batches:.6f} | "
+                        f"found_native_hard_area={offline_cache_stats['found_native_hard_area']:.6f} | "
+                        f"student_prob_mean={student_prob_mean_sum / max(num_batches, 1):.6f} | "
+                        f"teacher_prob_mean={teacher_prob_mean_sum / max(num_batches, 1):.6f} | "
+                        f"student_pred_area={student_pred_area_sum / max(num_batches, 1):.6f} | "
+                        f"teacher_pred_area={teacher_pred_area_sum / max(num_batches, 1):.6f} | "
+                        f"loss_static_final={dabe_pu_static_final_loss_sum / stat_batches:.6f} | "
+                        f"loss_static_coarse={dabe_pu_static_coarse_loss_sum / stat_batches:.6f} | "
+                        f"loss_static_base={dabe_pu_static_base_loss_sum / stat_batches:.6f} | "
+                        f"loss_teacher_final={dabe_pu_teacher_final_loss_sum / stat_batches:.6f} | "
+                        f"loss_teacher_coarse={dabe_pu_teacher_coarse_loss_sum / stat_batches:.6f} | "
+                        f"loss_teacher_base={dabe_pu_teacher_base_loss_sum / stat_batches:.6f}"
+                    )
+                elif dabe_clean_offline_enabled:
+                    logger.log(
+                        f"[Pure Offline Supervision] epoch={epoch:03d} | "
+                        f"offline_mode={getattr(cfg, 'DABE_CLEAN_OFFLINE_MODE')} | "
+                        "training_target=target_offline_68 | "
+                        f"static_weight={static_weight_log:.2f} | "
+                        f"teacher_weight={teacher_weight_log:.2f} | "
+                        f"target_mean={dabe_pu_target_mean_sum / stat_batches:.6f} | "
+                        f"target_hard_area={dabe_pu_target_hard_area_sum / stat_batches:.6f} | "
+                        f"primary_fg_mean={offline_cache_stats['primary_fg_mean']:.6f} | "
+                        f"primary_fg_hard_area={offline_cache_stats['primary_fg_hard_area']:.6f} | "
+                        f"complementary_fg_mean={offline_cache_stats['complementary_fg_mean']:.6f} | "
+                        f"consolidated_fg_mean={offline_cache_stats['consolidated_fg_mean']:.6f} | "
+                        f"consolidated_fg_hard_area={offline_cache_stats['consolidated_fg_hard_area']:.6f} | "
+                        f"background_mean={offline_cache_stats['background_mean']:.6f} | "
+                        f"conflict_mean={offline_cache_stats['conflict_mean']:.6f} | "
+                        f"commitment_mean={offline_cache_stats['commitment_mean']:.6f} | "
+                        f"student_prob_mean={student_prob_mean_sum / max(num_batches, 1):.6f} | "
+                        f"teacher_prob_mean={teacher_prob_mean_sum / max(num_batches, 1):.6f} | "
+                        f"student_pred_area={student_pred_area_sum / max(num_batches, 1):.6f} | "
+                        f"teacher_pred_area={teacher_pred_area_sum / max(num_batches, 1):.6f} | "
+                        f"loss_static_final={dabe_pu_static_final_loss_sum / stat_batches:.6f} | "
+                        f"loss_static_coarse={dabe_pu_static_coarse_loss_sum / stat_batches:.6f} | "
+                        f"loss_static_base={dabe_pu_static_base_loss_sum / stat_batches:.6f} | "
+                        f"loss_teacher_final={dabe_pu_teacher_final_loss_sum / stat_batches:.6f} | "
+                        f"loss_teacher_coarse={dabe_pu_teacher_coarse_loss_sum / stat_batches:.6f} | "
+                        f"loss_teacher_base={dabe_pu_teacher_base_loss_sum / stat_batches:.6f} | "
+                        "offline_evidence_maps_in_batch=False | "
+                        "static_weight_map_used=False | fixed_used_for_training=False"
+                    )
+                else:
+                    logger.log(
+                        f"[{'DABE-Clean' if use_dabe_clean else 'DABE-PU'}] epoch={epoch:03d} | "
+                        f"source={'independent_clean_cache' if use_dabe_clean else 'dabe_pu_cache'} | "
+                        f"version={getattr(cfg, 'DABE_CLEAN_VERSION', 'v1') if use_dabe_clean else getattr(cfg, 'DABE_PU_VERSION', 'pu_v11')} | "
+                        f"p_init_mode={getattr(cfg, 'P_INIT_MODE', 'dabe_pu_v11')} | "
+                        f"target_mode={getattr(cfg, 'DABE_CLEAN_TARGET_MODE', 'legacy_pu') if use_dabe_clean else 'legacy_pu'} | "
+                        f"static_weight={static_weight_log:.2f} | "
+                        f"teacher_weight={teacher_weight_log:.2f} | "
+                        f"target_mean={dabe_pu_target_mean_sum / stat_batches:.6f} | "
+                        f"diagnostic_weight_mean={dabe_pu_weight_mean_sum / stat_batches:.6f} | "
+                        f"foreground_evidence_mean={dabe_pu_fg_core_mean_sum / stat_batches:.6f} | "
+                        f"fg_fallback_mean={dabe_pu_fg_fallback_mean_sum / stat_batches:.6f} | "
+                        f"background_evidence_mean={dabe_pu_bg_core_mean_sum / stat_batches:.6f} | "
+                        f"extent_mean={dabe_pu_extent_mean_sum / stat_batches:.6f} | "
+                        f"unknown_mean={dabe_pu_unknown_mean_sum / stat_batches:.6f} | "
+                        f"loss_static_final={dabe_pu_static_final_loss_sum / stat_batches:.6f} | "
+                        f"loss_static_coarse={dabe_pu_static_coarse_loss_sum / stat_batches:.6f} | "
+                        f"loss_static_base={dabe_pu_static_base_loss_sum / stat_batches:.6f} | "
+                        f"loss_static_group={dabe_pu_static_group_loss_sum / stat_batches:.6f} | "
+                        f"loss_teacher_final={dabe_pu_teacher_final_loss_sum / stat_batches:.6f} | "
+                        f"loss_teacher_coarse={dabe_pu_teacher_coarse_loss_sum / stat_batches:.6f} | "
+                        f"loss_teacher_base={dabe_pu_teacher_base_loss_sum / stat_batches:.6f} | "
+                        f"loss_teacher_group={dabe_pu_teacher_group_loss_sum / stat_batches:.6f} | "
+                        f"teacher_conf_ratio={dabe_pu_teacher_conf_ratio_sum / stat_batches:.6f} | "
+                        f"teacher_fg_ratio={dabe_pu_teacher_fg_ratio_sum / stat_batches:.6f} | "
+                        f"teacher_bg_ratio={dabe_pu_teacher_bg_ratio_sum / stat_batches:.6f} | "
+                        f"static_loss_unweighted_mean_bce={use_dabe_clean} | "
+                        "fixed_used_for_training=False"
+                    )
                 if use_dabe_pu_despl_sched:
                     if use_ap_stcr_train:
                         logger.log(
