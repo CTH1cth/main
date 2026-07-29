@@ -58,7 +58,9 @@ from common.ecst import (
     get_ecst_scale,
 )
 from common.ecst_clean import (
+    ECST_CLEAN_C2_NOHIST_VERSION,
     build_ecst_clean_teacher_weight_map,
+    ecst_clean_uses_history,
     get_ecst_clean_continuous_strengths,
     get_ecst_clean_directional_strengths,
     get_ecst_clean_scale,
@@ -1979,6 +1981,67 @@ def get_dabe_pu_static_source(cfg):
             f"{source!r}; expected 'target_soft_68' or 'p_base_68'."
         )
     return source
+
+
+def get_dabe_clean_static_target_source(cfg):
+    source = str(
+        getattr(cfg, "DABE_CLEAN_STATIC_TARGET_SOURCE", "clean_target_68")
+    ).strip().lower()
+    allowed = {"clean_target_68", "dabe_v2_hard_68"}
+    if source not in allowed:
+        raise RuntimeError(
+            "Unsupported DABE_CLEAN_STATIC_TARGET_SOURCE="
+            f"{source!r}; expected one of {sorted(allowed)}."
+        )
+    return source
+
+
+def build_dabe_clean_static_target(
+    cfg,
+    clean_target_68,
+    selected_source_68,
+):
+    """Select only the Clean-path static BCE target.
+
+    The original Clean target remains available to routing/diagnostic code.  In
+    the DABE-v2-hard ablation, selected_source_68 is the independent DABE-v2
+    cache field p_dabe_68, and only its strict binary mask supervises the static
+    loss branches.
+    """
+
+    source = get_dabe_clean_static_target_source(cfg)
+    clean_target = clean_target_68.detach().float()
+    selected_source = selected_source_68.detach().float()
+    if tuple(clean_target.shape) != tuple(selected_source.shape):
+        raise RuntimeError(
+            "DABE-Clean target/selected source shape mismatch: "
+            f"{list(clean_target.shape)} != {list(selected_source.shape)}."
+        )
+    for name, tensor in (
+        ("clean_target_68", clean_target),
+        ("selected_source_68", selected_source),
+    ):
+        if tensor.requires_grad or not bool(torch.isfinite(tensor).all().item()):
+            raise RuntimeError(f"DABE-Clean {name} must be finite and detached.")
+        value_min = float(tensor.min().item())
+        value_max = float(tensor.max().item())
+        if value_min < -1e-6 or value_max > 1.0 + 1e-6:
+            raise RuntimeError(
+                f"DABE-Clean {name} must remain in [0,1], got "
+                f"{value_min:.8f}/{value_max:.8f}."
+            )
+    if source == "clean_target_68":
+        if not torch.equal(clean_target, selected_source):
+            raise RuntimeError(
+                "DABE-Clean default static source must equal clean_target_68."
+            )
+        return clean_target
+
+    threshold = float(
+        getattr(cfg, "DABE_CLEAN_DABE_V2_HARD_THRESHOLD", 0.5)
+    )
+    hard_target = (selected_source > threshold).float().detach()
+    return hard_target
 
 
 def build_dabe_pu_despl_static_target(
@@ -7064,6 +7127,7 @@ CLEAN_ECST_AUDIT_HEADERS = (
     "add_strength",
     "ring_bg_strength",
     "recovery_strength",
+    "history_enabled",
     "memory_active_ratio",
     "history_count_mean",
     "history_valid_ratio",
@@ -7093,6 +7157,8 @@ CLEAN_ECST_AUDIT_HEADERS = (
     "positive_static_evidence_mean",
     "negative_static_evidence_mean",
     "recoverability_mean",
+    "latent_support_mean",
+    "latent_effective_mean",
     "teacher_fg_ratio",
     "teacher_bg_ratio",
     "recovery_suppression_mass",
@@ -7360,6 +7426,8 @@ def new_ecst_epoch_accumulator():
         "clean_positive_static_evidence_sum": 0.0,
         "clean_negative_static_evidence_sum": 0.0,
         "clean_recoverability_sum": 0.0,
+        "clean_latent_support_sum": 0.0,
+        "clean_latent_effective_sum": 0.0,
         "clean_teacher_fg_ratio_sum": 0.0,
         "clean_teacher_bg_ratio_sum": 0.0,
         "clean_recovery_suppression_mass_sum": 0.0,
@@ -7383,8 +7451,14 @@ def new_ecst_epoch_accumulator():
 def accumulate_ecst_epoch(accumulator, stats, student_prob, teacher_prob):
     accumulator["batches"] += 1
     accumulator["memory_active_batches"] += int(bool(stats.get("memory_active", False)))
-    accumulator["history_count_mean_sum"] += float(stats["history_count_mean"])
-    accumulator["history_valid_ratio_sum"] += float(stats["history_valid_ratio"])
+    if "history_count_mean" in stats:
+        accumulator["history_count_mean_sum"] += float(
+            stats["history_count_mean"]
+        )
+    if "history_valid_ratio" in stats:
+        accumulator["history_valid_ratio_sum"] += float(
+            stats["history_valid_ratio"]
+        )
     if stats.get("routing_mode") == "clean_ecst":
         pixels = int(student_prob.numel())
         accumulator["map_sum"] += float(stats["teacher_map_mean"]) * pixels
@@ -7459,7 +7533,8 @@ def accumulate_ecst_epoch(accumulator, stats, student_prob, teacher_prob):
                 "clean_ring_bg_floor_saturation_sum",
             ),
         ):
-            accumulator[target] += float(stats[source])
+            if source in stats:
+                accumulator[target] += float(stats[source])
         for source, target in (
             (
                 "positive_static_evidence_mean",
@@ -7470,6 +7545,8 @@ def accumulate_ecst_epoch(accumulator, stats, student_prob, teacher_prob):
                 "clean_negative_static_evidence_sum",
             ),
             ("recoverability_mean", "clean_recoverability_sum"),
+            ("latent_support_mean", "clean_latent_support_sum"),
+            ("latent_effective_mean", "clean_latent_effective_sum"),
             ("teacher_fg_ratio", "clean_teacher_fg_ratio_sum"),
             ("teacher_bg_ratio", "clean_teacher_bg_ratio_sum"),
             (
@@ -7692,6 +7769,53 @@ def log_ecst_clean_first_batch(
     logger, cfg, epoch, sample_indices, stats, student_prob, teacher_prob
 ):
     if stats["strength_mode"] == "directional_continuous":
+        if not ecst_clean_uses_history(cfg):
+            if bool(stats.get("history_fields_consumed", True)):
+                raise RuntimeError(
+                    "Clean-ECST C2 FirstBatch consumed history fields."
+                )
+            latent_error = abs(
+                float(stats["latent_effective_mean"])
+                - float(stats["latent_support_mean"])
+            )
+            if latent_error > 1e-6 or float(
+                stats["latent_effective_max_abs_error"]
+            ) > 1e-6:
+                raise RuntimeError(
+                    "Clean-ECST C2 latent support changed in FirstBatch."
+                )
+            logger.log(
+                f"[Clean-ECST C2 NoHistory FirstBatch] epoch={int(epoch):03d} | "
+                f"sample_indices={sample_indices.tolist()} | "
+                f"schedule_scale={float(stats['schedule_scale']):.8f} | "
+                "history=disabled"
+            )
+            logger.log(
+                "[Clean-ECST C2 NoHistory FirstBatch] "
+                "positive_static_mean="
+                f"{float(stats['positive_static_evidence_mean']):.6f} | "
+                "negative_static_mean="
+                f"{float(stats['negative_static_evidence_mean']):.6f} | "
+                f"latent_support_mean={float(stats['latent_support_mean']):.6f} | "
+                f"latent_effective_mean={float(stats['latent_effective_mean']):.6f} | "
+                "latent_effective_max_abs_error="
+                f"{float(stats['latent_effective_max_abs_error']):.9g}"
+            )
+            logger.log(
+                "[Clean-ECST C2 NoHistory FirstBatch] teacher_fg_ratio="
+                f"{float(stats['teacher_fg_ratio']):.6f} | "
+                f"teacher_bg_ratio={float(stats['teacher_bg_ratio']):.6f} | "
+                "teacher_fg_weight_mean="
+                f"{float(stats['teacher_fg_effective_weight_mean']):.6f} | "
+                "teacher_bg_weight_mean="
+                f"{float(stats['teacher_bg_effective_weight_mean']):.6f} | "
+                "teacher_map_min/mean/max="
+                f"{float(stats['teacher_map_min']):.6f}/"
+                f"{float(stats['teacher_map_mean']):.6f}/"
+                f"{float(stats['teacher_map_max']):.6f} | "
+                "history_fields_consumed=False"
+            )
+            return
         logger.log(
             f"[Clean-ECST v5 FirstBatch] epoch={int(epoch):03d} | "
             f"version={getattr(cfg, 'ECST_CLEAN_VERSION', '')} | "
@@ -10571,6 +10695,36 @@ def save_checkpoint(
     torch.save(payload, path)
 
 
+def build_clean_ecst_checkpoint_extra(cfg, ecst_memory):
+    """Serialize Clean-ECST history only when the protocol actually uses it."""
+
+    if not bool(getattr(cfg, "USE_ECST_CLEAN", False)):
+        return None
+    history_enabled = ecst_clean_uses_history(cfg)
+    if not history_enabled:
+        if ecst_memory is not None:
+            raise RuntimeError(
+                "Clean-ECST C2 must not save an allocated temporal memory."
+            )
+        return {
+            "clean_ecst_checkpoint_schema": "clean_ecst_runtime_v1",
+            "clean_ecst_history_enabled": False,
+            "temporal_memory_initialized": False,
+            "temporal_memory_fetched": False,
+            "temporal_memory_updated": False,
+            "temporal_memory_saved": False,
+            "history_fields_consumed": False,
+        }
+    return {
+        "clean_ecst_checkpoint_schema": "clean_ecst_runtime_v1",
+        "clean_ecst_history_enabled": True,
+        "clean_ecst_temporal_memory": (
+            ecst_memory.state_dict() if ecst_memory is not None else None
+        ),
+        "temporal_memory_saved": ecst_memory is not None,
+    }
+
+
 def _pssf_bank_dtype(name):
     normalized = str(name).lower()
     if normalized == "float16":
@@ -13303,6 +13457,29 @@ def log_cache_summary(logger, cfg, train_dataset):
             logger.log("use_despl_pseudo = False")
             logger.log("use_fixed_in_pseudo = False")
             logger.log("fixed_used_for_training = False")
+    if getattr(cfg, "USE_DABE_CLEAN", False):
+        logger.log(
+            f"DABE-Clean cache path = {train_dataset.dabe_clean_cache_root}"
+        )
+        logger.log(
+            "first DABE-Clean cache file = "
+            f"{train_dataset.dabe_clean_first_cache_path}"
+        )
+        clean_static_source = get_dabe_clean_static_target_source(cfg)
+        logger.log(
+            f"DABE-Clean static target source = {clean_static_source}"
+        )
+        if clean_static_source == "dabe_v2_hard_68":
+            logger.log(
+                "DABE-v2 static cache path = "
+                f"{train_dataset.dabe_clean_dabe_v2_cache_root}"
+            )
+            logger.log(
+                "first DABE-v2 static cache file = "
+                f"{train_dataset.dabe_clean_dabe_v2_first_cache_path}"
+            )
+            logger.log("DABE-v2 static source key = p_dabe_68")
+            logger.log("DABE-v2 static threshold operator = strict > 0.5")
     if getattr(cfg, "USE_TCE", False):
         logger.log(f"TCE cover cache path = {train_dataset.tce_cover_cache_root}")
         logger.log(f"first TCE cover file = {train_dataset.tce_cover_first_cache_path}")
@@ -15075,6 +15252,54 @@ def validate_oed_baseline_contract(cfg, oed_config):
         raise RuntimeError("OED-v1 cannot be combined with AP-STCR, CVSA, or PSSF.")
 
 
+C2_PARENT_CONFIG = (
+    "configs/"
+    "dinov1_s8_dabe_clean_v1_dp_clean_ecst_v5_ab_contrec_"
+    "a1_residual_only_e25_a10_c25_dagp_uncgate_ndr_long45_lrfloor_2e5.py"
+)
+C2_ALLOWED_CONFIG_DIFFS = {
+    "EXP_NAME",
+    "ECST_CLEAN_VERSION",
+    "ECST_CLEAN_USE_HISTORY",
+}
+
+
+def audit_c2_config_difference(cfg):
+    """Enforce that C2 is exactly the authoritative A1 C3 minus history."""
+
+    if str(getattr(cfg, "ECST_CLEAN_VERSION", "")) != (
+        ECST_CLEAN_C2_NOHIST_VERSION
+    ):
+        return None
+    parent = load_config(Path(__file__).resolve().parent / C2_PARENT_CONFIG)
+    current_values = config_to_dict(cfg)
+    parent_values = config_to_dict(parent)
+    missing = object()
+    differences = {
+        key
+        for key in set(current_values).union(parent_values)
+        if current_values.get(key, missing) != parent_values.get(key, missing)
+    }
+    if differences != C2_ALLOWED_CONFIG_DIFFS:
+        raise RuntimeError(
+            "Clean-ECST C2 effective config must differ from its A1 C3 parent "
+            "only in EXP_NAME/ECST_CLEAN_VERSION/ECST_CLEAN_USE_HISTORY; "
+            f"actual={sorted(differences)}."
+        )
+    expected = {
+        "ECST_CLEAN_VERSION": ECST_CLEAN_C2_NOHIST_VERSION,
+        "ECST_CLEAN_USE_HISTORY": False,
+    }
+    mismatched = {
+        name: current_values.get(name)
+        for name, value in expected.items()
+        if current_values.get(name) != value
+    }
+    if mismatched:
+        raise RuntimeError(f"Clean-ECST C2 identity mismatch: {mismatched}.")
+    return tuple(sorted(differences))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train clean cached-DINO EMA baseline.")
     parser.add_argument("--config", required=True)
@@ -15116,6 +15341,7 @@ def main():
     teacher_routing_mode = validate_teacher_routing_config(cfg)
     ecst_minimal_enabled = validate_ecst_minimal_config(cfg)
     ecst_clean_enabled = validate_ecst_clean_config(cfg)
+    c2_config_differences = audit_c2_config_difference(cfg)
     dabe_clean_enabled = bool(getattr(cfg, "USE_DABE_CLEAN", False))
     dabe_clean_offline_enabled = dabe_clean_enabled and str(
         getattr(cfg, "DABE_CLEAN_VERSION", "")
@@ -15577,9 +15803,12 @@ def main():
             )
         if clean_version == "v2_contrec" and str(
             getattr(cfg, "ECST_CLEAN_VERSION", "")
-        ) != "v5_asym_continuous_recoverability":
+        ) not in {
+            "v5_asym_continuous_recoverability",
+            ECST_CLEAN_C2_NOHIST_VERSION,
+        }:
             raise RuntimeError(
-                "DABE-Clean v2-contrec is reserved for Clean-ECST v5."
+                "DABE-Clean v2-contrec is reserved for Clean-ECST v5/C2."
             )
         if clean_version == "v3_offline_consolidation":
             training_target_source = str(
@@ -15734,6 +15963,45 @@ def main():
             "bridge",
         }:
             raise RuntimeError(f"Unsupported DABE_CLEAN_TARGET_MODE={mode!r}.")
+        clean_static_target_source = get_dabe_clean_static_target_source(cfg)
+        if clean_static_target_source == "dabe_v2_hard_68":
+            hard_threshold = float(
+                getattr(cfg, "DABE_CLEAN_DABE_V2_HARD_THRESHOLD", float("nan"))
+            )
+            if not math.isfinite(hard_threshold) or abs(hard_threshold - 0.5) > 1e-12:
+                raise RuntimeError(
+                    "DABE-v2-hard static ablation requires "
+                    "DABE_CLEAN_DABE_V2_HARD_THRESHOLD=0.5."
+                )
+            if clean_version != "v1" or mode != "dp":
+                raise RuntimeError(
+                    "DABE-v2-hard static ablation must inherit the v1 Clean-DP "
+                    "cache protocol."
+                )
+            if str(
+                getattr(cfg, "DABE_CLEAN_DABE_V2_VERSION", "")
+            ).strip().lower() != "v2":
+                raise RuntimeError(
+                    "DABE-v2-hard static ablation requires "
+                    "DABE_CLEAN_DABE_V2_VERSION='v2'."
+                )
+            if not str(
+                getattr(cfg, "DABE_CLEAN_DABE_V2_ROOT", "")
+            ).strip():
+                raise RuntimeError(
+                    "DABE-v2-hard static ablation requires an explicit "
+                    "DABE_CLEAN_DABE_V2_ROOT."
+                )
+            if (
+                teacher_routing_mode != "ecst"
+                or not bool(getattr(cfg, "USE_ECST", False))
+                or bool(getattr(cfg, "USE_ECST_MINIMAL", False))
+                or bool(getattr(cfg, "USE_ECST_CLEAN", False))
+            ):
+                raise RuntimeError(
+                    "DABE-v2-hard static ablation is isolated to the preserved "
+                    "legacy full-ECST route of the requested baseline."
+                )
         legacy_regions = bool(
             getattr(cfg, "DABE_CLEAN_USE_LEGACY_ECST_REGIONS", False)
         )
@@ -16286,14 +16554,20 @@ def main():
                     "ECST_CLEAN_WEIGHT_MIN",
                     "ECST_CLEAN_WEIGHT_MAX",
                     "ECST_CLEAN_MARGIN_TAU",
-                    "ECST_CLEAN_TEMPORAL_RHO",
-                    "ECST_CLEAN_VARIANCE_TAU",
-                    "ECST_CLEAN_MIN_HISTORY",
-                    "ECST_CLEAN_MEMORY_DTYPE",
                     "ECST_CLEAN_APPLY_TO_FINAL",
                     "ECST_CLEAN_APPLY_TO_COARSE_AUX",
                     "ECST_CLEAN_APPLY_TO_BASE_AUX",
                 ]
+                clean_history_enabled = ecst_clean_uses_history(cfg)
+                if clean_history_enabled:
+                    clean_config_fields.extend(
+                        [
+                            "ECST_CLEAN_TEMPORAL_RHO",
+                            "ECST_CLEAN_VARIANCE_TAU",
+                            "ECST_CLEAN_MIN_HISTORY",
+                            "ECST_CLEAN_MEMORY_DTYPE",
+                        ]
+                    )
                 if bool(getattr(cfg, "ECST_CLEAN_USE_HARD_RING", True)):
                     clean_config_fields.append("ECST_CLEAN_RING_RADIUS")
                 for field in clean_config_fields:
@@ -16360,6 +16634,24 @@ def main():
                     "legacy_regions_loaded=False | static_weight_map_used=False | "
                     "routing_source=clean_dp_target_and_continuous_evidence"
                 )
+                if not clean_history_enabled:
+                    logger.log("[Clean-ECST C2 NoHistory]")
+                    logger.log(
+                        "version = "
+                        f"{getattr(cfg, 'ECST_CLEAN_VERSION', '')}"
+                    )
+                    logger.log("history_enabled = False")
+                    logger.log("temporal_memory_initialized = False")
+                    logger.log("signed_static_enabled = True")
+                    logger.log("latent_support_enabled = True")
+                    logger.log("latent_history_gate = disabled")
+                    logger.log(
+                        "teacher_direction_source = current_binary_teacher"
+                    )
+                    logger.log(
+                        "C2_CONFIG_DIFFS = "
+                        f"{list(c2_config_differences or ())}"
+                    )
             elif teacher_routing_mode == "bitc_v1":
                 logger.log("USE_BITC = True")
                 for field in (
@@ -17586,6 +17878,31 @@ def main():
                 logger.log(
                     f"DABE_CLEAN_TARGET_MODE = {getattr(cfg, 'DABE_CLEAN_TARGET_MODE', '')}"
                 )
+                clean_static_target_source = get_dabe_clean_static_target_source(cfg)
+                logger.log(
+                    "DABE_CLEAN_STATIC_TARGET_SOURCE = "
+                    f"{clean_static_target_source}"
+                )
+                if clean_static_target_source == "dabe_v2_hard_68":
+                    logger.log(
+                        "DABE_CLEAN_DABE_V2_ROOT = "
+                        f"{getattr(cfg, 'DABE_CLEAN_DABE_V2_ROOT')}"
+                    )
+                    logger.log(
+                        "DABE_CLEAN_DABE_V2_VERSION = "
+                        f"{getattr(cfg, 'DABE_CLEAN_DABE_V2_VERSION')}"
+                    )
+                    logger.log("DABE_CLEAN_DABE_V2_SOURCE_KEY = p_dabe_68")
+                    logger.log(
+                        "DABE_CLEAN_DABE_V2_HARD_THRESHOLD = "
+                        f"{float(getattr(cfg, 'DABE_CLEAN_DABE_V2_HARD_THRESHOLD')):.6f}"
+                    )
+                    logger.log(
+                        "STATIC_TARGET_SINGLE_VARIABLE = "
+                        "Clean-DP_68 -> 1[independent p_dabe_68 > 0.5]; "
+                        "legacy ECST regions/routing, schedule, Teacher, reset, "
+                        "DAGP and NDR unchanged"
+                    )
             logger.log(
                 f"DABE_CLEAN_ROOT = {getattr(cfg, 'DABE_CLEAN_ROOT', '')}"
             )
@@ -17743,13 +18060,29 @@ def main():
                         else "target_offline_68"
                     )
                     if dabe_clean_offline_enabled
-                    else f"dabe_clean_{clean_mode}_68"
+                    else (
+                        "dabe_v2_hard_68"
+                        if get_dabe_clean_static_target_source(cfg)
+                        == "dabe_v2_hard_68"
+                        else f"dabe_clean_{clean_mode}_68"
+                    )
                 )
                 logger.log(f"pseudo final candidate = {clean_candidate}")
-                logger.log(
-                    "p_init_formula = direct mean BCE(single continuous Clean target) "
-                    "+ full teacher binary BCE"
-                )
+                if (
+                    not dabe_clean_offline_enabled
+                    and get_dabe_clean_static_target_source(cfg)
+                    == "dabe_v2_hard_68"
+                ):
+                    logger.log(
+                        "p_init_formula = direct mean BCE("
+                        "1[independent p_dabe_68 > 0.5]) "
+                        "+ full teacher binary BCE"
+                    )
+                else:
+                    logger.log(
+                        "p_init_formula = direct mean BCE(single continuous Clean target) "
+                        "+ full teacher binary BCE"
+                    )
             logger.log("legacy_static_weight_map_used_for_training = False")
             logger.log("fixed_used_for_training = False")
 
@@ -17759,6 +18092,11 @@ def main():
         use_dabe = bool(getattr(cfg, "USE_DABE_PSEUDO", False))
         use_dabe_pu_cache = bool(getattr(cfg, "USE_DABE_PU", False))
         use_dabe_clean = bool(getattr(cfg, "USE_DABE_CLEAN", False))
+        dabe_clean_static_target_source = (
+            get_dabe_clean_static_target_source(cfg)
+            if use_dabe_clean
+            else "clean_target_68"
+        )
         teacher_only_no_offline_pseudo = (
             teacher_only_no_offline_pseudo_enabled(cfg)
         )
@@ -17807,6 +18145,12 @@ def main():
         use_ecst = teacher_routing_uses_ecst(cfg) and use_dabe_pu_despl_sched
         use_ecst_minimal_train = bool(ecst_minimal_enabled) and use_dabe_clean
         use_ecst_clean_train = bool(ecst_clean_enabled) and use_dabe_clean
+        clean_ecst_history_enabled = (
+            ecst_clean_uses_history(cfg) if use_ecst_clean_train else True
+        )
+        ecst_history_enabled = (
+            clean_ecst_history_enabled if use_ecst_clean_train else True
+        )
         use_source_arbiter_train = (
             bool(getattr(cfg, "USE_SOURCE_ARBITER", False)) and use_ecst
         )
@@ -17837,7 +18181,17 @@ def main():
             get_dabe_pu_despl_teacher_target_mode(cfg) if use_dabe_pu_despl_sched else "binary"
         )
         dabe_pu_despl_static_target_mode = (
-            get_dabe_pu_despl_static_target_mode(cfg) if use_dabe_pu_despl_sched else "soft"
+            "hard_from_dabe_v2"
+            if (
+                use_dabe_pu_despl_sched
+                and use_dabe_clean
+                and dabe_clean_static_target_source == "dabe_v2_hard_68"
+            )
+            else (
+                get_dabe_pu_despl_static_target_mode(cfg)
+                if use_dabe_pu_despl_sched
+                else "soft"
+            )
         )
         complex_post_reset_scheduler = str(
             getattr(cfg, "COMPLEX_HEAD_POST_RESET_SCHEDULER", "original_iter_steplr")
@@ -19096,7 +19450,7 @@ def main():
 
         lr_floor_activated_logged = False
         ecst_memory = None
-        if use_ecst:
+        if use_ecst and ecst_history_enabled:
             memory_update_end = int(
                 getattr(
                     cfg,
@@ -19114,13 +19468,27 @@ def main():
                     or resume_pending_after_reset
                 )
             )
-            if args.resume and start_epoch <= memory_update_end and not use_source_arbiter_train:
+            clean_resume_needs_active_memory = bool(
+                use_ecst_clean_train
+                and args.resume
+                and start_epoch <= memory_update_end
+            )
+            if (
+                args.resume
+                and start_epoch <= memory_update_end
+                and not use_source_arbiter_train
+                and not use_ecst_clean_train
+            ):
                 raise RuntimeError(
                     "Cannot resume ECST inside its temporal-memory update window: "
                     f"start_epoch={start_epoch}, update_end={memory_update_end}. "
                     "Existing checkpoints do not contain ECST temporal memory."
                 )
-            if start_epoch <= memory_update_end or resume_needs_active_memory:
+            if (
+                start_epoch <= memory_update_end
+                or resume_needs_active_memory
+                or clean_resume_needs_active_memory
+            ):
                 ecst_memory = ECSTTemporalTeacherMemory(
                     num_samples=len(train_dataset),
                     height=int(cfg.LOSS_SIZE),
@@ -19148,6 +19516,18 @@ def main():
                             f"{temporal_memory_key}."
                         )
                     ecst_memory.load_state_dict(state)
+                elif clean_resume_needs_active_memory:
+                    state = checkpoint.get("clean_ecst_temporal_memory")
+                    if state is None:
+                        raise RuntimeError(
+                            "History-enabled Clean-ECST resume inside the memory "
+                            "window requires clean_ecst_temporal_memory."
+                        )
+                    ecst_memory.load_state_dict(state)
+                    logger.log(
+                        "[Clean-ECST Resume] temporal memory restored=True | "
+                        f"start_epoch={start_epoch}"
+                    )
                 memory_bytes = (
                     ecst_memory.mean.numel() * ecst_memory.mean.element_size()
                     + ecst_memory.second.numel() * ecst_memory.second.element_size()
@@ -19177,6 +19557,16 @@ def main():
                     f"start_epoch={start_epoch} | update_end={memory_update_end} | "
                     "memory_active=False"
                 )
+        elif use_ecst and use_ecst_clean_train:
+            if ecst_memory is not None:
+                raise RuntimeError(
+                    "Clean-ECST C2 must not initialize TemporalTeacherMemory."
+                )
+            logger.log(
+                "[Clean-ECST C2 NoHistory] temporal_memory_initialized=False | "
+                "temporal_memory_fetched=False | temporal_memory_updated=False | "
+                "temporal_memory_saved=False | history_fields_consumed=False"
+            )
         elif use_bitc_train:
             logger.log(
                 "[BITC] mode=bitc_v1 | ECST temporal memory initialized=False | "
@@ -20449,8 +20839,46 @@ def main():
                         pu_target_soft = batch[clean_training_target_key].to(
                             device, non_blocking=True
                         ).float().detach()
-                    pu_static_source_target = pu_target_soft
-                    pu_static_target = pu_target_soft
+                    if dabe_clean_offline_enabled:
+                        pu_static_target = pu_target_soft
+                    else:
+                        selected_clean_static_source_68 = pu_target_soft
+                        if dabe_clean_static_target_source == "dabe_v2_hard_68":
+                            missing_dabe_v2_fields = sorted(
+                                {
+                                    "dabe_clean_dabe_v2_soft_68",
+                                    "dabe_clean_static_target_68",
+                                }.difference(batch)
+                            )
+                            if missing_dabe_v2_fields:
+                                raise RuntimeError(
+                                    "DABE-v2-hard Clean batch is missing fields: "
+                                    f"{missing_dabe_v2_fields}."
+                                )
+                            selected_clean_static_source_68 = batch[
+                                "dabe_clean_dabe_v2_soft_68"
+                            ].to(device, non_blocking=True).float().detach()
+                        pu_static_target = build_dabe_clean_static_target(
+                            cfg,
+                            pu_target_soft,
+                            selected_clean_static_source_68,
+                        )
+                        if dabe_clean_static_target_source == "dabe_v2_hard_68":
+                            expected_static_target = batch[
+                                "dabe_clean_static_target_68"
+                            ].to(device, non_blocking=True).float().detach()
+                            if not torch.equal(
+                                pu_static_target,
+                                expected_static_target,
+                            ) or not torch.equal(pseudo_68, expected_static_target):
+                                raise RuntimeError(
+                                    "DABE-v2-hard static target/pseudo invariant "
+                                    "failed."
+                                )
+                            # Keep every generic pseudo-target diagnostic aligned
+                            # with the target that actually enters static BCE.
+                            pseudo_68 = pu_static_target
+                    pu_static_source_target = pu_static_target
                     if dabe_clean_offline_enabled:
                         pu_static_weight_map = None
                         batch_static_weight_mode = "pure_offline_no_static_map"
@@ -20461,15 +20889,30 @@ def main():
                             pu_static_target, requires_grad=False
                         )
                         batch_static_weight_mode = "clean_internal_ones_diagnostic"
-                    hard_thresh = float(getattr(cfg, "DABE_PU_HARD_THRESH", 0.5))
-                    pu_target_hard = (pu_target_soft > hard_thresh).float()
+                    hard_thresh = (
+                        float(
+                            getattr(
+                                cfg,
+                                "DABE_CLEAN_DABE_V2_HARD_THRESHOLD",
+                                0.5,
+                            )
+                        )
+                        if dabe_clean_static_target_source == "dabe_v2_hard_68"
+                        else float(getattr(cfg, "DABE_PU_HARD_THRESH", 0.5))
+                    )
+                    pu_target_hard = (pu_static_target > hard_thresh).float()
                     dabe_pu_static_source = (
                         "none_teacher_only"
                         if teacher_only_no_offline_pseudo
                         else (
                             "target_offline_68"
                             if dabe_clean_offline_enabled
-                            else f"dabe_clean_{str(getattr(cfg, 'DABE_CLEAN_TARGET_MODE', '')).lower()}_68"
+                            else (
+                                "dabe_v2_hard_68"
+                                if dabe_clean_static_target_source
+                                == "dabe_v2_hard_68"
+                                else f"dabe_clean_{str(getattr(cfg, 'DABE_CLEAN_TARGET_MODE', '')).lower()}_68"
+                            )
                         )
                     )
                     clean_tensors = [("target", pu_static_target)]
@@ -21650,7 +22093,32 @@ def main():
                             20,
                         )
                     )
-                    if int(epoch) <= update_end:
+                    if use_ecst_clean_train and not clean_ecst_history_enabled:
+                        if ecst_memory is not None:
+                            raise RuntimeError(
+                                "Clean-ECST C2 unexpectedly has temporal memory."
+                            )
+                        teacher_route_map, ecst_stats = (
+                            build_ecst_clean_teacher_weight_map(
+                                cfg=cfg,
+                                batch=batch,
+                                teacher_prob=teacher_prob.detach(),
+                                epoch=epoch,
+                                device=device,
+                            )
+                        )
+                        if ecst_stats.get("history_fields_consumed") is not False:
+                            raise RuntimeError(
+                                "Clean-ECST C2 consumed history fields."
+                            )
+                        if float(
+                            ecst_stats["latent_effective_max_abs_error"]
+                        ) > 1e-6:
+                            raise RuntimeError(
+                                "Clean-ECST C2 latent-support identity failed."
+                            )
+                        ecst_stats["memory_active"] = False
+                    elif int(epoch) <= update_end:
                         if ecst_memory is None:
                             raise RuntimeError(
                                 "ECST temporal memory was released before its update window ended."
@@ -25387,7 +25855,11 @@ def main():
                         f"cssd_scale={cssd_scale_epoch:.8f}."
                     )
 
-                if use_ecst and not use_source_arbiter_train:
+                if (
+                    use_ecst
+                    and ecst_history_enabled
+                    and not use_source_arbiter_train
+                ):
                     update_start = int(
                         getattr(
                             cfg,
@@ -25817,7 +26289,12 @@ def main():
                     dabe_aware_loss_area_guard_sum += float(loss_area_guard.detach().item())
                     dabe_aware_stat_batches += 1
                 if use_dabe_pu:
-                    dabe_pu_target_mean_sum += float(pu_target_soft.detach().mean().item())
+                    target_for_epoch_log = (
+                        pu_static_target if use_dabe_clean else pu_target_soft
+                    )
+                    dabe_pu_target_mean_sum += float(
+                        target_for_epoch_log.detach().mean().item()
+                    )
                     if use_dabe_clean:
                         dabe_pu_weight_mean_sum += 1.0
                         if not dabe_clean_offline_enabled:
@@ -27674,6 +28151,7 @@ def main():
                         f"version={getattr(cfg, 'DABE_CLEAN_VERSION', 'v1') if use_dabe_clean else getattr(cfg, 'DABE_PU_VERSION', 'pu_v11')} | "
                         f"p_init_mode={getattr(cfg, 'P_INIT_MODE', 'dabe_pu_v11')} | "
                         f"target_mode={getattr(cfg, 'DABE_CLEAN_TARGET_MODE', 'legacy_pu') if use_dabe_clean else 'legacy_pu'} | "
+                        f"static_target_source={dabe_pu_static_source} | "
                         f"static_weight={static_weight_log:.2f} | "
                         f"teacher_weight={teacher_weight_log:.2f} | "
                         f"target_mean={dabe_pu_target_mean_sum / stat_batches:.6f} | "
@@ -27743,6 +28221,7 @@ def main():
                         logger.log(
                             f"[{'DABE-Clean-Schedule' if use_dabe_clean else 'DABE-PU-DesplSched'}] epoch={epoch:03d} | "
                             f"static_target_mode={dabe_pu_despl_static_target_mode} | "
+                            f"static_target_source={dabe_pu_static_source} | "
                             f"teacher_target_mode={dabe_pu_despl_teacher_target_mode} | "
                             f"static_weight={static_weight_log:.2f} | "
                             f"teacher_weight={teacher_weight_log:.2f} | "
@@ -27949,18 +28428,23 @@ def main():
                             "add_strength": directional_strengths["add"],
                             "ring_bg_strength": directional_strengths["ring_bg"],
                             "recovery_strength": recovery_strength,
+                            "history_enabled": clean_ecst_history_enabled,
                             "memory_active_ratio": ecst_epoch_accumulator[
                                 "memory_active_batches"
                             ]
                             / ecst_batches,
-                            "history_count_mean": ecst_epoch_accumulator[
-                                "history_count_mean_sum"
-                            ]
-                            / ecst_batches,
-                            "history_valid_ratio": ecst_epoch_accumulator[
-                                "history_valid_ratio_sum"
-                            ]
-                            / ecst_batches,
+                            "history_count_mean": (
+                                ecst_epoch_accumulator["history_count_mean_sum"]
+                                / ecst_batches
+                                if clean_ecst_history_enabled
+                                else None
+                            ),
+                            "history_valid_ratio": (
+                                ecst_epoch_accumulator["history_valid_ratio_sum"]
+                                / ecst_batches
+                                if clean_ecst_history_enabled
+                                else None
+                            ),
                             "support_area_mean": ecst_epoch_accumulator[
                                 "clean_support_area_sum"
                             ]
@@ -28005,10 +28489,14 @@ def main():
                                 "clean_semantic_fg_tendency_sum"
                             ]
                             / ecst_batches,
-                            "history_bg_reliability_mean": ecst_epoch_accumulator[
-                                "clean_history_bg_reliability_sum"
-                            ]
-                            / ecst_batches,
+                            "history_bg_reliability_mean": (
+                                ecst_epoch_accumulator[
+                                    "clean_history_bg_reliability_sum"
+                                ]
+                                / ecst_batches
+                                if clean_ecst_history_enabled
+                                else None
+                            ),
                             "negative_weight_mean": ecst_epoch_accumulator[
                                 "clean_negative_weight_sum"
                             ]
@@ -28063,6 +28551,14 @@ def main():
                             / ecst_batches,
                             "recoverability_mean": ecst_epoch_accumulator[
                                 "clean_recoverability_sum"
+                            ]
+                            / ecst_batches,
+                            "latent_support_mean": ecst_epoch_accumulator[
+                                "clean_latent_support_sum"
+                            ]
+                            / ecst_batches,
+                            "latent_effective_mean": ecst_epoch_accumulator[
+                                "clean_latent_effective_sum"
                             ]
                             / ecst_batches,
                             "teacher_fg_ratio": ecst_epoch_accumulator[
@@ -28245,7 +28741,10 @@ def main():
                             f"{clean_ecst_row['teacher_loss_base']:.6f} | "
                             "legacy_pu_cache_used=False | legacy_regions_loaded=False"
                         )
-                        if strength_mode == "directional_continuous":
+                        if (
+                            strength_mode == "directional_continuous"
+                            and clean_ecst_history_enabled
+                        ):
                             logger.log(
                                 f"[Clean-ECST v5] epoch={epoch:03d} | "
                                 f"schedule_scale={clean_ecst_row['schedule_scale']:.8f} | "
@@ -28291,6 +28790,43 @@ def main():
                                 "student/teacher_pred_area="
                                 f"{clean_ecst_row['student_pred_area']:.6f}/"
                                 f"{clean_ecst_row['teacher_pred_area']:.6f}"
+                            )
+                        if (
+                            strength_mode == "directional_continuous"
+                            and not clean_ecst_history_enabled
+                        ):
+                            latent_mean_error = abs(
+                                clean_ecst_row["latent_support_mean"]
+                                - clean_ecst_row["latent_effective_mean"]
+                            )
+                            if latent_mean_error > 1e-6:
+                                raise RuntimeError(
+                                    "Clean-ECST C2 epoch latent support changed."
+                                )
+                            logger.log(
+                                f"[Clean-ECST C2 NoHistory] epoch={epoch:03d} | "
+                                f"schedule_scale={clean_ecst_row['schedule_scale']:.8f} | "
+                                "history=disabled | memory_active_ratio="
+                                f"{clean_ecst_row['memory_active_ratio']:.6f} | "
+                                "positive/negative_static_mean="
+                                f"{clean_ecst_row['positive_static_evidence_mean']:.6f}/"
+                                f"{clean_ecst_row['negative_static_evidence_mean']:.6f} | "
+                                f"latent_support_mean={clean_ecst_row['latent_support_mean']:.6f} | "
+                                f"latent_effective_mean={clean_ecst_row['latent_effective_mean']:.6f} | "
+                                "teacher_fg/bg_ratio="
+                                f"{clean_ecst_row['teacher_fg_ratio']:.6f}/"
+                                f"{clean_ecst_row['teacher_bg_ratio']:.6f}"
+                            )
+                            logger.log(
+                                f"[Clean-ECST C2 NoHistory] epoch={epoch:03d} | "
+                                "teacher_bg/teacher_fg_weight_mean="
+                                f"{clean_ecst_row['teacher_bg_effective_weight_mean']:.6f}/"
+                                f"{clean_ecst_row['teacher_fg_effective_weight_mean']:.6f} | "
+                                "teacher_map_min/mean/max="
+                                f"{clean_ecst_row['effective_map_min']:.6f}/"
+                                f"{clean_ecst_row['effective_map_mean']:.6f}/"
+                                f"{clean_ecst_row['effective_map_max']:.6f} | "
+                                "history_fields_consumed=False"
                             )
                         if clean_ecst_audit_path is None:
                             raise RuntimeError("Clean-ECST audit CSV path is unavailable.")
@@ -30025,6 +30561,11 @@ def main():
                     protocol_fingerprint=ap_stcr_protocol_fingerprint,
                     train_loader_generator=train_loader_generator,
                 )
+            elif use_ecst_clean_train:
+                epoch_checkpoint_extra = build_clean_ecst_checkpoint_extra(
+                    cfg,
+                    ecst_memory,
+                )
             else:
                 epoch_checkpoint_extra = (
                     build_source_arbiter_checkpoint_extra(
@@ -30186,7 +30727,7 @@ def main():
                         "temporal_history_allocated=False | "
                         "cross_reset_target_used=False"
                     )
-                if use_ecst and bool(
+                if use_ecst and ecst_history_enabled and bool(
                     getattr(
                         cfg,
                         "ECST_CLEAN_RESET_MEMORY_AT_FINETUNE_RESET"
@@ -30208,6 +30749,16 @@ def main():
                         )
                         +
                         f"epoch={epoch:03d}"
+                    )
+                elif use_ecst_clean_train and not clean_ecst_history_enabled:
+                    if ecst_memory is not None:
+                        raise RuntimeError(
+                            "Clean-ECST C2 allocated memory before reset."
+                        )
+                    logger.log(
+                        "[Clean-ECST C2 NoHistory] finetune reset | "
+                        "temporal_memory_allocated=False | "
+                        "temporal_memory_reset_skipped=True"
                     )
                 if use_source_arbiter_train:
                     if route_memory is not None:

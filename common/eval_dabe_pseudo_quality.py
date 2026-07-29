@@ -286,6 +286,31 @@ def _binary_stats(gt, prob, threshold):
     }
 
 
+def _soft_region_stats(gt, prob):
+    prob = prob.float().clamp(0.0, 1.0)
+    gt = (gt > 0.5).float()
+    intersection = float((prob * gt).sum().item())
+    pred_mass = float(prob.sum().item())
+    gt_mass = float(gt.sum().item())
+    union_mass = pred_mass + gt_mass - intersection
+    if union_mass == 0.0:
+        iou = 1.0
+    else:
+        iou = intersection / union_mass
+    if pred_mass == 0.0:
+        precision = 1.0 if gt_mass == 0.0 else 0.0
+    else:
+        precision = intersection / pred_mass
+    recall = 1.0 if gt_mass == 0.0 else intersection / gt_mass
+    return {
+        "IoU": float(iou),
+        "Precision": float(precision),
+        "Recall": float(recall),
+        "area_ratio": float(prob.mean().item()),
+        "num_components": None,
+    }
+
+
 def _cod_result(gt, prob, threshold):
     binary = (prob > float(threshold)).float()
     metrics = CODMetrics()
@@ -301,6 +326,27 @@ def _cod_result(gt, prob, threshold):
         **stats,
         "area": stats["area_ratio"],
         "components": stats["num_components"],
+        "fallback_count": 0,
+        "small_area_count": 0,
+        "large_area_count": 0,
+        "num_samples": 1,
+    }
+
+
+def _cod_soft_result(gt, prob):
+    metrics = CODMetrics()
+    metrics.step(gt.unsqueeze(0), prob.unsqueeze(0))
+    result = metrics.get_result()
+    stats = _soft_region_stats(gt, prob)
+    return {
+        "S_m": float(result["SMeasure"]),
+        "F_beta^w": float(result["WFM"]),
+        "F_beta^m": float(result["F_MEAN"]),
+        "E_phi^m": float(result["E_MEAN"]),
+        "MAE": float(result["MAE"]),
+        **stats,
+        "area": stats["area_ratio"],
+        "components": None,
         "fallback_count": 0,
         "small_area_count": 0,
         "large_area_count": 0,
@@ -357,6 +403,53 @@ class Accumulator:
         }
 
 
+class SoftAccumulator:
+    def __init__(self):
+        self.metrics = CODMetrics()
+        self.ious = []
+        self.precisions = []
+        self.recalls = []
+        self.areas = []
+        self.fallback_count = 0
+        self.small_area_count = 0
+        self.large_area_count = 0
+        self.count = 0
+
+    def step(self, gt, prob, threshold, fallback=False, small_area=False, large_area=False):
+        del threshold
+        self.metrics.step(gt.unsqueeze(0), prob.unsqueeze(0))
+        stats = _soft_region_stats(gt, prob)
+        self.ious.append(stats["IoU"])
+        self.precisions.append(stats["Precision"])
+        self.recalls.append(stats["Recall"])
+        self.areas.append(stats["area_ratio"])
+        self.fallback_count += int(bool(fallback))
+        self.small_area_count += int(bool(small_area))
+        self.large_area_count += int(bool(large_area))
+        self.count += 1
+
+    def result(self):
+        result = self.metrics.get_result()
+        return {
+            "S_m": float(result["SMeasure"]),
+            "F_beta^w": float(result["WFM"]),
+            "F_beta^m": float(result["F_MEAN"]),
+            "E_phi^m": float(result["E_MEAN"]),
+            "MAE": float(result["MAE"]),
+            "IoU": float(np.mean(self.ious)) if self.ious else 0.0,
+            "Precision": float(np.mean(self.precisions)) if self.precisions else 0.0,
+            "Recall": float(np.mean(self.recalls)) if self.recalls else 0.0,
+            "area_ratio": float(np.mean(self.areas)) if self.areas else 0.0,
+            "area": float(np.mean(self.areas)) if self.areas else 0.0,
+            "num_components": None,
+            "components": None,
+            "fallback_count": int(self.fallback_count),
+            "small_area_count": int(self.small_area_count),
+            "large_area_count": int(self.large_area_count),
+            "num_samples": int(self.count),
+        }
+
+
 def _make_summary_row(scope, dataset, method, accumulator, dabe_version=""):
     return {
         "scope": scope,
@@ -401,6 +494,8 @@ def method_meta_version(method, primary_version):
         return "gc"
     if method == "DABE-v2":
         return "v2"
+    if method == "DABE-v2-soft":
+        return "v2_soft"
     if method == "DABE-v3.1":
         return "v3_1"
     if method.startswith("DABE-"):
@@ -455,6 +550,7 @@ def eval_dabe_pseudo_quality(
     compare_dabe_rac_root="",
     compare_dabe_rac_safe_root="",
     compare_dabe_pu_root="",
+    include_dabe_v2_soft=False,
     out_dir="../workdir/dabe_v2_offline_eval",
     threshold=0.5,
     logger=print,
@@ -496,6 +592,10 @@ def eval_dabe_pseudo_quality(
         dabe_v2_map = _safe_manifest_map(dabe_v2_manifest, "DABE-v2", logger)
         if dabe_v2_map is not None and "DABE-v2" not in methods:
             methods.append("DABE-v2")
+    if include_dabe_v2_soft:
+        if "DABE-v2" not in methods:
+            raise RuntimeError("DABE-v2-soft requires DABE-v2 as the primary or comparison cache.")
+        methods.insert(methods.index("DABE-v2") + 1, "DABE-v2-soft")
     if compare_dabe_v31_root:
         dabe_v31_manifest = Path(compare_dabe_v31_root).expanduser() / f"manifest_{split}.jsonl"
         dabe_v31_map = _safe_manifest_map(dabe_v31_manifest, "DABE-v3.1", logger)
@@ -537,8 +637,11 @@ def eval_dabe_pseudo_quality(
     logger(f"methods = {', '.join(methods)}")
     logger(f"num_items = {len(items)}")
 
-    by_dataset = defaultdict(lambda: {method: Accumulator() for method in methods})
-    overall = {method: Accumulator() for method in methods}
+    def _make_accumulator(method):
+        return SoftAccumulator() if method == "DABE-v2-soft" else Accumulator()
+
+    by_dataset = defaultdict(lambda: {method: _make_accumulator(method) for method in methods})
+    overall = {method: _make_accumulator(method) for method in methods}
     per_sample_rows = []
     pu_diag_rows = []
 
@@ -599,6 +702,9 @@ def eval_dabe_pseudo_quality(
                     "cache_path": dabe_map[key]["cache_path"],
                 }
             }
+            if primary_method == "DABE-v2" and "DABE-v2-soft" in methods:
+                tensors["DABE-v2-soft"] = dabe_prob
+                method_meta["DABE-v2-soft"] = dict(method_meta["DABE-v2"])
 
         if "DABE-PU-v1" in methods and method_meta.get("DABE-PU-v1") is None:
             if dabe_pu_map is None or key not in dabe_pu_map:
@@ -674,6 +780,9 @@ def eval_dabe_pseudo_quality(
                 "large_area_flag": bool(dabe_v2_payload.get("large_area_flag", False)),
                 "cache_path": dabe_v2_map[key]["cache_path"],
             }
+            if "DABE-v2-soft" in methods:
+                tensors["DABE-v2-soft"] = tensors["DABE-v2"]
+                method_meta["DABE-v2-soft"] = dict(method_meta["DABE-v2"])
 
         if "DABE-v3.1" in methods and method_meta.get("DABE-v3.1") is None:
             if dabe_v31_map is None or key not in dabe_v31_map:
@@ -752,7 +861,11 @@ def eval_dabe_pseudo_quality(
                 small_area=small_area,
                 large_area=large_area,
             )
-            sample_values = _cod_result(gt, tensors[method], threshold)
+            sample_values = (
+                _cod_soft_result(gt, tensors[method])
+                if method == "DABE-v2-soft"
+                else _cod_result(gt, tensors[method], threshold)
+            )
             sample_values["fallback_count"] = int(fallback)
             sample_values["large_area_count"] = int(large_area)
             per_sample_rows.append(
@@ -818,6 +931,23 @@ def eval_dabe_pseudo_quality(
             "compare_dabe_rac_root": str(Path(compare_dabe_rac_root).expanduser().resolve()) if compare_dabe_rac_root else "",
             "compare_dabe_rac_safe_root": str(Path(compare_dabe_rac_safe_root).expanduser().resolve()) if compare_dabe_rac_safe_root else "",
             "compare_dabe_pu_root": str(Path(compare_dabe_pu_root).expanduser().resolve()) if compare_dabe_pu_root else "",
+            "dabe_v2_soft_protocol": (
+                {
+                    "enabled": True,
+                    "source": "bilinear-resized p_dabe_68",
+                    "cod_pred_normalization": "per_image_minmax",
+                    "soft_region_stats": {
+                        "intersection": "sum(p * gt)",
+                        "precision": "intersection / sum(p)",
+                        "recall": "intersection / sum(gt)",
+                        "iou": "intersection / (sum(p) + sum(gt) - intersection)",
+                        "area": "mean(p)",
+                    },
+                    "components": None,
+                }
+                if include_dabe_v2_soft
+                else {"enabled": False}
+            ),
             "methods": methods,
             "overall": {row["method"]: row for row in summary_rows},
             "pu_diagnostics": pu_diag_rows if is_pu else [],
@@ -838,12 +968,14 @@ def eval_dabe_pseudo_quality(
         _write_csv(pu_diag_csv_path, PU_DIAG_FIELDS, pu_diag_rows)
 
     for row in summary_rows:
+        components_text = "N/A" if row["num_components"] is None else f"{row['num_components']:.2f}"
         logger(
             f"[Quality] {row['method']} | S_m={row['S_m']:.4f} | "
             f"Fw={row['F_beta^w']:.4f} | E={row['E_phi^m']:.4f} | "
             f"MAE={row['MAE']:.4f} | IoU={row['IoU']:.4f} | "
             f"Precision={row['Precision']:.4f} | Recall={row['Recall']:.4f} | "
-            f"Area={row['area_ratio']:.4f} | components={row['num_components']:.2f} | "
+            f"Area={row['area_ratio']:.4f} | "
+            f"components={components_text} | "
             f"fallback_count={row['fallback_count']} | "
             f"small_area_count={row['small_area_count']} | "
             f"large_area_count={row['large_area_count']} | n={row['num_samples']}"
@@ -877,6 +1009,7 @@ def main():
     parser.add_argument("--compare_dabe_rac_root", default="")
     parser.add_argument("--compare_dabe_rac_safe_root", default="")
     parser.add_argument("--compare_dabe_pu_root", default="")
+    parser.add_argument("--include_dabe_v2_soft", action="store_true")
     parser.add_argument("--out_dir", default="../workdir/dabe_v2_offline_eval")
     parser.add_argument("--threshold", type=float, default=0.5)
     args = parser.parse_args()
@@ -900,6 +1033,7 @@ def main():
         compare_dabe_rac_root=args.compare_dabe_rac_root,
         compare_dabe_rac_safe_root=args.compare_dabe_rac_safe_root,
         compare_dabe_pu_root=args.compare_dabe_pu_root,
+        include_dabe_v2_soft=args.include_dabe_v2_soft,
         out_dir=args.out_dir,
         threshold=args.threshold,
         logger=print,

@@ -769,6 +769,66 @@ def _load_dabe_pseudo(row, expected_dataset, expected_stem, cfg):
     return out
 
 
+def _load_dabe_clean_dabe_v2_static(row, expected_dataset, expected_stem, cfg):
+    """Load the exact independent DABE-v2 p_dabe_68 static source."""
+
+    payload = torch_load(row["cache_path"], map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(
+            f"DABE-v2 static payload must be a dict: {row['cache_path']}"
+        )
+    if (
+        str(payload.get("dataset")) != str(expected_dataset)
+        or str(payload.get("stem")) != str(expected_stem)
+    ):
+        raise RuntimeError(
+            "DABE-v2 static identity mismatch | "
+            f"expected={expected_dataset}/{expected_stem} | "
+            f"actual={payload.get('dataset')}/{payload.get('stem')} | "
+            f"cache={row['cache_path']}"
+        )
+    if str(payload.get("backbone_key")) != str(cfg.BACKBONE_KEY):
+        raise RuntimeError(
+            f"DABE-v2 static backbone mismatch: {row['cache_path']}"
+        )
+    expected_version = str(
+        getattr(cfg, "DABE_CLEAN_DABE_V2_VERSION", "v2")
+    ).strip().lower()
+    if str(payload.get("dabe_version", "")).strip().lower() != expected_version:
+        raise RuntimeError(
+            "DABE-v2 static version mismatch: "
+            f"{payload.get('dabe_version')} != {expected_version} | "
+            f"{row['cache_path']}"
+        )
+    soft = payload.get("p_dabe_68")
+    if not torch.is_tensor(soft):
+        raise RuntimeError(
+            f"DABE-v2 static payload is missing p_dabe_68: {row['cache_path']}"
+        )
+    soft = soft.detach().cpu().float()
+    expected_shape = (1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE))
+    if tuple(soft.shape) != expected_shape:
+        raise RuntimeError(
+            f"DABE-v2 p_dabe_68 shape mismatch: {list(soft.shape)} != "
+            f"{list(expected_shape)} | {row['cache_path']}"
+        )
+    _validate_unit_range(soft, "p_dabe_68", row["cache_path"])
+    if soft.requires_grad or not bool(torch.isfinite(soft).all().item()):
+        raise RuntimeError(
+            f"DABE-v2 p_dabe_68 must be finite and detached: {row['cache_path']}"
+        )
+    threshold = float(
+        getattr(cfg, "DABE_CLEAN_DABE_V2_HARD_THRESHOLD", 0.5)
+    )
+    hard = (soft > threshold).float().detach()
+    return {
+        "dabe_v2_soft_68": soft,
+        "dabe_v2_hard_68": hard,
+        "dabe_v2_source_key": "p_dabe_68",
+        "dabe_v2_version": expected_version,
+    }
+
+
 def _dabe_payload_first_tensor(payload, keys):
     for key in keys:
         value = payload.get(key)
@@ -1556,6 +1616,21 @@ class CachedTrainDataset(Dataset):
         self.use_dabe_pseudo = bool(getattr(cfg, "USE_DABE_PSEUDO", False))
         self.use_dabe_pu = bool(getattr(cfg, "USE_DABE_PU", False))
         self.use_dabe_clean = bool(getattr(cfg, "USE_DABE_CLEAN", False))
+        self.dabe_clean_static_target_source = str(
+            getattr(cfg, "DABE_CLEAN_STATIC_TARGET_SOURCE", "clean_target_68")
+        ).strip().lower()
+        if self.dabe_clean_static_target_source not in {
+            "clean_target_68",
+            "dabe_v2_hard_68",
+        }:
+            raise RuntimeError(
+                "Unsupported DABE_CLEAN_STATIC_TARGET_SOURCE="
+                f"{self.dabe_clean_static_target_source!r}."
+            )
+        self.use_dabe_clean_dabe_v2_hard = (
+            self.use_dabe_clean
+            and self.dabe_clean_static_target_source == "dabe_v2_hard_68"
+        )
         self.use_ecst_clean = bool(getattr(cfg, "USE_ECST_CLEAN", False))
         self.use_dabe_clean_offline = self.use_dabe_clean and str(
             getattr(cfg, "DABE_CLEAN_VERSION", "")
@@ -1887,6 +1962,9 @@ class CachedTrainDataset(Dataset):
         self.dabe_clean_map = None
         self.dabe_clean_cache_root = None
         self.dabe_clean_first_cache_path = None
+        self.dabe_clean_dabe_v2_map = None
+        self.dabe_clean_dabe_v2_cache_root = None
+        self.dabe_clean_dabe_v2_first_cache_path = None
         self.found_static_map = None
         self.found_static_cache_root = None
         self.dabe_clean_legacy_region_map = None
@@ -2076,6 +2154,44 @@ class CachedTrainDataset(Dataset):
             self.dabe_clean_cache_root = ""
             self.actual_pseudo_cache_root = ""
             self.actual_pseudo_cache_pattern = "not_used_teacher_only"
+        if self.use_dabe_clean_dabe_v2_hard:
+            if self.use_dabe_clean_offline or self.use_teacher_only_no_offline_pseudo:
+                raise RuntimeError(
+                    "DABE-v2-hard static source requires the regular v1 "
+                    "DABE-Clean path."
+                )
+            dabe_v2_root = Path(
+                str(getattr(cfg, "DABE_CLEAN_DABE_V2_ROOT", "")).strip()
+            )
+            if not str(dabe_v2_root) or str(dabe_v2_root) == ".":
+                raise RuntimeError(
+                    "DABE-v2-hard static source requires "
+                    "DABE_CLEAN_DABE_V2_ROOT."
+                )
+            dabe_v2_manifest = dabe_v2_root / "manifest_train.jsonl"
+            dabe_v2_rows = read_jsonl(dabe_v2_manifest)
+            self.dabe_clean_dabe_v2_map = manifest_to_map(
+                dabe_v2_rows,
+                dabe_v2_manifest,
+            )
+            if max_samples < 0:
+                check_exact_keys(
+                    "DABE-Clean independent DABE-v2 static cache",
+                    self.dabe_clean_dabe_v2_map.keys(),
+                    self.keys,
+                )
+            else:
+                missing_dabe_v2 = sorted(
+                    set(self.keys) - set(self.dabe_clean_dabe_v2_map)
+                )
+                if missing_dabe_v2:
+                    raise RuntimeError(
+                        "DABE-Clean independent DABE-v2 static cache missing "
+                        f"first 10: {missing_dabe_v2[:10]}"
+                    )
+            self.dabe_clean_dabe_v2_cache_root = str(
+                dabe_v2_manifest.parent.resolve()
+            )
         if self.dabe_clean_use_legacy_regions:
             legacy_manifest = dabe_clean_legacy_region_manifest_path(cfg)
             legacy_rows = read_jsonl(legacy_manifest)
@@ -2309,21 +2425,49 @@ class CachedTrainDataset(Dataset):
                 if self.use_dabe_clean_offline
                 else "dabe_clean_target_68"
             )
-            self.pseudo_shape = list(dabe_clean_payload[clean_target_key].shape)
-            self.pseudo_source = str(dabe_clean_payload["dabe_clean_version"])
-            self.pseudo_final_candidate = (
-                "FOUND fixed 28x28 -> bilinear 68x68 + DESPL-style full "
-                "binary EMA Teacher"
-                if self.use_found_static
-                else (
-                    f"single continuous DABE target ({self.dabe_clean_target_mode}) "
-                    "+ DESPL-style full binary EMA Teacher"
-                )
-            )
             self.dabe_clean_first_cache_path = first_clean_map[
                 (first_dataset, first_stem)
             ]["cache_path"]
-            self.first_pseudo_cache_path = self.dabe_clean_first_cache_path
+            if self.use_dabe_clean_dabe_v2_hard:
+                dabe_v2_static = _load_dabe_clean_dabe_v2_static(
+                    self.dabe_clean_dabe_v2_map[(first_dataset, first_stem)],
+                    first_dataset,
+                    first_stem,
+                    cfg,
+                )
+                self.pseudo_shape = list(
+                    dabe_v2_static["dabe_v2_hard_68"].shape
+                )
+                self.pseudo_source = "independent_dabe_v2_p_dabe_68_hard"
+                self.pseudo_final_candidate = (
+                    "1[independent DABE-v2 p_dabe_68 > 0.5] + "
+                    "DESPL-style full binary EMA Teacher"
+                )
+                self.dabe_clean_dabe_v2_first_cache_path = (
+                    self.dabe_clean_dabe_v2_map[
+                        (first_dataset, first_stem)
+                    ]["cache_path"]
+                )
+                self.first_pseudo_cache_path = (
+                    self.dabe_clean_dabe_v2_first_cache_path
+                )
+            else:
+                self.pseudo_shape = list(
+                    dabe_clean_payload[clean_target_key].shape
+                )
+                self.pseudo_source = str(
+                    dabe_clean_payload["dabe_clean_version"]
+                )
+                self.pseudo_final_candidate = (
+                    "FOUND fixed 28x28 -> bilinear 68x68 + DESPL-style full "
+                    "binary EMA Teacher"
+                    if self.use_found_static
+                    else (
+                        f"single continuous DABE target ({self.dabe_clean_target_mode}) "
+                        "+ DESPL-style full binary EMA Teacher"
+                    )
+                )
+                self.first_pseudo_cache_path = self.dabe_clean_first_cache_path
             if self.dabe_clean_use_legacy_regions:
                 _load_dabe_clean_legacy_regions(
                     self.dabe_clean_legacy_region_map[(first_dataset, first_stem)],
@@ -2693,7 +2837,19 @@ class CachedTrainDataset(Dataset):
                 if self.use_dabe_clean_offline
                 else "dabe_clean_target_68"
             )
-            pseudo = dabe_clean_payload[clean_target_key].float()
+            dabe_clean_dabe_v2_static = None
+            if self.use_dabe_clean_dabe_v2_hard:
+                dabe_clean_dabe_v2_static = _load_dabe_clean_dabe_v2_static(
+                    self.dabe_clean_dabe_v2_map[key],
+                    dataset,
+                    stem,
+                    self.cfg,
+                )
+                pseudo = dabe_clean_dabe_v2_static[
+                    "dabe_v2_hard_68"
+                ].float()
+            else:
+                pseudo = dabe_clean_payload[clean_target_key].float()
             pseudo_base = pseudo
             pseudo_safe = pseudo
             p_init_area = float(pseudo.mean().item())
@@ -2935,6 +3091,36 @@ class CachedTrainDataset(Dataset):
                         "fixed_used_for_training": False,
                     }
                 )
+                if self.use_dabe_clean_dabe_v2_hard:
+                    if dabe_clean_dabe_v2_static is None:
+                        raise RuntimeError(
+                            "DABE-v2-hard static payload was not materialized."
+                        )
+                    sample.update(
+                        {
+                            "dabe_clean_dabe_v2_soft_68": (
+                                dabe_clean_dabe_v2_static[
+                                    "dabe_v2_soft_68"
+                                ].float()
+                            ),
+                            "dabe_clean_static_target_68": (
+                                dabe_clean_dabe_v2_static[
+                                    "dabe_v2_hard_68"
+                                ].float()
+                            ),
+                            "dabe_clean_static_target_source": (
+                                "independent_dabe_v2_p_dabe_68_gt_0.5"
+                            ),
+                        }
+                    )
+                    if not torch.equal(
+                        sample["pseudo"],
+                        sample["dabe_clean_static_target_68"],
+                    ):
+                        raise RuntimeError(
+                            "DABE-v2-hard Dataset requires pseudo == "
+                            "dabe_clean_static_target_68."
+                        )
                 for field in (
                     "dabe_clean_p_rw_37",
                     "dabe_clean_evidence_gate_37",

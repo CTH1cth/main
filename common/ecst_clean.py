@@ -18,6 +18,7 @@ ECST_CLEAN_V2_VERSION = "v2_early_r2_strength15"
 ECST_CLEAN_V3_VERSION = "v3_instant_full_r2_strength15_ablation"
 ECST_CLEAN_V4_VERSION = "v4_directional_asymmetric_strength"
 ECST_CLEAN_V5_VERSION = "v5_asym_continuous_recoverability"
+ECST_CLEAN_C2_NOHIST_VERSION = "c2_signed_latent_no_history"
 # Backward-compatible public alias used by the existing v1 tests/config.
 ECST_CLEAN_VERSION = ECST_CLEAN_V1_VERSION
 ECST_CLEAN_VERSION_CONTRACTS = {
@@ -61,6 +62,16 @@ ECST_CLEAN_VERSION_CONTRACTS = {
         "use_hard_ring": False,
         "recovery_mode": "latent_rw_geometric_mean",
     },
+    ECST_CLEAN_C2_NOHIST_VERSION: {
+        "start_epoch": 5,
+        "ramp_end_epoch": 10,
+        "strength_mode": "directional_continuous",
+        "erase_strength": 2.5,
+        "add_strength": 1.0,
+        "recovery_strength": 2.5,
+        "use_hard_ring": False,
+        "recovery_mode": "latent_rw_geometric_mean",
+    },
 }
 LEGACY_REGION_KEYS = {
     "legacy_ecst_fg_core",
@@ -88,6 +99,16 @@ def _require_close(cfg, name, expected, atol=1e-12):
     if abs(value - float(expected)) > float(atol):
         raise RuntimeError(f"{name} must equal {expected}, got {value}.")
     return value
+
+
+def ecst_clean_uses_history(cfg):
+    """Return the explicit Clean-ECST history lifecycle switch.
+
+    Existing configurations predate the switch and therefore retain their
+    exact history-enabled behaviour through the default value ``True``.
+    """
+
+    return bool(getattr(cfg, "ECST_CLEAN_USE_HISTORY", True))
 
 
 def validate_ecst_clean_config(cfg):
@@ -125,18 +146,34 @@ def validate_ecst_clean_config(cfg):
             f"{sorted(ECST_CLEAN_VERSION_CONTRACTS)}."
         )
     version_contract = ECST_CLEAN_VERSION_CONTRACTS[version]
+    use_history = ecst_clean_uses_history(cfg)
+    if version == ECST_CLEAN_C2_NOHIST_VERSION:
+        if use_history:
+            raise RuntimeError(
+                "Clean-ECST C2 requires ECST_CLEAN_USE_HISTORY=False."
+            )
+    elif not use_history:
+        raise RuntimeError(
+            "ECST_CLEAN_USE_HISTORY=False is reserved for the isolated "
+            f"{ECST_CLEAN_C2_NOHIST_VERSION!r} ablation."
+        )
 
     integer_contract = {
         "ECST_CLEAN_START_EPOCH": version_contract["start_epoch"],
         "ECST_CLEAN_RAMP_END_EPOCH": version_contract["ramp_end_epoch"],
         "ECST_CLEAN_STOP_EPOCH": 21,
-        "ECST_CLEAN_MEMORY_UPDATE_START_EPOCH": 1,
-        "ECST_CLEAN_MEMORY_UPDATE_END_EPOCH": 20,
-        "ECST_CLEAN_MIN_HISTORY": 3,
         "MAX_EPOCH": 45,
         "STOP_AFTER_EPOCH": 0,
         "SAVE_INTERVAL": 1,
     }
+    if use_history:
+        integer_contract.update(
+            {
+                "ECST_CLEAN_MEMORY_UPDATE_START_EPOCH": 1,
+                "ECST_CLEAN_MEMORY_UPDATE_END_EPOCH": 20,
+                "ECST_CLEAN_MIN_HISTORY": 3,
+            }
+        )
     if bool(version_contract.get("use_hard_ring", True)):
         integer_contract["ECST_CLEAN_RING_RADIUS"] = version_contract[
             "ring_radius"
@@ -148,14 +185,19 @@ def validate_ecst_clean_config(cfg):
         if value != expected:
             raise RuntimeError(f"{name} must equal {expected}, got {value}.")
     float_contract = {
-        "ECST_CLEAN_TEMPORAL_RHO": 0.90,
-        "ECST_CLEAN_VARIANCE_TAU": 0.02,
         "ECST_CLEAN_CONFLICT_FLOOR": 0.20,
         "ECST_CLEAN_NEGATIVE_WEIGHT_FLOOR": 0.25,
         "ECST_CLEAN_MARGIN_TAU": 0.05,
         "ECST_CLEAN_WEIGHT_MIN": 0.20,
         "ECST_CLEAN_WEIGHT_MAX": 1.00,
     }
+    if use_history:
+        float_contract.update(
+            {
+                "ECST_CLEAN_TEMPORAL_RHO": 0.90,
+                "ECST_CLEAN_VARIANCE_TAU": 0.02,
+            }
+        )
     for name, expected in float_contract.items():
         _require_close(cfg, name, expected)
     strength_mode = str(
@@ -222,16 +264,24 @@ def validate_ecst_clean_config(cfg):
                 f"ECST_CLEAN_RECOVERY_MODE must equal "
                 f"{version_contract['recovery_mode']!r}, got {recovery_mode!r}."
             )
-    if str(getattr(cfg, "ECST_CLEAN_MEMORY_DTYPE", "")).lower() != "float16":
+    if use_history and str(
+        getattr(cfg, "ECST_CLEAN_MEMORY_DTYPE", "")
+    ).lower() != "float16":
         raise RuntimeError("ECST_CLEAN_MEMORY_DTYPE must equal 'float16'.")
-    for name in (
-        "ECST_CLEAN_USE_PREUPDATE_STATS",
-        "ECST_CLEAN_RESET_MEMORY_AT_FINETUNE_RESET",
+    required_true = [
         "ECST_CLEAN_APPLY_TO_FINAL",
         "ECST_CLEAN_APPLY_TO_COARSE_AUX",
         "ECST_CLEAN_APPLY_TO_BASE_AUX",
         "SAVE_EVERY_EPOCH",
-    ):
+    ]
+    if use_history:
+        required_true.extend(
+            [
+                "ECST_CLEAN_USE_PREUPDATE_STATS",
+                "ECST_CLEAN_RESET_MEMORY_AT_FINETUNE_RESET",
+            ]
+        )
+    for name in required_true:
         if not bool(getattr(cfg, name, False)):
             raise RuntimeError(f"Clean-ECST requires {name}=True.")
     if str(getattr(cfg, "DABE_CLEAN_STATIC_WEIGHT_MODE", "")).lower() != "ones":
@@ -610,11 +660,11 @@ def build_ecst_clean_continuous_teacher_weight_map(
     cfg,
     batch,
     teacher_prob,
-    temporal_mean,
-    temporal_second,
-    history_count,
-    epoch,
-    device,
+    temporal_mean=None,
+    temporal_second=None,
+    history_count=None,
+    epoch=None,
+    device=None,
     return_states=False,
 ):
     """Build v5's threshold-free static evidence and continuous recovery route."""
@@ -631,6 +681,8 @@ def build_ecst_clean_continuous_teacher_weight_map(
     if missing:
         raise KeyError(f"Clean-ECST v5 batch is missing fields: {missing}.")
 
+    if device is None:
+        device = teacher_prob.device
     teacher = teacher_prob.detach().to(device=device).float()
     if teacher.ndim != 4 or int(teacher.shape[1]) != 1:
         raise RuntimeError(
@@ -644,13 +696,39 @@ def build_ecst_clean_continuous_teacher_weight_map(
     )
     _validate_probability("target_dp_68", target, expected)
     _validate_probability("recoverability_68", recoverability, expected)
-    temporal = build_clean_history_bg_reliability(
-        temporal_mean.detach().to(device).float(),
-        temporal_second.detach().to(device).float(),
-        history_count.detach().to(device),
-        min_history=int(getattr(cfg, "ECST_CLEAN_MIN_HISTORY", 3)),
-        variance_tau=float(getattr(cfg, "ECST_CLEAN_VARIANCE_TAU", 0.02)),
-    )
+    use_history = ecst_clean_uses_history(cfg)
+    history_inputs = (temporal_mean, temporal_second, history_count)
+    if use_history:
+        if any(value is None for value in history_inputs):
+            raise RuntimeError(
+                "History-enabled Clean-ECST requires mean, second and count."
+            )
+        temporal = build_clean_history_bg_reliability(
+            temporal_mean.detach().to(device).float(),
+            temporal_second.detach().to(device).float(),
+            history_count.detach().to(device),
+            min_history=int(getattr(cfg, "ECST_CLEAN_MIN_HISTORY", 3)),
+            variance_tau=float(getattr(cfg, "ECST_CLEAN_VARIANCE_TAU", 0.02)),
+        )
+        latent_effective = (
+            recoverability * (1.0 - temporal["history_bg_reliability"])
+        ).detach()
+    else:
+        if any(value is not None for value in history_inputs):
+            raise RuntimeError(
+                "Clean-ECST C2 forbids placeholder or computed history inputs."
+            )
+        temporal = None
+        latent_effective = recoverability
+        if not torch.allclose(
+            latent_effective,
+            recoverability,
+            atol=1e-6,
+            rtol=0.0,
+        ):
+            raise RuntimeError(
+                "Clean-ECST C2 latent support was altered without history."
+            )
 
     signed_static = (2.0 * target - 1.0).detach()
     positive_static_evidence = signed_static.clamp_min(0.0).detach()
@@ -672,11 +750,17 @@ def build_ecst_clean_continuous_teacher_weight_map(
     erase_suppression = (
         scale * strengths["erase"] * erase_suppression_raw
     ).clamp(0.0, suppression_max).detach()
-    recovery_suppression_raw = (
-        (1.0 - negative_floor)
-        * recoverability
-        * (1.0 - temporal["history_bg_reliability"])
-    ).detach()
+    if use_history:
+        # Preserve the original v5 operation order for bit-compatible C3 maps.
+        recovery_suppression_raw = (
+            (1.0 - negative_floor)
+            * recoverability
+            * (1.0 - temporal["history_bg_reliability"])
+        ).detach()
+    else:
+        recovery_suppression_raw = (
+            (1.0 - negative_floor) * latent_effective
+        ).detach()
     recovery_suppression = (
         scale * strengths["recovery"] * recovery_suppression_raw
     ).clamp(0.0, suppression_max).detach()
@@ -727,13 +811,11 @@ def build_ecst_clean_continuous_teacher_weight_map(
         "recovery_strength": float(strengths["recovery"]),
         "ring_bg_strength": None,
         "hard_ring_used": False,
-        "memory_active": True,
-        "history_count_min": int(history_count.min().detach().item()),
-        "history_count_mean": float(history_count.float().mean().detach().item()),
-        "history_count_max": int(history_count.max().detach().item()),
-        "history_valid_ratio": float(
-            temporal["history_valid"].float().mean().detach().item()
-        ),
+        "history_enabled": use_history,
+        "memory_active": use_history,
+        "history_fields_consumed": use_history,
+        "temporal_memory_fetched": use_history,
+        "latent_history_gate": "enabled" if use_history else "disabled",
         "positive_static_evidence_mean": float(
             positive_static_evidence.mean().item()
         ),
@@ -741,6 +823,11 @@ def build_ecst_clean_continuous_teacher_weight_map(
             negative_static_evidence.mean().item()
         ),
         "recoverability_mean": float(recoverability.mean().item()),
+        "latent_support_mean": float(recoverability.mean().item()),
+        "latent_effective_mean": float(latent_effective.mean().item()),
+        "latent_effective_max_abs_error": float(
+            (latent_effective - recoverability).abs().max().item()
+        ),
         "teacher_fg_ratio": float(teacher_fg.float().mean().item()),
         "teacher_bg_ratio": float(teacher_bg.float().mean().item()),
         "erase_suppression_mass": float(
@@ -815,15 +902,6 @@ def build_ecst_clean_continuous_teacher_weight_map(
         "semantic_fg_tendency_min": semantic_mean,
         "semantic_fg_tendency_mean": semantic_mean,
         "semantic_fg_tendency_max": semantic_mean,
-        "history_bg_reliability_min": float(
-            temporal["history_bg_reliability"].min().item()
-        ),
-        "history_bg_reliability_mean": float(
-            temporal["history_bg_reliability"].mean().item()
-        ),
-        "history_bg_reliability_max": float(
-            temporal["history_bg_reliability"].max().item()
-        ),
         "negative_weight_mean": float(recovery_weight.mean().item()),
         "conflict_weight_mean": float(erase_weight.mean().item()),
         "add_effective_weight_mean": _masked_mean(
@@ -844,6 +922,28 @@ def build_ecst_clean_continuous_teacher_weight_map(
         "fg_prototype_fallback_count": 0,
         "bg_prototype_fallback_count": 0,
     }
+    if use_history:
+        stats.update(
+            {
+                "history_count_min": int(history_count.min().detach().item()),
+                "history_count_mean": float(
+                    history_count.float().mean().detach().item()
+                ),
+                "history_count_max": int(history_count.max().detach().item()),
+                "history_valid_ratio": float(
+                    temporal["history_valid"].float().mean().detach().item()
+                ),
+                "history_bg_reliability_min": float(
+                    temporal["history_bg_reliability"].min().item()
+                ),
+                "history_bg_reliability_mean": float(
+                    temporal["history_bg_reliability"].mean().item()
+                ),
+                "history_bg_reliability_max": float(
+                    temporal["history_bg_reliability"].max().item()
+                ),
+            }
+        )
     states = {
         "signed_static": signed_static.detach(),
         "positive_static_evidence": positive_static_evidence.detach(),
@@ -851,10 +951,8 @@ def build_ecst_clean_continuous_teacher_weight_map(
         "teacher_fg": teacher_fg.detach(),
         "teacher_bg": teacher_bg.detach(),
         "recoverability_68": recoverability.detach(),
-        "history_mean": temporal["mean"].detach(),
-        "history_variance": temporal["variance"].detach(),
-        "history_valid": temporal["history_valid"].detach(),
-        "history_bg_reliability": temporal["history_bg_reliability"].detach(),
+        "latent_support": recoverability.detach(),
+        "latent_effective": latent_effective.detach(),
         "erase_suppression_raw": erase_suppression_raw.detach(),
         "erase_suppression": erase_suppression.detach(),
         "recovery_suppression_raw": recovery_suppression_raw.detach(),
@@ -866,6 +964,31 @@ def build_ecst_clean_continuous_teacher_weight_map(
         "teacher_fg_weight": teacher_fg_weight.detach(),
         "effective_map": effective_map.detach(),
     }
+    if use_history:
+        states.update(
+            {
+                "history_mean": temporal["mean"].detach(),
+                "history_variance": temporal["variance"].detach(),
+                "history_valid": temporal["history_valid"].detach(),
+                "history_bg_reliability": temporal[
+                    "history_bg_reliability"
+                ].detach(),
+            }
+        )
+    else:
+        if stats["history_fields_consumed"]:
+            raise RuntimeError("Clean-ECST C2 consumed history fields.")
+        if effective_map.requires_grad:
+            raise RuntimeError("Clean-ECST C2 Teacher map must be detached.")
+        if not bool(torch.isfinite(effective_map).all().item()):
+            raise RuntimeError("Clean-ECST C2 Teacher map contains NaN/Inf.")
+        map_min = float(effective_map.min().item())
+        map_max = float(effective_map.max().item())
+        if map_min < weight_min - 1e-6 or map_max > 1.0 + 1e-6:
+            raise RuntimeError(
+                "Clean-ECST C2 Teacher map is outside its fixed bounds: "
+                f"{map_min}/{map_max}."
+            )
     if return_states:
         return effective_map, stats, states
     return effective_map, stats
@@ -875,11 +998,11 @@ def build_ecst_clean_teacher_weight_map(
     cfg,
     batch,
     teacher_prob,
-    temporal_mean,
-    temporal_second,
-    history_count,
-    epoch,
-    device,
+    temporal_mean=None,
+    temporal_second=None,
+    history_count=None,
+    epoch=None,
+    device=None,
     return_states=False,
 ):
     validate_ecst_clean_config(cfg)
