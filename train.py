@@ -39,6 +39,22 @@ from common.dabe_clean_offline import (
     DABE_CLEAN_OFFLINE_MODES,
     DABE_CLEAN_OFFLINE_PAYLOAD_VERSION,
 )
+from common.dabev2hard_noecst_control import (
+    is_strict_control_config as is_dabev2hard_noecst_strict_control,
+    validate_strict_control_config as validate_dabev2hard_noecst_strict_control,
+)
+from common.dabev2hard_clean_ecst_v5_control import (
+    is_dabev2hard_clean_ecst_v5_control,
+    validate_dabev2hard_clean_ecst_v5_control,
+)
+from common.dabev2hard_static_only import (
+    is_dabev2hard_static_only_config,
+    validate_dabev2hard_static_only_config,
+)
+from common.r1hard_linear_pure_student import (
+    is_r1hard_dagp_ndr_pure_student_config,
+    is_r1hard_linear_pure_student_config,
+)
 from common.found_static import (
     FOUND_STATIC_RESIZE_MODE,
     FOUND_STATIC_SOURCE,
@@ -57,6 +73,14 @@ from common.ecst import (
     build_ecst_teacher_weight_map_from_states,
     get_ecst_scale,
 )
+from common.ecst_causal_audit import (
+    ECST_CAUSAL_CONTROL_SEED,
+    build_spatial_roll_map,
+    compute_gradient_magnitude_match_scalar,
+    get_ecst_causal_control_mode,
+    gradient_magnitude_matched_global_bce,
+    validate_ecst_causal_audit_config,
+)
 from common.ecst_clean import (
     ECST_CLEAN_C2_NOHIST_VERSION,
     build_ecst_clean_teacher_weight_map,
@@ -72,6 +96,22 @@ from common.ecst_minimal import (
     build_ecst_minimal_teacher_weight_map,
     get_ecst_minimal_scale,
     validate_ecst_minimal_config,
+)
+from common.ectp import (
+    accumulate_ectp_epoch,
+    build_ectp_projected_target,
+    finalize_ectp_epoch,
+    new_ectp_epoch_accumulator,
+    validate_ectp_config,
+)
+from common.eaogp import (
+    accumulate_eaogp_epoch,
+    build_eaogp_target,
+    build_same_source_background_evidence,
+    finalize_eaogp_epoch,
+    get_eaogp_scale,
+    new_eaogp_epoch_accumulator,
+    validate_eaogp_config,
 )
 from common.source_arbiter import (
     RouteTrajectoryMemory,
@@ -112,6 +152,8 @@ from common.teacher_routing import (
     LEGACY_TEACHER_ROUTING_MODE,
     accumulate_teacher_routing,
     build_identity_teacher_route,
+    eaogp_teacher_bce_with_logits,
+    ectp_teacher_bce_with_logits,
     finalize_teacher_routing,
     get_teacher_routing_mode,
     new_teacher_routing_accumulator,
@@ -1357,6 +1399,17 @@ def validate_pssf_config(cfg):
 
 def resolve_epoch_supervision_for_training(cfg, epoch, use_pure_despl=False):
     """Resolve legacy handover state without touching it on the PSSF path."""
+    if is_dabev2hard_static_only_config(cfg):
+        return {
+            "fixed_weight": 1.0,
+            "teacher_weight": 0.0,
+            "fusion_mode": "dabe_v2_hard_static_only",
+            "effective_despl_weight": 1.0,
+            "effective_teacher_weight": 0.0,
+            "target_mode": "dabe_v2_hard_static_only",
+            "teacher_binary_used": False,
+        }
+
     if use_pssf(cfg):
         supervision_mode = (
             "ppse_v2_state" if use_ppse_v2(cfg) else "pssf_state"
@@ -1829,6 +1882,8 @@ def get_dabe_pu_balanced_v2_schedule(epoch, cfg):
 
 def get_dabe_pu_despl_schedule(epoch, cfg):
     epoch = int(epoch)
+    if is_dabev2hard_static_only_config(cfg):
+        return 1.0, 0.0
     handover_mode = get_supervision_handover_mode(cfg)
     teacher_only_start = int(
         getattr(cfg, "DABE_PU_DESPL_TEACHER_ONLY_START", get_reset_epoch(cfg) + 1)
@@ -1987,13 +2042,26 @@ def get_dabe_clean_static_target_source(cfg):
     source = str(
         getattr(cfg, "DABE_CLEAN_STATIC_TARGET_SOURCE", "clean_target_68")
     ).strip().lower()
-    allowed = {"clean_target_68", "dabe_v2_hard_68"}
+    allowed = {
+        "clean_target_68",
+        "dabe_v2_hard_68",
+        "dabe_v2_r1_hard_68",
+        "cvbr_v1_second_ring_hard_68",
+    }
     if source not in allowed:
         raise RuntimeError(
             "Unsupported DABE_CLEAN_STATIC_TARGET_SOURCE="
             f"{source!r}; expected one of {sorted(allowed)}."
         )
     return source
+
+
+def uses_independent_dabe_v2_hard_source(source):
+    return str(source).strip().lower() in {
+        "dabe_v2_hard_68",
+        "dabe_v2_r1_hard_68",
+        "cvbr_v1_second_ring_hard_68",
+    }
 
 
 def build_dabe_clean_static_target(
@@ -2164,7 +2232,7 @@ def teacher_routing_apply_flag(cfg, branch):
     if branch not in suffixes:
         raise ValueError(f"Unsupported teacher routing branch: {branch}")
     routing_mode = get_teacher_routing_mode(cfg)
-    if routing_mode == "none":
+    if routing_mode in {"none", "ectp", "eaogp"}:
         return True
     if routing_mode == "bitc_v1":
         fields = {
@@ -4108,6 +4176,10 @@ def apply_finetune_reset(
     if reset_global_step:
         global_step = 0
     if reset_teacher:
+        if teacher is None:
+            raise RuntimeError(
+                "FINETUNE_RESET_TEACHER=True is incompatible with a pure-Student run."
+            )
         teacher.load_state_dict(student.state_dict())
         for p in teacher.parameters():
             p.requires_grad_(False)
@@ -4273,7 +4345,10 @@ def forward_seg_head(
     return_aux=False,
     bg_reliable_68=None,
     pa_compare_original=False,
+    return_eaogp_aux=False,
 ):
+    if return_eaogp_aux and not use_dagp_safe_head(cfg):
+        raise RuntimeError("EAOGP auxiliary output requires HEAD_TYPE='dagp_safe'.")
     if use_cacd(cfg):
         return model(
             model_input,
@@ -4298,6 +4373,7 @@ def forward_seg_head(
             image_68=image_68,
             return_aux=return_aux,
             pa_compare_original=pa_compare_original,
+            return_eaogp_aux=return_eaogp_aux,
         )
     return model(model_input)
 
@@ -7036,6 +7112,20 @@ def teacher_route_bce_with_logits(
 ):
     """Apply the active teacher router without coupling ECST to legacy routing."""
     routing_mode = get_teacher_routing_mode(cfg)
+    if routing_mode == "ectp":
+        if not bool(apply_to_loss):
+            raise RuntimeError(
+                "ECTP must apply the same projected Teacher target to "
+                "final/coarse/base; branch-level disabling is forbidden"
+            )
+        return ectp_teacher_bce_with_logits(logits, target, teacher_map)
+    if routing_mode == "eaogp":
+        if not bool(apply_to_loss):
+            raise RuntimeError(
+                "EAOGP must apply one shared effective Teacher target to "
+                "final/coarse/base; branch-level disabling is forbidden."
+            )
+        return eaogp_teacher_bce_with_logits(logits, target, teacher_map)
     if routing_mode == "none":
         if teacher_map is None:
             raise RuntimeError("No-ECST teacher route map is unavailable")
@@ -7056,6 +7146,10 @@ def teacher_route_bce_with_logits(
             raise RuntimeError(
                 "TEACHER_ROUTING_MODE='none' requires an exact detached all-one map"
             )
+        if is_dabev2hard_static_only_config(cfg):
+            # Keep the shadow Teacher forward/EMA for diagnostics and checkpoint
+            # compatibility, but remove its BCE from every Student loss branch.
+            return logits.sum() * 0.0
         return F.binary_cross_entropy_with_logits(logits, target, reduction="mean")
     if routing_mode == "bitc_v1":
         if teacher_map is None:
@@ -7080,6 +7174,23 @@ def teacher_route_bce_with_logits(
     if routing_mode in {"ecst", "minimal_ecst", "clean_ecst"} or bool(
         getattr(cfg, "USE_ECST", False)
     ):
+        causal_control_mode = get_ecst_causal_control_mode(cfg)
+        if causal_control_mode == "gradient_magnitude_global":
+            if routing_mode != "ecst":
+                raise RuntimeError(
+                    "ECST GMG causal control is valid only for Full ECST."
+                )
+            if not bool(apply_to_loss) or float(routing_scale) <= 0.0:
+                return F.binary_cross_entropy_with_logits(
+                    logits, target, reduction="mean"
+                )
+            loss, _ = gradient_magnitude_matched_global_bce(
+                logits,
+                target,
+                teacher_map.to(device=logits.device, dtype=logits.dtype),
+                eps=eps,
+            )
+            return loss
         return teacher_weighted_bce_with_logits(
             logits,
             target,
@@ -10678,7 +10789,7 @@ def save_checkpoint(
         "epoch": epoch,
         "backbone_key": cfg.BACKBONE_KEY,
         "student": student.state_dict(),
-        "teacher": teacher.state_dict(),
+        "teacher": teacher.state_dict() if teacher is not None else None,
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "best_metric": best_metric,
@@ -13469,7 +13580,7 @@ def log_cache_summary(logger, cfg, train_dataset):
         logger.log(
             f"DABE-Clean static target source = {clean_static_source}"
         )
-        if clean_static_source == "dabe_v2_hard_68":
+        if uses_independent_dabe_v2_hard_source(clean_static_source):
             logger.log(
                 "DABE-v2 static cache path = "
                 f"{train_dataset.dabe_clean_dabe_v2_cache_root}"
@@ -13478,7 +13589,10 @@ def log_cache_summary(logger, cfg, train_dataset):
                 "first DABE-v2 static cache file = "
                 f"{train_dataset.dabe_clean_dabe_v2_first_cache_path}"
             )
-            logger.log("DABE-v2 static source key = p_dabe_68")
+            logger.log(
+                "DABE-v2 static source key = "
+                f"{getattr(cfg, 'DABE_CLEAN_DABE_V2_SOURCE_KEY', 'p_dabe_68')}"
+            )
             logger.log("DABE-v2 static threshold operator = strict > 0.5")
     if getattr(cfg, "USE_TCE", False):
         logger.log(f"TCE cover cache path = {train_dataset.tce_cover_cache_root}")
@@ -15326,6 +15440,18 @@ def main():
         raise ValueError("--resume cannot be combined with --debug_loader_only.")
 
     cfg = load_config(args.config)
+    ecst_causal_control_mode = get_ecst_causal_control_mode(cfg)
+    if ecst_causal_control_mode != "none":
+        causal_baseline_path = Path(__file__).resolve().parent / "configs" / (
+            "dinov1_s8_dabe_clean_v1_dp_dabev2hard_ecst_"
+            "dagp_uncgate_ndr_long45_lrfloor_2e5.py"
+        )
+        ecst_causal_control_audit = validate_ecst_causal_audit_config(
+            cfg,
+            baseline_cfg=load_config(causal_baseline_path),
+        )
+    else:
+        ecst_causal_control_audit = validate_ecst_causal_audit_config(cfg)
     oed_config = validate_oed_config(cfg)
     validate_oed_baseline_contract(cfg, oed_config)
     oed_enabled = str(oed_config["mode"]) != "none"
@@ -15339,6 +15465,56 @@ def main():
     if bitc_debug_enabled and not bitc_enabled:
         raise RuntimeError("--debug_bitc requires a BITC-v1 configuration.")
     teacher_routing_mode = validate_teacher_routing_config(cfg)
+    ectp_enabled = bool(getattr(cfg, "USE_ECTP", False))
+    ectp_config_audit = (
+        validate_ectp_config(cfg) if ectp_enabled else None
+    )
+    eaogp_enabled = bool(getattr(cfg, "USE_EAOGP", False))
+    eaogp_config_audit = (
+        validate_eaogp_config(cfg) if eaogp_enabled else None
+    )
+    dabev2hard_noecst_control_audit = (
+        validate_dabev2hard_noecst_strict_control(cfg)
+    )
+    dabev2hard_static_only_audit = (
+        validate_dabev2hard_static_only_config(cfg)
+    )
+    pure_student_static_only = is_r1hard_linear_pure_student_config(cfg)
+    r1hard_dagp_ndr_pure_student = (
+        is_r1hard_dagp_ndr_pure_student_config(cfg)
+    )
+    if pure_student_static_only and dabev2hard_static_only_audit is None:
+        raise RuntimeError(
+            "Hard-R1 linear pure-Student config must pass its static-only audit."
+        )
+    dabev2hard_clean_ecst_v5_audit = (
+        validate_dabev2hard_clean_ecst_v5_control(cfg)
+    )
+    if dabev2hard_noecst_control_audit is not None:
+        strict_runtime_overrides = {
+            "pseudo_cache_override": args.pseudo_cache_override,
+            "max_samples": sample_limit if int(sample_limit) != -1 else None,
+            "max_epochs": args.max_epochs,
+            "stop_after_epoch": (
+                int(args.stop_after_epoch)
+                if int(args.stop_after_epoch) != 0
+                else None
+            ),
+            "debug_loader_only": True if args.debug_loader_only else None,
+            "work_dir": args.work_dir,
+            "resume": args.resume,
+        }
+        strict_runtime_overrides = {
+            name: value
+            for name, value in strict_runtime_overrides.items()
+            if value is not None
+        }
+        if strict_runtime_overrides:
+            raise RuntimeError(
+                "DABE-v2-hard no-ECST strict control forbids runtime protocol "
+                f"overrides: {strict_runtime_overrides}. Start the full run from "
+                "the config-defined initialization and output directory."
+            )
     ecst_minimal_enabled = validate_ecst_minimal_config(cfg)
     ecst_clean_enabled = validate_ecst_clean_config(cfg)
     c2_config_differences = audit_c2_config_difference(cfg)
@@ -15952,7 +16128,14 @@ def main():
             )
         if not bool(getattr(cfg, "USE_DABE_CLEAN_DESPL_SCHEDULE", False)):
             raise RuntimeError("DABE-Clean requires USE_DABE_CLEAN_DESPL_SCHEDULE=True.")
-        if not bool(getattr(cfg, "USE_TEACHER_BINARY_FULL_LOSS", False)) or bool(
+        if dabev2hard_static_only_audit is not None:
+            if bool(getattr(cfg, "USE_TEACHER_BINARY_FULL_LOSS", False)) or bool(
+                getattr(cfg, "USE_TEACHER_SOFT_FULL_LOSS", False)
+            ):
+                raise RuntimeError(
+                    "DABE-v2-hard static-only requires all Teacher loss flags disabled."
+                )
+        elif not bool(getattr(cfg, "USE_TEACHER_BINARY_FULL_LOSS", False)) or bool(
             getattr(cfg, "USE_TEACHER_SOFT_FULL_LOSS", False)
         ):
             raise RuntimeError("DABE-Clean requires the full binary EMA Teacher target.")
@@ -15964,7 +16147,7 @@ def main():
         }:
             raise RuntimeError(f"Unsupported DABE_CLEAN_TARGET_MODE={mode!r}.")
         clean_static_target_source = get_dabe_clean_static_target_source(cfg)
-        if clean_static_target_source == "dabe_v2_hard_68":
+        if uses_independent_dabe_v2_hard_source(clean_static_target_source):
             hard_threshold = float(
                 getattr(cfg, "DABE_CLEAN_DABE_V2_HARD_THRESHOLD", float("nan"))
             )
@@ -15973,10 +16156,22 @@ def main():
                     "DABE-v2-hard static ablation requires "
                     "DABE_CLEAN_DABE_V2_HARD_THRESHOLD=0.5."
                 )
-            if clean_version != "v1" or mode != "dp":
+            dabev2hard_clean_ecst_v5_named = bool(
+                dabev2hard_clean_ecst_v5_audit is not None
+                and is_dabev2hard_clean_ecst_v5_control(cfg)
+            )
+            if not (
+                (clean_version == "v1" and mode == "dp")
+                or (
+                    dabev2hard_clean_ecst_v5_named
+                    and clean_version == "v2_contrec"
+                    and mode == "dp"
+                )
+            ):
                 raise RuntimeError(
-                    "DABE-v2-hard static ablation must inherit the v1 Clean-DP "
-                    "cache protocol."
+                    "DABE-v2-hard static ablation requires either the preserved "
+                    "v1 Clean-DP cache protocol or the audited A1 v2_contrec "
+                    "Clean-ECST-v5 control."
                 )
             if str(
                 getattr(cfg, "DABE_CLEAN_DABE_V2_VERSION", "")
@@ -15992,15 +16187,116 @@ def main():
                     "DABE-v2-hard static ablation requires an explicit "
                     "DABE_CLEAN_DABE_V2_ROOT."
                 )
-            if (
-                teacher_routing_mode != "ecst"
-                or not bool(getattr(cfg, "USE_ECST", False))
-                or bool(getattr(cfg, "USE_ECST_MINIMAL", False))
-                or bool(getattr(cfg, "USE_ECST_CLEAN", False))
+            dabev2hard_full_ecst = bool(
+                teacher_routing_mode == "ecst"
+                and bool(getattr(cfg, "USE_ECST", False))
+                and not bool(getattr(cfg, "USE_ECST_MINIMAL", False))
+                and not bool(getattr(cfg, "USE_ECST_CLEAN", False))
+                and bool(
+                    getattr(
+                        cfg,
+                        "DABE_CLEAN_USE_LEGACY_ECST_REGIONS",
+                        False,
+                    )
+                )
+            )
+            dabev2hard_strict_noecst = bool(
+                is_dabev2hard_noecst_strict_control(cfg)
+                and dabev2hard_noecst_control_audit is not None
+                and teacher_routing_mode == "none"
+                and not bool(getattr(cfg, "USE_ECST", False))
+                and not bool(getattr(cfg, "USE_ECST_MINIMAL", False))
+                and not bool(getattr(cfg, "USE_ECST_CLEAN", False))
+                and not bool(
+                    getattr(
+                        cfg,
+                        "DABE_CLEAN_USE_LEGACY_ECST_REGIONS",
+                        False,
+                    )
+                )
+            )
+            dabev2hard_static_only = bool(
+                dabev2hard_static_only_audit is not None
+                and is_dabev2hard_static_only_config(cfg)
+                and teacher_routing_mode == "none"
+                and not bool(getattr(cfg, "USE_ECST", False))
+                and not bool(getattr(cfg, "USE_ECST_MINIMAL", False))
+                and not bool(getattr(cfg, "USE_ECST_CLEAN", False))
+                and not bool(
+                    getattr(
+                        cfg,
+                        "DABE_CLEAN_USE_LEGACY_ECST_REGIONS",
+                        False,
+                    )
+                )
+            )
+            dabev2hard_clean_ecst_v5 = bool(
+                dabev2hard_clean_ecst_v5_named
+                and ecst_clean_enabled
+                and teacher_routing_mode == "clean_ecst"
+                and bool(getattr(cfg, "USE_ECST_CLEAN", False))
+                and not bool(getattr(cfg, "USE_ECST", False))
+                and not bool(getattr(cfg, "USE_ECST_MINIMAL", False))
+                and not bool(
+                    getattr(
+                        cfg,
+                        "DABE_CLEAN_USE_LEGACY_ECST_REGIONS",
+                        False,
+                    )
+                )
+                and str(getattr(cfg, "DABE_CLEAN_VERSION", "")).strip().lower()
+                == "v2_contrec"
+                and str(getattr(cfg, "ECST_CLEAN_VERSION", "")).strip().lower()
+                == "v5_asym_continuous_recoverability"
+                and abs(float(getattr(cfg, "DABE_BC_LAMBDA", float("nan"))))
+                <= 1e-12
+            )
+            dabev2hard_ectp = bool(
+                ectp_enabled
+                and teacher_routing_mode == "ectp"
+                and not bool(getattr(cfg, "USE_ECST", False))
+                and not bool(getattr(cfg, "USE_ECST_MINIMAL", False))
+                and not bool(getattr(cfg, "USE_ECST_CLEAN", False))
+                and not bool(
+                    getattr(
+                        cfg,
+                        "DABE_CLEAN_USE_LEGACY_ECST_REGIONS",
+                        False,
+                    )
+                )
+                and clean_version == "v1"
+                and mode == "dp"
+            )
+            dabev2hard_eaogp = bool(
+                eaogp_enabled
+                and teacher_routing_mode == "eaogp"
+                and not bool(getattr(cfg, "USE_ECTP", False))
+                and not bool(getattr(cfg, "USE_ECST", False))
+                and not bool(getattr(cfg, "USE_ECST_MINIMAL", False))
+                and not bool(getattr(cfg, "USE_ECST_CLEAN", False))
+                and not bool(
+                    getattr(
+                        cfg,
+                        "DABE_CLEAN_USE_LEGACY_ECST_REGIONS",
+                        False,
+                    )
+                )
+                and clean_version == "v1"
+                and mode == "dp"
+            )
+            if not (
+                dabev2hard_full_ecst
+                or dabev2hard_strict_noecst
+                or dabev2hard_static_only
+                or dabev2hard_clean_ecst_v5
+                or dabev2hard_ectp
+                or dabev2hard_eaogp
             ):
                 raise RuntimeError(
-                    "DABE-v2-hard static ablation is isolated to the preserved "
-                    "legacy full-ECST route of the requested baseline."
+                    "DABE-v2-hard static supervision permits only the preserved "
+                    "legacy full-ECST baseline, its audited strict no-ECST "
+                    "single-variable control, the audited static-only control, "
+                    "the audited A1 Clean-ECST-v5 control, ECTP, or EAOGP."
                 )
         legacy_regions = bool(
             getattr(cfg, "DABE_CLEAN_USE_LEGACY_ECST_REGIONS", False)
@@ -16016,8 +16312,12 @@ def main():
                 raise RuntimeError("Clean-ECST forbids legacy routing-only loading.")
             if str(getattr(cfg, "DABE_CLEAN_LEGACY_REGION_ROOT", "")).strip():
                 raise RuntimeError("Clean-ECST requires an empty legacy region root.")
-        if not bool(getattr(cfg, "USE_DAGP_SAFE_HEAD", False)) or not bool(
-            getattr(cfg, "USE_NDR_BRANCH", False)
+        if (
+            not pure_student_static_only
+            and (
+                not bool(getattr(cfg, "USE_DAGP_SAFE_HEAD", False))
+                or not bool(getattr(cfg, "USE_NDR_BRANCH", False))
+            )
         ):
             raise RuntimeError("DABE-Clean preserves DAGP-Safe and NDR-v1.")
     if bool(getattr(cfg, "USE_CSD_DECODER", False)):
@@ -16392,6 +16692,288 @@ def main():
         logger.log(f"train_start_time = {current_time_text()}")
         logger.log(f"EXP_NAME = {cfg.EXP_NAME}")
         logger.log(f"device = {device}")
+        logger.log(
+            "ECST_CAUSAL_CONTROL_MODE = "
+            f"{ecst_causal_control_mode}"
+        )
+        if ecst_causal_control_mode != "none":
+            logger.log(
+                "[ECST Causal Control] config_validation = "
+                f"{ecst_causal_control_audit['status']}"
+            )
+            logger.log(
+                "[ECST Causal Control] effective_differences = "
+                + str(
+                    [
+                        row["field"]
+                        for row in ecst_causal_control_audit[
+                            "effective_differences"
+                        ]
+                    ]
+                )
+            )
+            if ecst_causal_control_mode == "gradient_magnitude_global":
+                logger.log(
+                    "[ECST Causal Control] teacher_loss = "
+                    "stopgrad(batch_L1_gradient_match_scalar) * plain_mean_BCE"
+                )
+                logger.log(
+                    "[ECST Causal Control] spatial_weight_positions_used = False"
+                )
+            else:
+                logger.log(
+                    "[ECST Causal Control] spatial_roll_seed = "
+                    f"{ECST_CAUSAL_CONTROL_SEED}"
+                )
+                logger.log(
+                    "[ECST Causal Control] histogram_preserved_per_image = True"
+                )
+        if dabev2hard_noecst_control_audit is not None:
+            strict_diff_names = [
+                record["field"]
+                for record in dabev2hard_noecst_control_audit[
+                    "actual_differences"
+                ]
+            ]
+            logger.log("[Strict Control]")
+            logger.log("baseline = dabev2hard_ecst")
+            logger.log("control = dabev2hard_noecst")
+            logger.log("single_variable = disable_ecst_teacher_routing")
+            logger.log(
+                "config_diff_audit = PASS | effective_differences="
+                f"{strict_diff_names}"
+            )
+            logger.log("[Static Supervision]")
+            logger.log(
+                "source = independent_dabe_v2_p_dabe_68_hard"
+            )
+            logger.log("threshold = strict > 0.5")
+            logger.log("target_shape = [B,1,68,68]")
+            logger.log("target_min = 0")
+            logger.log("target_max = 1")
+            logger.log("static_weight_mode = ones")
+            logger.log("static_loss = direct mean BCEWithLogits")
+            logger.log("[Teacher Supervision]")
+            logger.log("teacher_target_mode = binary")
+            logger.log("global_teacher_schedule = unchanged")
+            logger.log("teacher_routing_mode = none")
+            logger.log("teacher_pixel_weight = identity/all ones")
+            logger.log("ECST = disabled")
+            logger.log("temporal_memory = not initialized")
+            logger.log("legacy_ecst_regions_used = false")
+            logger.log("[Training Protocol]")
+            logger.log("EMA = unchanged")
+            logger.log("finetune_reset_epoch = 20")
+            logger.log("teacher_reset = true")
+            logger.log("DAGP = unchanged")
+            logger.log("NDR = unchanged")
+            logger.log("optimizer = unchanged")
+            logger.log("scheduler = unchanged")
+            logger.log("lr_floor = unchanged")
+        if ectp_enabled:
+            logger.log("[ECTP Config]")
+            logger.log(
+                "config_validation = "
+                f"{ectp_config_audit['status']}"
+            )
+            logger.log(
+                "version = ectp_v1_dual_evidence_overlap_projection"
+            )
+            logger.log("routing_mode = ectp")
+            logger.log(
+                "static_target = independent_dabe_v2_hard_68"
+            )
+            logger.log(
+                "foreground_evidence = independent_dabe_v2_soft_68"
+            )
+            logger.log(
+                "background_evidence = dabe_clean_bg_evidence_68"
+            )
+            logger.log("teacher_source_target = binary_ema")
+            logger.log(
+                "effective_teacher_target = evidence_projected_soft"
+            )
+            logger.log("legacy_regions = disabled")
+            logger.log("temporal_history = disabled")
+            logger.log("pixel_weight_map = identity")
+            logger.log("independent_schedule = none")
+            logger.log("projection_strength_parameter = none")
+            logger.log(
+                "foreground_cache_drift_policy = "
+                + (
+                    "warn_and_continue_user_override"
+                    if ectp_config_audit[
+                        "allow_foreground_cache_drift"
+                    ]
+                    else "strict_stop_at_1e-5"
+                )
+            )
+            for audit_epoch in (1, 7, 10, 14, 15, 19, 20, 21, 24, 27, 45):
+                audit_static, audit_teacher = get_dabe_pu_despl_schedule(
+                    audit_epoch, cfg
+                )
+                audit_overlap = max(
+                    0.0,
+                    min(1.0, 4.0 * audit_static * audit_teacher),
+                )
+                logger.log(
+                    "[ECTP Schedule] "
+                    f"epoch={audit_epoch:03d} | "
+                    f"alpha={audit_static:.6f} | "
+                    f"beta={audit_teacher:.6f} | "
+                    f"overlap_rho={audit_overlap:.6f}"
+                )
+        if eaogp_enabled:
+            logger.log("[EAOGP Config]")
+            logger.log(f"config_validation = {eaogp_config_audit['status']}")
+            logger.log("version = eaogp_v1_dabe_anchor_dualgraph_projection")
+            logger.log("static_target = independent_dabe_v2_hard_68")
+            logger.log("foreground_anchor = independent_dabe_v2_p_dabe_68")
+            logger.log(
+                "background_anchor = same_dabe_v2_bc_x_one_minus_residual"
+            )
+            logger.log("dabe_residual_source_key = residual_37_normalized_alias")
+            logger.log("teacher_source = binary_ema")
+            logger.log(
+                "teacher_probability_used_for = uncertainty_and_graph_signal"
+            )
+            logger.log("dino_graph = reused_dagp_raw_topk")
+            logger.log("teacher_graph = ema_teacher_projection_embedding")
+            logger.log("graph_combine = dino_weight_x_teacher_cosine_gate")
+            logger.log("legacy_regions = disabled")
+            logger.log("temporal_history = disabled")
+            logger.log("future_teacher = disabled")
+            logger.log("learnable_router = disabled")
+            logger.log("teacher_pixel_weight_map = identity")
+            logger.log("eaogp_persistent_after_reset = true")
+            logger.log("new_trainable_parameters = 0")
+            for audit_epoch in (1, 6, 7, 10, 15, 20, 21, 27, 45):
+                logger.log(
+                    "[EAOGP Schedule] "
+                    f"epoch={audit_epoch:03d} | "
+                    f"shared_dagp_scale={get_eaogp_scale(cfg, audit_epoch):.9f}"
+                )
+        if dabev2hard_static_only_audit is not None:
+            static_only_diff_names = [
+                record["field"]
+                for record in dabev2hard_static_only_audit[
+                    "actual_differences"
+                ]
+            ]
+            logger.log("[DABE-v2 Hard StaticOnly]")
+            logger.log(
+                "parent = "
+                + (
+                    "dabev2hard_staticonly"
+                    if pure_student_static_only
+                    else "dabev2hard_noecst"
+                )
+            )
+            logger.log(
+                "supervision_source = independent_dabe_v2_"
+                f"{getattr(cfg, 'DABE_CLEAN_DABE_V2_SOURCE_KEY', 'p_dabe_68')}_hard"
+            )
+            logger.log("threshold = strict > 0.5")
+            logger.log("target_shape = [B,1,68,68]")
+            logger.log("static_loss = direct mean BCEWithLogits")
+            logger.log("effective_schedule_epoch_1_45 = static/teacher 1.0/0.0")
+            logger.log("teacher_loss_final/coarse/base = exact graph zero")
+            logger.log("teacher_target_used_for_gradient = False")
+            logger.log(
+                "teacher_instantiated = "
+                f"{str(not pure_student_static_only).lower()}"
+            )
+            logger.log(
+                "teacher_forward = "
+                f"{'false' if pure_student_static_only else 'diagnostic_only'}"
+            )
+            logger.log(
+                "EMA_update = "
+                f"{'false' if pure_student_static_only else 'diagnostic_only'}"
+            )
+            logger.log("ECST = disabled")
+            logger.log("legacy_ecst_regions_used = false")
+            logger.log("finetune_reset_epoch = 20 (unchanged)")
+            logger.log(
+                "student_head = "
+                + (
+                    "dagp_safe_plus_ndr_v1"
+                    if r1hard_dagp_ndr_pure_student
+                    else (
+                        "single_1x1_conv"
+                        if pure_student_static_only
+                        else "unchanged_DAGP_NDR"
+                    )
+                )
+            )
+            logger.log(
+                "config_diff_audit = PASS | effective_differences="
+                f"{static_only_diff_names}"
+            )
+            for audit_epoch in (1, 20, 21, 45):
+                audit_static, audit_teacher = get_dabe_pu_despl_schedule(
+                    audit_epoch, cfg
+                )
+                if audit_static != 1.0 or audit_teacher != 0.0:
+                    raise RuntimeError(
+                        "DABE-v2-hard static-only startup schedule audit failed "
+                        f"at epoch {audit_epoch}: "
+                        f"{audit_static}/{audit_teacher}."
+                    )
+                logger.log(
+                    "[DABE-v2 Hard StaticOnly Schedule] "
+                    f"epoch={audit_epoch:03d} | "
+                    "static_weight=1.000000 | teacher_weight=0.000000"
+                )
+        if dabev2hard_clean_ecst_v5_audit is not None:
+            clean_ecst_diff_names = [
+                record["field"]
+                for record in dabev2hard_clean_ecst_v5_audit[
+                    "actual_differences"
+                ]
+            ]
+            logger.log("[DABE-v2 Hard + A1 Clean-ECST v5]")
+            logger.log("parent = clean_ecst_v5_a1_residual_only")
+            logger.log(
+                "static_supervision_source = "
+                "1[independent_dabe_v2_p_dabe_68 > 0.5]"
+            )
+            logger.log(
+                "static_supervision_applies_to = final/coarse/base direct mean BCE"
+            )
+            logger.log(
+                "clean_ecst_route_evidence = unchanged A1 "
+                "dabe_clean_target_68 + dabe_clean_recoverability_68"
+            )
+            logger.log(
+                "static_cache_root = "
+                f"{getattr(cfg, 'DABE_CLEAN_DABE_V2_ROOT')}"
+            )
+            logger.log(
+                "routing_cache_root = "
+                f"{getattr(cfg, 'DABE_CLEAN_ROOT')}"
+            )
+            logger.log("teacher_routing_mode = clean_ecst")
+            logger.log("clean_ecst_version = v5_asym_continuous_recoverability")
+            logger.log("DABE_BC_LAMBDA = 0.0 (A1 unchanged)")
+            logger.log("global_static_teacher_schedule = unchanged")
+            logger.log("EMA/reset/optimizer/scheduler/DAGP/NDR = unchanged")
+            logger.log(
+                "config_diff_audit = PASS | effective_differences="
+                f"{clean_ecst_diff_names}"
+            )
+            for audit_epoch in (1, 5, 10, 20, 21, 45):
+                audit_static, audit_teacher = get_dabe_pu_despl_schedule(
+                    audit_epoch, cfg
+                )
+                logger.log(
+                    "[DABE-v2 Hard + A1 Clean-ECST v5 Schedule] "
+                    f"epoch={audit_epoch:03d} | "
+                    f"static_weight={audit_static:.6f} | "
+                    f"teacher_weight={audit_teacher:.6f} | "
+                    "clean_ecst_scale="
+                    f"{get_ecst_clean_scale(cfg, audit_epoch):.6f}"
+                )
         if use_cacd(cfg):
             logger.log("HEAD_TYPE = cacd_v1_base")
             logger.log("USE_CACD = True")
@@ -16541,6 +17123,27 @@ def main():
                 logger.log(
                     "NO_ECST_SINGLE_VARIABLE = ECST teacher pixel weighting "
                     "disabled; target/static schedule/EMA/reset/DAGP/NDR unchanged"
+                )
+            elif teacher_routing_mode == "ectp":
+                logger.log(
+                    "ECTP_TEACHER_TARGET_PROJECTION = binary EMA Teacher "
+                    "margin is projected toward 0.5 only on evidence-supported "
+                    "conflicts; static target/global schedule/EMA/reset/DAGP/NDR "
+                    "unchanged"
+                )
+                logger.log(
+                    "ECTP_ROUTE_MAP = exact detached all ones; Teacher BCE = "
+                    "ordinary reduction='mean'"
+                )
+            elif teacher_routing_mode == "eaogp":
+                logger.log(
+                    "EAOGP_TEACHER_TARGET_PROJECTION = same-source DABE anchors "
+                    "plus EMA-Teacher-validated sparse DINO graph consensus; "
+                    "global schedule/EMA/reset/DAGP/NDR unchanged"
+                )
+                logger.log(
+                    "EAOGP_ROUTE_MAP = exact detached all ones; Teacher BCE = "
+                    "ordinary reduction='mean'"
                 )
             elif teacher_routing_mode == "clean_ecst":
                 logger.log("[Clean-ECST Config]")
@@ -17883,7 +18486,9 @@ def main():
                     "DABE_CLEAN_STATIC_TARGET_SOURCE = "
                     f"{clean_static_target_source}"
                 )
-                if clean_static_target_source == "dabe_v2_hard_68":
+                if uses_independent_dabe_v2_hard_source(
+                    clean_static_target_source
+                ):
                     logger.log(
                         "DABE_CLEAN_DABE_V2_ROOT = "
                         f"{getattr(cfg, 'DABE_CLEAN_DABE_V2_ROOT')}"
@@ -17892,16 +18497,36 @@ def main():
                         "DABE_CLEAN_DABE_V2_VERSION = "
                         f"{getattr(cfg, 'DABE_CLEAN_DABE_V2_VERSION')}"
                     )
-                    logger.log("DABE_CLEAN_DABE_V2_SOURCE_KEY = p_dabe_68")
+                    logger.log(
+                        "DABE_CLEAN_DABE_V2_SOURCE_KEY = "
+                        f"{getattr(cfg, 'DABE_CLEAN_DABE_V2_SOURCE_KEY', 'p_dabe_68')}"
+                    )
                     logger.log(
                         "DABE_CLEAN_DABE_V2_HARD_THRESHOLD = "
                         f"{float(getattr(cfg, 'DABE_CLEAN_DABE_V2_HARD_THRESHOLD')):.6f}"
                     )
                     logger.log(
                         "STATIC_TARGET_SINGLE_VARIABLE = "
-                        "Clean-DP_68 -> 1[independent p_dabe_68 > 0.5]; "
-                        "legacy ECST regions/routing, schedule, Teacher, reset, "
-                        "DAGP and NDR unchanged"
+                        "Clean-DP_68 -> 1[independent "
+                        f"{getattr(cfg, 'DABE_CLEAN_DABE_V2_SOURCE_KEY', 'p_dabe_68')} "
+                        "> 0.5]; "
+                        + (
+                            "A1 Clean-ECST-v5 routing evidence/cache unchanged; "
+                            "schedule, Teacher, reset, DAGP and NDR unchanged"
+                            if dabev2hard_clean_ecst_v5_audit is not None
+                            else (
+                                "static-only for epochs 1-45; all Teacher losses "
+                                "exactly zero; reset, DAGP and NDR unchanged"
+                                if dabev2hard_static_only_audit is not None
+                                else (
+                                    "ECST teacher routing disabled; schedule, Teacher, "
+                                    "reset, DAGP and NDR unchanged"
+                                    if dabev2hard_noecst_control_audit is not None
+                                    else "legacy ECST regions/routing, schedule, Teacher, "
+                                    "reset, DAGP and NDR unchanged"
+                                )
+                            )
+                        )
                     )
             logger.log(
                 f"DABE_CLEAN_ROOT = {getattr(cfg, 'DABE_CLEAN_ROOT', '')}"
@@ -18061,23 +18686,39 @@ def main():
                     )
                     if dabe_clean_offline_enabled
                     else (
-                        "dabe_v2_hard_68"
-                        if get_dabe_clean_static_target_source(cfg)
-                        == "dabe_v2_hard_68"
+                        get_dabe_clean_static_target_source(cfg)
+                        if uses_independent_dabe_v2_hard_source(
+                            get_dabe_clean_static_target_source(cfg)
+                        )
                         else f"dabe_clean_{clean_mode}_68"
                     )
                 )
                 logger.log(f"pseudo final candidate = {clean_candidate}")
                 if (
                     not dabe_clean_offline_enabled
-                    and get_dabe_clean_static_target_source(cfg)
-                    == "dabe_v2_hard_68"
-                ):
-                    logger.log(
-                        "p_init_formula = direct mean BCE("
-                        "1[independent p_dabe_68 > 0.5]) "
-                        "+ full teacher binary BCE"
+                    and uses_independent_dabe_v2_hard_source(
+                        get_dabe_clean_static_target_source(cfg)
                     )
+                ):
+                    if dabev2hard_static_only_audit is not None:
+                        logger.log(
+                            "p_init_formula = direct mean BCE("
+                            "1[independent "
+                            f"{getattr(cfg, 'DABE_CLEAN_DABE_V2_SOURCE_KEY', 'p_dabe_68')} "
+                            "> 0.5]); Teacher BCE disabled"
+                        )
+                    elif dabev2hard_clean_ecst_v5_audit is not None:
+                        logger.log(
+                            "p_init_formula = direct mean BCE("
+                            "1[independent p_dabe_68 > 0.5]) + binary Teacher "
+                            "BCE routed by unchanged A1 Clean-ECST-v5 evidence"
+                        )
+                    else:
+                        logger.log(
+                            "p_init_formula = direct mean BCE("
+                            "1[independent p_dabe_68 > 0.5]) "
+                            "+ full teacher binary BCE"
+                        )
                 else:
                     logger.log(
                         "p_init_formula = direct mean BCE(single continuous Clean target) "
@@ -18134,9 +18775,19 @@ def main():
             and bool(getattr(cfg, "USE_DABE_CLEAN_DESPL_SCHEDULE", False))
         )
         use_bitc_train = bool(bitc_enabled) and use_dabe_pu_despl_sched
+        use_ectp_train = bool(ectp_enabled) and use_dabe_pu_despl_sched
+        use_eaogp_train = bool(eaogp_enabled) and use_dabe_pu_despl_sched
         if bool(bitc_enabled) and not use_bitc_train:
             raise RuntimeError(
                 "BITC-v1 requires the DABE-PU DESPL-style supervision path."
+            )
+        if bool(ectp_enabled) and not use_ectp_train:
+            raise RuntimeError(
+                "ECTP requires the DABE-Clean DESPL-style supervision path."
+            )
+        if bool(eaogp_enabled) and not use_eaogp_train:
+            raise RuntimeError(
+                "EAOGP requires the DABE-Clean DESPL-style supervision path."
             )
         if (use_ap_stcr_train or use_cvsa_train) and not use_dabe_pu_despl_sched:
             raise RuntimeError(
@@ -18185,7 +18836,9 @@ def main():
             if (
                 use_dabe_pu_despl_sched
                 and use_dabe_clean
-                and dabe_clean_static_target_source == "dabe_v2_hard_68"
+                and uses_independent_dabe_v2_hard_source(
+                    dabe_clean_static_target_source
+                )
             )
             else (
                 get_dabe_pu_despl_static_target_mode(cfg)
@@ -18524,11 +19177,18 @@ def main():
 
         in_channels = train_dataset.in_channels
         student = build_seg_head(in_channels, cfg).to(device)
-        teacher = build_seg_head(in_channels, cfg).to(device)
-        # 初始 teacher 与 student 对齐；finetune reset 不显式重置 teacher。
-        teacher.load_state_dict(student.state_dict())
-        for p in teacher.parameters():
-            p.requires_grad_(False)
+        teacher = None
+        if not pure_student_static_only:
+            teacher = build_seg_head(in_channels, cfg).to(device)
+            # 初始 teacher 与 student 对齐；finetune reset 不显式重置 teacher。
+            teacher.load_state_dict(student.state_dict())
+            for p in teacher.parameters():
+                p.requires_grad_(False)
+        else:
+            logger.log(
+                "[Hard-R1 PureStudent] teacher_instantiated=False | "
+                "teacher_forward=False | ema_update=False"
+            )
         if use_cacd(cfg):
             student_keys = list(student.state_dict().keys())
             teacher_keys = list(teacher.state_dict().keys())
@@ -19067,7 +19727,13 @@ def main():
                 )
 
             student.load_state_dict(checkpoint["student"], strict=True)
-            teacher.load_state_dict(checkpoint["teacher"], strict=True)
+            if pure_student_static_only:
+                if checkpoint["teacher"] is not None:
+                    raise RuntimeError(
+                        "Hard-R1 pure-Student resume checkpoint must store teacher=None."
+                    )
+            else:
+                teacher.load_state_dict(checkpoint["teacher"], strict=True)
             if use_cvsa_train:
                 required_cvsa_keys = {
                     "cvsa_router",
@@ -19448,6 +20114,24 @@ def main():
                 clean_ecst_audit_path.unlink()
             logger.log(f"CLEAN_ECST_AUDIT_CSV = {clean_ecst_audit_path}")
 
+        ectp_epoch_stats_path = None
+        if use_ectp_train:
+            ectp_epoch_stats_path = (
+                train_dir.parent / "analysis" / "ectp_epoch_stats.csv"
+            )
+            if not args.resume and ectp_epoch_stats_path.exists():
+                ectp_epoch_stats_path.unlink()
+            logger.log(f"ECTP_EPOCH_STATS_CSV = {ectp_epoch_stats_path}")
+
+        eaogp_epoch_stats_path = None
+        if use_eaogp_train:
+            eaogp_epoch_stats_path = (
+                train_dir.parent / "analysis" / "eaogp_epoch_stats.csv"
+            )
+            if not args.resume and eaogp_epoch_stats_path.exists():
+                eaogp_epoch_stats_path.unlink()
+            logger.log(f"EAOGP_EPOCH_STATS_CSV = {eaogp_epoch_stats_path}")
+
         lr_floor_activated_logged = False
         ecst_memory = None
         if use_ecst and ecst_history_enabled:
@@ -19575,6 +20259,22 @@ def main():
                 f"substitution={getattr(cfg, 'BITC_SUBSTITUTION_MODE')} | "
                 f"groups={int(getattr(cfg, 'BITC_NUM_GROUPS'))} | "
                 f"weight_floor={float(getattr(cfg, 'BITC_WEIGHT_FLOOR')):.6f}"
+            )
+        elif use_ectp_train:
+            if ecst_memory is not None:
+                raise RuntimeError("ECTP must not initialize temporal memory.")
+            logger.log(
+                "[ECTP Runtime] temporal_memory_initialized=False | "
+                "legacy_regions_used=False | dino_margin_used=False | "
+                "teacher_pixel_weight_map=identity"
+            )
+        elif use_eaogp_train:
+            if ecst_memory is not None:
+                raise RuntimeError("EAOGP must not initialize temporal memory.")
+            logger.log(
+                "[EAOGP Runtime] temporal_memory_initialized=False | "
+                "legacy_regions_used=False | future_teacher_used=False | "
+                "teacher_pixel_weight_map=identity | new_trainable_parameters=0"
             )
         elif (
             teacher_routing_mode == "none"
@@ -19866,6 +20566,10 @@ def main():
         rast_first_batch_logged = False
         static_weight_first_batch_logged = False
         teacher_routing_first_batch_logged = False
+        ectp_first_batch_logged_epoch = None
+        ectp_cache_drift_warning_logged = False
+        eaogp_first_batch_logged_epoch = None
+        eaogp_numeric_warning_keys = set()
         bitc_first_batch_logged_epoch = None
         bitc_debug_saved = 0
         ap_stcr_first_batch_logged_epoch = None
@@ -19943,9 +20647,14 @@ def main():
             apply_complex_head_lr_policy(optimizer, epoch, cfg)
 
             set_model_epoch(student, epoch)
-            set_model_epoch(teacher, epoch)
+            if teacher is not None:
+                set_model_epoch(teacher, epoch)
+            eaogp_scale_expected = (
+                get_eaogp_scale(cfg, epoch) if use_eaogp_train else 0.0
+            )
             student.train()
-            teacher.eval()
+            if teacher is not None:
+                teacher.eval()
             if cvsa_router is not None:
                 cvsa_router.train()
             if use_pssf_train:
@@ -20068,6 +20777,14 @@ def main():
                 )
                 else None
             )
+            ectp_epoch_accumulator = (
+                new_ectp_epoch_accumulator() if use_ectp_train else None
+            )
+            ectp_epoch_row = None
+            eaogp_epoch_accumulator = (
+                new_eaogp_epoch_accumulator() if use_eaogp_train else None
+            )
+            eaogp_epoch_row = None
             bitc_epoch_accumulator = (
                 new_bitc_epoch_accumulator() if use_bitc_train else None
             )
@@ -20843,7 +21560,9 @@ def main():
                         pu_static_target = pu_target_soft
                     else:
                         selected_clean_static_source_68 = pu_target_soft
-                        if dabe_clean_static_target_source == "dabe_v2_hard_68":
+                        if uses_independent_dabe_v2_hard_source(
+                            dabe_clean_static_target_source
+                        ):
                             missing_dabe_v2_fields = sorted(
                                 {
                                     "dabe_clean_dabe_v2_soft_68",
@@ -20863,7 +21582,9 @@ def main():
                             pu_target_soft,
                             selected_clean_static_source_68,
                         )
-                        if dabe_clean_static_target_source == "dabe_v2_hard_68":
+                        if uses_independent_dabe_v2_hard_source(
+                            dabe_clean_static_target_source
+                        ):
                             expected_static_target = batch[
                                 "dabe_clean_static_target_68"
                             ].to(device, non_blocking=True).float().detach()
@@ -20897,7 +21618,9 @@ def main():
                                 0.5,
                             )
                         )
-                        if dabe_clean_static_target_source == "dabe_v2_hard_68"
+                        if uses_independent_dabe_v2_hard_source(
+                            dabe_clean_static_target_source
+                        )
                         else float(getattr(cfg, "DABE_PU_HARD_THRESH", 0.5))
                     )
                     pu_target_hard = (pu_static_target > hard_thresh).float()
@@ -20908,9 +21631,10 @@ def main():
                             "target_offline_68"
                             if dabe_clean_offline_enabled
                             else (
-                                "dabe_v2_hard_68"
-                                if dabe_clean_static_target_source
-                                == "dabe_v2_hard_68"
+                                dabe_clean_static_target_source
+                                if uses_independent_dabe_v2_hard_source(
+                                    dabe_clean_static_target_source
+                                )
                                 else f"dabe_clean_{str(getattr(cfg, 'DABE_CLEAN_TARGET_MODE', '')).lower()}_68"
                             )
                         )
@@ -21031,7 +21755,8 @@ def main():
                         f"[DABE-Clean FirstBatch] epoch={epoch:03d} | "
                         "mode="
                         f"{FOUND_STATIC_SOURCE if found_static_train else (getattr(cfg, 'DABE_CLEAN_OFFLINE_MODE') if dabe_clean_offline_enabled else getattr(cfg, 'DABE_CLEAN_TARGET_MODE'))} | "
-                        f"target_source_key={clean_training_target_key} | "
+                        "target_source_key="
+                        f"{'dabe_clean_static_target_68' if uses_independent_dabe_v2_hard_source(dabe_clean_static_target_source) else clean_training_target_key} | "
                         f"payload_version={'legacy_found_binary_v1' if found_static_train else getattr(cfg, 'DABE_CLEAN_EXPECTED_PAYLOAD_VERSION', '')} | "
                         f"cache_root={found_static_root(cfg) if found_static_train else getattr(cfg, 'DABE_CLEAN_ROOT', '')} | "
                         f"target_shape={list(pu_static_target.shape)} | "
@@ -21229,15 +21954,27 @@ def main():
                         )
                         mvproto_first_batch_logged = True
                 with torch.no_grad():
-                    teacher_out = forward_seg_head(
-                        teacher,
-                        model_input,
-                        cfg,
-                        image_68=image_68,
-                        image_136=image_136,
-                        sobel_68=sobel_68,
-                        return_aux=use_bitc_train,
-                    )
+                    if pure_student_static_only:
+                        # Downstream static-only loss bookkeeping expects a
+                        # finite target-shaped tensor.  This detached sentinel
+                        # is derived solely from Hard-R1; it is not a model
+                        # output and never contributes a Teacher loss.
+                        teacher_out = torch.logit(
+                            pu_static_target.detach().clamp(1e-6, 1.0 - 1e-6)
+                        )
+                    else:
+                        teacher_out = forward_seg_head(
+                            teacher,
+                            model_input,
+                            cfg,
+                            image_68=image_68,
+                            image_136=image_136,
+                            sobel_68=sobel_68,
+                            return_aux=use_bitc_train or use_eaogp_train,
+                            return_eaogp_aux=(
+                                use_eaogp_train and eaogp_scale_expected > 0.0
+                            ),
+                        )
                     if use_bitc_train and (
                         not isinstance(teacher_out, dict)
                         or "coarse_logits_37" not in teacher_out
@@ -21246,6 +21983,85 @@ def main():
                             "BITC-v1 requires the existing EMA-Teacher forward "
                             "to expose coarse_logits_37."
                         )
+                    eaogp_scale_actual = 0.0
+                    if use_eaogp_train:
+                        if not isinstance(teacher_out, dict):
+                            raise RuntimeError(
+                                "EAOGP requires a DAGP-Safe Teacher auxiliary dict."
+                            )
+                        scale_tensor = teacher_out.get("dagp_scale")
+                        if not torch.is_tensor(scale_tensor):
+                            raise RuntimeError(
+                                "EAOGP Teacher output is missing the actual DAGP scale."
+                            )
+                        eaogp_scale_actual = float(scale_tensor.detach().item())
+                        # The schedule helper returns a Python float64 while the
+                        # model exposes its shared scale as a float32 CUDA
+                        # scalar.  Fractions such as 5/9 therefore differ by a
+                        # few 1e-8 after an otherwise exact round-trip.  Keep
+                        # the model's actual shared DAGP scale authoritative and
+                        # make this provenance audit non-blocking.
+                        eaogp_scale_expected_f32 = float(
+                            scale_tensor.detach().new_tensor(
+                                eaogp_scale_expected
+                            ).item()
+                        )
+                        expected_scale_error = abs(
+                            eaogp_scale_actual - eaogp_scale_expected_f32
+                        )
+                        if (
+                            expected_scale_error > 1e-6
+                            and "shared_dagp_scale" not in eaogp_numeric_warning_keys
+                        ):
+                            logger.log(
+                                "[EAOGP WARNING] expected/actual shared DAGP "
+                                "scale mismatch was allowed: expected_float32/"
+                                "actual/error="
+                                f"{eaogp_scale_expected_f32:.9g}/"
+                                f"{eaogp_scale_actual:.9g}/"
+                                f"{expected_scale_error:.9g}; using the actual "
+                                "model DAGP scale."
+                            )
+                            eaogp_numeric_warning_keys.add("shared_dagp_scale")
+                        if eaogp_scale_actual > 0.0:
+                            required_eaogp_aux = {
+                                "eaogp_dino_topk_idx",
+                                "eaogp_dino_topk_weight",
+                                "eaogp_teacher_embedding_37",
+                                "eaogp_dagp_scale",
+                            }
+                            missing_eaogp_aux = sorted(
+                                required_eaogp_aux.difference(teacher_out)
+                            )
+                            if missing_eaogp_aux:
+                                raise RuntimeError(
+                                    "EAOGP Teacher output is missing auxiliary fields: "
+                                    f"{missing_eaogp_aux}."
+                                )
+                            aux_scale = float(
+                                teacher_out["eaogp_dagp_scale"].detach().item()
+                            )
+                            auxiliary_scale_error = abs(
+                                aux_scale - eaogp_scale_actual
+                            )
+                            if (
+                                auxiliary_scale_error > 1e-6
+                                and "auxiliary_dagp_scale"
+                                not in eaogp_numeric_warning_keys
+                            ):
+                                logger.log(
+                                    "[EAOGP WARNING] auxiliary/DAGP scale "
+                                    "mismatch was allowed: auxiliary/actual/error="
+                                    f"{aux_scale:.9g}/{eaogp_scale_actual:.9g}/"
+                                    f"{auxiliary_scale_error:.9g}; forcing EAOGP "
+                                    "to consume the actual model DAGP scale."
+                                )
+                                eaogp_numeric_warning_keys.add(
+                                    "auxiliary_dagp_scale"
+                                )
+                            teacher_out["eaogp_dagp_scale"] = (
+                                scale_tensor.detach()
+                            )
                     teacher_logits = resize_logits_for_loss(extract_logits(teacher_out), cfg)
                     teacher_prob = teacher_logits.sigmoid()
                     if use_pssf_train:
@@ -21272,10 +22088,19 @@ def main():
                         teacher_binary = (
                             teacher_prob >= teacher_binary_thresh
                         ).float()
-                    if use_dabe_pu_despl_sched and dabe_pu_despl_teacher_target_mode == "soft_prob":
+                    if pure_student_static_only:
+                        teacher_full_target = pu_static_target.detach()
+                        teacher_full_target_source = (
+                            "disabled_pure_student_hard_r1_sentinel"
+                        )
+                    elif use_dabe_pu_despl_sched and dabe_pu_despl_teacher_target_mode == "soft_prob":
                         teacher_full_target = teacher_prob.detach()
+                        teacher_full_target_source = "ema_teacher_soft_probability"
                     else:
                         teacher_full_target = teacher_binary
+                        teacher_full_target_source = "binary_ema"
+                    teacher_target_binary_68 = teacher_binary.detach()
+                    teacher_target_for_loss_68 = teacher_full_target.detach()
 
                     cvsa_teacher_hflip_prob = None
                     if use_cvsa_train:
@@ -21867,6 +22692,9 @@ def main():
                 tepr_stats = None
                 bitc_result = None
                 bitc_stats = None
+                ectp_stats = None
+                eaogp_batch_result = None
+                eaogp_stats = None
                 rast_stats = {
                     "rast_scale": 0.0,
                     "rast_pre_reset_scale": 0.0,
@@ -22062,6 +22890,450 @@ def main():
                             f"{bitc_stats['bitc_teacher_map_max']:.6f}"
                         )
                         bitc_first_batch_logged_epoch = int(epoch)
+                elif teacher_routing_mode == "eaogp":
+                    if not use_eaogp_train:
+                        raise RuntimeError(
+                            "TEACHER_ROUTING_MODE='eaogp' reached a non-EAOGP "
+                            "training path."
+                        )
+                    if teacher_full_target_source != "binary_ema":
+                        raise RuntimeError(
+                            "EAOGP requires the preserved binary EMA Teacher source, "
+                            f"got {teacher_full_target_source!r}."
+                        )
+                    required_eaogp_fields = {
+                        "dabe_clean_dabe_v2_soft_68",
+                        "dabe_clean_dabe_v2_bc_map_37",
+                        "dabe_clean_dabe_v2_residual_norm_37",
+                        "dabe_clean_dabe_v2_bg_evidence_37",
+                        "dabe_clean_dabe_v2_bg_evidence_68",
+                        "dabe_clean_dabe_v2_residual_source_key",
+                        "dabe_clean_dabe_v2_training_gt_read",
+                        "dabe_clean_static_target_68",
+                    }
+                    missing_eaogp_fields = sorted(
+                        required_eaogp_fields.difference(batch)
+                    )
+                    if missing_eaogp_fields:
+                        raise RuntimeError(
+                            "EAOGP batch is missing same-source DABE-v2 fields: "
+                            f"{missing_eaogp_fields}."
+                        )
+                    eaogp_foreground = batch[
+                        "dabe_clean_dabe_v2_soft_68"
+                    ].to(device, non_blocking=True).float().detach()
+                    eaogp_background = batch[
+                        "dabe_clean_dabe_v2_bg_evidence_68"
+                    ].to(device, non_blocking=True).float().detach()
+                    eaogp_bc_map = batch[
+                        "dabe_clean_dabe_v2_bc_map_37"
+                    ].to(device, non_blocking=True).float().detach()
+                    eaogp_residual = batch[
+                        "dabe_clean_dabe_v2_residual_norm_37"
+                    ].to(device, non_blocking=True).float().detach()
+                    eaogp_background_37 = batch[
+                        "dabe_clean_dabe_v2_bg_evidence_37"
+                    ].to(device, non_blocking=True).float().detach()
+                    rebuilt_background_37, rebuilt_background_68 = (
+                        build_same_source_background_evidence(
+                            eaogp_bc_map,
+                            eaogp_residual,
+                        )
+                    )
+                    background_37_error = float(
+                        (rebuilt_background_37 - eaogp_background_37)
+                        .abs()
+                        .max()
+                        .item()
+                    )
+                    background_68_error = float(
+                        (rebuilt_background_68 - eaogp_background)
+                        .abs()
+                        .max()
+                        .item()
+                    )
+                    # B37 is an element-wise construction and remains under the
+                    # strict tolerance. B68 is materialized by the Dataset on
+                    # CPU, then reconstructed here on CUDA; the two bilinear
+                    # kernels can differ by a few float32 ULPs despite identical
+                    # inputs and align_corners=False.
+                    background_37_tolerance = 1e-6
+                    background_68_tolerance = 5e-6
+                    if (
+                        background_37_error > background_37_tolerance
+                        or background_68_error > background_68_tolerance
+                    ):
+                        if (
+                            "same_source_background"
+                            not in eaogp_numeric_warning_keys
+                        ):
+                            logger.log(
+                                "[EAOGP WARNING] cached/rebuilt same-source "
+                                "background difference was allowed: "
+                                "error37/error68="
+                                f"{background_37_error:.9g}/"
+                                f"{background_68_error:.9g} | "
+                                "tolerance37/tolerance68="
+                                f"{background_37_tolerance:.9g}/"
+                                f"{background_68_tolerance:.9g}; using the "
+                                "on-device rebuilt evidence."
+                            )
+                            eaogp_numeric_warning_keys.add(
+                                "same_source_background"
+                            )
+                    # Always consume the value reconstructed from the exact
+                    # same-source fields on the active device.  The cached CPU
+                    # interpolation remains diagnostic-only and cannot stop or
+                    # subtly diverge from the EAOGP formula.
+                    eaogp_background_37 = rebuilt_background_37
+                    eaogp_background = rebuilt_background_68
+                    residual_source_keys = sorted(
+                        set(batch["dabe_clean_dabe_v2_residual_source_key"])
+                    )
+                    if not residual_source_keys or any(
+                        key not in {"residual_norm_37", "residual_37"}
+                        for key in residual_source_keys
+                    ):
+                        raise RuntimeError(
+                            "EAOGP residual source must be residual_norm_37 or the "
+                            "user-authorized normalized residual_37 alias, got "
+                            f"{residual_source_keys}."
+                        )
+                    training_gt_report = batch[
+                        "dabe_clean_dabe_v2_training_gt_read"
+                    ]
+                    if torch.is_tensor(training_gt_report):
+                        training_gt_reported = bool(
+                            training_gt_report.bool().any().item()
+                        )
+                    else:
+                        training_gt_reported = bool(training_gt_report)
+                    if training_gt_reported:
+                        raise RuntimeError(
+                            "EAOGP DABE-v2 evidence reports training GT access."
+                        )
+                    eaogp_static_target = batch[
+                        "dabe_clean_static_target_68"
+                    ].to(device, non_blocking=True).float().detach()
+                    if not torch.equal(eaogp_static_target, pu_static_target):
+                        raise RuntimeError(
+                            "EAOGP static target differs from the exact target "
+                            "used by static BCE."
+                        )
+                    if not torch.equal(
+                        eaogp_static_target,
+                        (eaogp_foreground > 0.5).float(),
+                    ):
+                        raise RuntimeError(
+                            "EAOGP static target is not strict DABE-v2 soft > 0.5."
+                        )
+                    anchor_confidence = (
+                        eaogp_static_target
+                        * eaogp_foreground
+                        * (1.0 - eaogp_background)
+                        + (1.0 - eaogp_static_target)
+                        * eaogp_background
+                        * (1.0 - eaogp_foreground)
+                    ).clamp(0.0, 1.0).detach()
+                    if eaogp_scale_actual == 0.0:
+                        teacher_target_for_loss_68 = teacher_target_binary_68
+                        if not torch.equal(
+                            teacher_target_for_loss_68,
+                            teacher_target_binary_68,
+                        ):
+                            raise RuntimeError(
+                                "Inactive EAOGP must exactly preserve binary Teacher."
+                            )
+                        static_fg_mask = eaogp_static_target > 0.5
+                        static_bg_mask = ~static_fg_mask
+                        eaogp_stats = {
+                            "eaogp_scale": 0.0,
+                            "static_fg_area": float(eaogp_static_target.mean().item()),
+                            "teacher_binary_area": float(teacher_target_binary_68.mean().item()),
+                            "effective_target_mean": float(teacher_target_binary_68.mean().item()),
+                            "effective_target_hard_area": float(teacher_target_binary_68.mean().item()),
+                            "eaogp_target_mean": float(teacher_target_binary_68.mean().item()),
+                            "eaogp_target_hard_area": float(teacher_target_binary_68.mean().item()),
+                            "anchor_confidence_mean": float(anchor_confidence.mean().item()),
+                            "anchor_confidence_fg_mean": (
+                                float(anchor_confidence[static_fg_mask].mean().item())
+                                if bool(static_fg_mask.any().item())
+                                else 0.0
+                            ),
+                            "anchor_confidence_bg_mean": (
+                                float(anchor_confidence[static_bg_mask].mean().item())
+                                if bool(static_bg_mask.any().item())
+                                else 0.0
+                            ),
+                            "teacher_uncertainty_mean": float(
+                                (4.0 * teacher_prob * (1.0 - teacher_prob)).mean().item()
+                            ),
+                            "dino_graph_consensus_mean": 0.0,
+                            "dual_graph_consensus_mean": 0.0,
+                            "dual_vs_dino_shift_abs_mean": 0.0,
+                            "task_gate_mean": 0.0,
+                            "dual_graph_entropy": 0.0,
+                            "anchor_delta_abs_mean": 0.0,
+                            "graph_delta_abs_mean": 0.0,
+                            "new_fg_ratio": 0.0,
+                            "new_bg_ratio": 0.0,
+                            "eaogp_anchor_mass": 0.0,
+                            "eaogp_graph_mass": 0.0,
+                            "eaogp_new_fg_mass": 0.0,
+                            "eaogp_new_bg_mass": 0.0,
+                        }
+                        eaogp_batch_result = {
+                            "stats": eaogp_stats,
+                            "anchor_confidence_68": anchor_confidence,
+                            "effective_teacher_target_68": teacher_target_for_loss_68,
+                        }
+                    else:
+                        teacher_target_for_loss_68, eaogp_batch_result = (
+                            build_eaogp_target(
+                                foreground_response_68=eaogp_foreground,
+                                background_evidence_68=eaogp_background,
+                                static_target_68=eaogp_static_target,
+                                teacher_prob_68=teacher_prob.detach(),
+                                teacher_binary_68=teacher_target_binary_68,
+                                teacher_embedding_37=teacher_out[
+                                    "eaogp_teacher_embedding_37"
+                                ],
+                                dino_topk_idx=teacher_out[
+                                    "eaogp_dino_topk_idx"
+                                ],
+                                dino_topk_weight=teacher_out[
+                                    "eaogp_dino_topk_weight"
+                                ],
+                                scale=teacher_out["eaogp_dagp_scale"],
+                            )
+                        )
+                        eaogp_stats = eaogp_batch_result["stats"]
+                    teacher_route_map, _ = build_identity_teacher_route(
+                        teacher_target_binary_68
+                    )
+                    teacher_routing_scale = 0.0
+                    if eaogp_first_batch_logged_epoch != int(epoch):
+                        if eaogp_scale_actual == 0.0:
+                            logger.log(
+                                f"[EAOGP FirstBatch] epoch={epoch:03d} | "
+                                "EAOGP inactive because shared DAGP scale=0 | "
+                                "effective target exactly equals binary Teacher=True | "
+                                "legacy_regions_used=False | "
+                                "temporal_memory_initialized=False | "
+                                "training_gt_used=False"
+                            )
+                        else:
+                            logger.log(
+                                f"[EAOGP FirstBatch] epoch={epoch:03d} | "
+                                "foreground_response min/mean/max="
+                                f"{float(eaogp_foreground.min()):.6f}/"
+                                f"{float(eaogp_foreground.mean()):.6f}/"
+                                f"{float(eaogp_foreground.max()):.6f} | "
+                                "background_evidence min/mean/max="
+                                f"{float(eaogp_background.min()):.6f}/"
+                                f"{float(eaogp_background.mean()):.6f}/"
+                                f"{float(eaogp_background.max()):.6f} | "
+                                f"static_target_mean={float(eaogp_static_target.mean()):.6f} | "
+                                f"residual_source={residual_source_keys} | "
+                                "same_source_bg_error37/error68="
+                                f"{background_37_error:.9g}/{background_68_error:.9g} | "
+                                "anchor_confidence min/mean/max="
+                                f"{float(anchor_confidence.min()):.6f}/"
+                                f"{float(anchor_confidence.mean()):.6f}/"
+                                f"{float(anchor_confidence.max()):.6f}"
+                            )
+                            logger.log(
+                                f"[EAOGP FirstBatch] epoch={epoch:03d} | "
+                                "teacher_prob min/mean/max="
+                                f"{float(teacher_prob.min()):.6f}/"
+                                f"{float(teacher_prob.mean()):.6f}/"
+                                f"{float(teacher_prob.max()):.6f} | "
+                                f"teacher_binary_area={float(teacher_target_binary_68.mean()):.6f} | "
+                                "teacher_uncertainty min/mean/max="
+                                f"{float(eaogp_batch_result['teacher_uncertainty_68'].min()):.6f}/"
+                                f"{eaogp_stats['teacher_uncertainty_mean']:.6f}/"
+                                f"{float(eaogp_batch_result['teacher_uncertainty_68'].max()):.6f} | "
+                                f"dino_row_sum_error={eaogp_batch_result['dino_row_sum_error']:.9g} | "
+                                "task_gate min/mean/max="
+                                f"{eaogp_stats['task_gate_min']:.6f}/"
+                                f"{eaogp_stats['task_gate_mean']:.6f}/"
+                                f"{eaogp_stats['task_gate_max']:.6f} | "
+                                f"dual_row_sum_error={eaogp_batch_result['dual_row_sum_error']:.9g}"
+                            )
+                            logger.log(
+                                f"[EAOGP FirstBatch] epoch={epoch:03d} | "
+                                f"eaogp_scale={eaogp_scale_actual:.9f} | "
+                                "dino_consensus min/mean/max="
+                                f"{float(eaogp_batch_result['dino_graph_consensus_68'].min()):.6f}/"
+                                f"{eaogp_stats['dino_graph_consensus_mean']:.6f}/"
+                                f"{float(eaogp_batch_result['dino_graph_consensus_68'].max()):.6f} | "
+                                "dual_consensus min/mean/max="
+                                f"{float(eaogp_batch_result['dual_graph_consensus_68'].min()):.6f}/"
+                                f"{eaogp_stats['dual_graph_consensus_mean']:.6f}/"
+                                f"{float(eaogp_batch_result['dual_graph_consensus_68'].max()):.6f} | "
+                                "dual_vs_dino_shift_abs_mean="
+                                f"{eaogp_stats['dual_vs_dino_shift_abs_mean']:.6f} | "
+                                "raw_target min/mean/max="
+                                f"{float(eaogp_batch_result['raw_eaogp_target_68'].min()):.6f}/"
+                                f"{eaogp_stats['raw_eaogp_target_mean']:.6f}/"
+                                f"{float(eaogp_batch_result['raw_eaogp_target_68'].max()):.6f} | "
+                                "effective_target min/mean/max="
+                                f"{float(teacher_target_for_loss_68.min()):.6f}/"
+                                f"{eaogp_stats['effective_target_mean']:.6f}/"
+                                f"{float(teacher_target_for_loss_68.max()):.6f} | "
+                                "effective_hard_area="
+                                f"{eaogp_stats['effective_target_hard_area']:.6f} | "
+                                "anchor/graph_delta_abs_mean="
+                                f"{eaogp_stats['anchor_delta_abs_mean']:.6f}/"
+                                f"{eaogp_stats['graph_delta_abs_mean']:.6f} | "
+                                f"new_fg/new_bg={eaogp_stats['new_fg_ratio']:.6f}/"
+                                f"{eaogp_stats['new_bg_ratio']:.6f} | "
+                                "legacy_regions_used=False | "
+                                "temporal_memory_initialized=False | "
+                                "training_gt_used=False"
+                            )
+                        eaogp_first_batch_logged_epoch = int(epoch)
+                elif teacher_routing_mode == "ectp":
+                    if not use_ectp_train:
+                        raise RuntimeError(
+                            "TEACHER_ROUTING_MODE='ectp' reached a non-ECTP "
+                            "training path."
+                        )
+                    required_ectp_fields = {
+                        "dabe_clean_dabe_v2_soft_68",
+                        "dabe_clean_fg_evidence_68",
+                        "dabe_clean_bg_evidence_68",
+                        "dabe_clean_static_target_68",
+                    }
+                    missing_ectp_fields = sorted(
+                        required_ectp_fields.difference(batch)
+                    )
+                    if missing_ectp_fields:
+                        raise RuntimeError(
+                            "ECTP batch is missing required offline fields: "
+                            f"{missing_ectp_fields}."
+                        )
+                    ectp_foreground = batch[
+                        "dabe_clean_dabe_v2_soft_68"
+                    ].to(device, non_blocking=True).float().detach()
+                    ectp_clean_foreground = batch[
+                        "dabe_clean_fg_evidence_68"
+                    ].to(device, non_blocking=True).float().detach()
+                    ectp_background = batch[
+                        "dabe_clean_bg_evidence_68"
+                    ].to(device, non_blocking=True).float().detach()
+                    ectp_static_target = batch[
+                        "dabe_clean_static_target_68"
+                    ].to(device, non_blocking=True).float().detach()
+                    if not torch.equal(ectp_static_target, pu_static_target):
+                        raise RuntimeError(
+                            "ECTP static target differs from the exact target "
+                            "used by static BCE."
+                        )
+                    foreground_cache_consistency_error = float(
+                        (
+                            ectp_foreground - ectp_clean_foreground
+                        ).abs().max().item()
+                    )
+                    if foreground_cache_consistency_error > 1e-5:
+                        cache_drift_message = (
+                            "ECTP DABE-v2 foreground response and DABE-Clean "
+                            "foreground evidence differ beyond the strict "
+                            "1e-5 provenance tolerance: max_abs_error="
+                            f"{foreground_cache_consistency_error:.9g}."
+                        )
+                        if not bool(
+                            getattr(
+                                cfg,
+                                "ECTP_ALLOW_FOREGROUND_CACHE_DRIFT",
+                                False,
+                            )
+                        ):
+                            raise RuntimeError(cache_drift_message)
+                        if not ectp_cache_drift_warning_logged:
+                            logger.log(
+                                "[ECTP WARNING] "
+                                + cache_drift_message
+                                + " Continuing because "
+                                "ECTP_ALLOW_FOREGROUND_CACHE_DRIFT=True; "
+                                "the strict offline audit remains FAIL."
+                            )
+                            ectp_cache_drift_warning_logged = True
+                    teacher_target_for_loss_68, ectp_stats = (
+                        build_ectp_projected_target(
+                            foreground_evidence=ectp_foreground,
+                            background_evidence=ectp_background,
+                            static_target=ectp_static_target,
+                            teacher_binary=teacher_target_binary_68,
+                            static_weight=fixed_weight,
+                            teacher_weight=teacher_weight,
+                        )
+                    )
+                    ectp_stats["foreground_cache_consistency_error"] = (
+                        foreground_cache_consistency_error
+                    )
+                    teacher_route_map, _ = build_identity_teacher_route(
+                        teacher_target_binary_68
+                    )
+                    teacher_routing_scale = 0.0
+                    if ectp_first_batch_logged_epoch != int(epoch):
+                        logger.log(
+                            f"[ECTP FirstBatch] epoch={epoch:03d} | "
+                            "static_target_min/mean/max="
+                            f"{float(ectp_static_target.min()):.6f}/"
+                            f"{float(ectp_static_target.mean()):.6f}/"
+                            f"{float(ectp_static_target.max()):.6f} | "
+                            "foreground_evidence_min/mean/max="
+                            f"{float(ectp_foreground.min()):.6f}/"
+                            f"{float(ectp_foreground.mean()):.6f}/"
+                            f"{float(ectp_foreground.max()):.6f} | "
+                            "background_evidence_min/mean/max="
+                            f"{float(ectp_background.min()):.6f}/"
+                            f"{float(ectp_background.mean()):.6f}/"
+                            f"{float(ectp_background.max()):.6f} | "
+                            "support_min/mean/max="
+                            f"{ectp_stats['support_min']:.6f}/"
+                            f"{ectp_stats['support_mean']:.6f}/"
+                            f"{ectp_stats['support_max']:.6f}"
+                        )
+                        logger.log(
+                            f"[ECTP FirstBatch] epoch={epoch:03d} | "
+                            f"static_fg_ratio={ectp_stats['static_fg_ratio']:.6f} | "
+                            "teacher_binary_fg_ratio="
+                            f"{ectp_stats['teacher_binary_fg_ratio']:.6f} | "
+                            f"alpha={ectp_stats['alpha']:.6f} | "
+                            f"beta={ectp_stats['beta']:.6f} | "
+                            f"overlap_rho={ectp_stats['overlap_rho']:.6f} | "
+                            f"conflict_ratio={ectp_stats['conflict_ratio']:.6f} | "
+                            "fg_to_bg_conflict_ratio="
+                            f"{ectp_stats['fg_to_bg_conflict_ratio']:.6f} | "
+                            "bg_to_fg_conflict_ratio="
+                            f"{ectp_stats['bg_to_fg_conflict_ratio']:.6f} | "
+                            "support_on_conflict_mean="
+                            f"{ectp_stats['support_on_conflict_mean']:.6f}"
+                        )
+                        logger.log(
+                            f"[ECTP FirstBatch] epoch={epoch:03d} | "
+                            "projected_target_min/mean/max="
+                            f"{ectp_stats['projected_target_min']:.6f}/"
+                            f"{ectp_stats['projected_target_mean']:.6f}/"
+                            f"{ectp_stats['projected_target_max']:.6f} | "
+                            "projected_target_shift_abs_mean="
+                            f"{ectp_stats['projected_target_shift_abs_mean']:.6f} | "
+                            "projected_target_minus_binary_mean="
+                            f"{ectp_stats['projected_target_minus_binary_mean']:.6f} | "
+                            f"fg_protection_mass={ectp_stats['fg_protection_mass']:.6f} | "
+                            f"bg_protection_mass={ectp_stats['bg_protection_mass']:.6f} | "
+                            "nonconflict_exact_match="
+                            f"{ectp_stats['nonconflict_exact_match']} | "
+                            "static_target_consistency_error="
+                            f"{ectp_stats['static_target_consistency_error']:.9g} | "
+                            "foreground_cache_consistency_error="
+                            f"{foreground_cache_consistency_error:.9g} | "
+                            "temporal_memory_initialized=False | "
+                            "legacy_regions_used=False"
+                        )
+                        ectp_first_batch_logged_epoch = int(epoch)
                 elif teacher_routing_mode == "none":
                     teacher_route_map, _ = build_identity_teacher_route(
                         teacher_prob.detach()
@@ -22296,6 +23568,126 @@ def main():
                         ):
                             ecst_map_audit = teacher_route_map
                     teacher_routing_scale = float(ecst_stats["ecst_scale"])
+                    if (
+                        dabev2hard_clean_ecst_v5_audit is not None
+                        and iter_idx == 0
+                    ):
+                        threshold = float(
+                            getattr(cfg, "DABE_CLEAN_DABE_V2_HARD_THRESHOLD")
+                        )
+                        dabe_v2_soft = batch[
+                            "dabe_clean_dabe_v2_soft_68"
+                        ].to(device, non_blocking=True).float().detach()
+                        cached_hard = batch[
+                            "dabe_clean_static_target_68"
+                        ].to(device, non_blocking=True).float().detach()
+                        expected_hard = (dabe_v2_soft > threshold).float().detach()
+                        a1_clean_target = batch[
+                            "dabe_clean_target_68"
+                        ].to(device, non_blocking=True).float().detach()
+                        a1_recoverability = batch[
+                            "dabe_clean_recoverability_68"
+                        ].to(device, non_blocking=True).float().detach()
+                        signed_a1 = (2.0 * a1_clean_target - 1.0).detach()
+                        route_stat_errors = {
+                            "positive_static_evidence_mean": abs(
+                                float(ecst_stats["positive_static_evidence_mean"])
+                                - float(signed_a1.clamp_min(0.0).mean().item())
+                            ),
+                            "negative_static_evidence_mean": abs(
+                                float(ecst_stats["negative_static_evidence_mean"])
+                                - float((-signed_a1).clamp_min(0.0).mean().item())
+                            ),
+                            "recoverability_mean": abs(
+                                float(ecst_stats["recoverability_mean"])
+                                - float(a1_recoverability.mean().item())
+                            ),
+                        }
+                        hard_static_matches = bool(
+                            torch.equal(cached_hard, expected_hard)
+                            and torch.equal(pu_static_target, expected_hard)
+                            and torch.equal(pseudo_68, expected_hard)
+                        )
+                        route_uses_a1_evidence = bool(
+                            max(route_stat_errors.values()) <= 1e-6
+                        )
+                        route_is_valid = bool(
+                            not teacher_route_map.requires_grad
+                            and bool(torch.isfinite(teacher_route_map).all().item())
+                            and float(teacher_route_map.min().item())
+                            >= float(getattr(cfg, "ECST_CLEAN_WEIGHT_MIN")) - 1e-6
+                            and float(teacher_route_map.max().item()) <= 1.0 + 1e-6
+                        )
+                        hard_tensor_valid = bool(
+                            not pu_static_target.requires_grad
+                            and bool(torch.isfinite(pu_static_target).all().item())
+                            and torch.equal(
+                                pu_static_target,
+                                pu_static_target.bool().float(),
+                            )
+                            and not pu_static_weight_map.requires_grad
+                            and torch.equal(
+                                pu_static_weight_map,
+                                torch.ones_like(pu_static_weight_map),
+                            )
+                        )
+                        route_tensors_valid = bool(
+                            not a1_clean_target.requires_grad
+                            and not a1_recoverability.requires_grad
+                            and bool(torch.isfinite(a1_clean_target).all().item())
+                            and bool(torch.isfinite(a1_recoverability).all().item())
+                        )
+                        source_identities = sorted(
+                            set(
+                                str(value)
+                                for value in batch[
+                                    "dabe_clean_static_target_source"
+                                ]
+                            )
+                        )
+                        source_identity_valid = source_identities == [
+                            "independent_dabe_v2_p_dabe_68_gt_0.5"
+                        ]
+                        leaked_legacy_keys = sorted(
+                            key
+                            for key in batch
+                            if str(key).startswith("legacy_ecst_")
+                        )
+                        if not (
+                            hard_static_matches
+                            and hard_tensor_valid
+                            and route_uses_a1_evidence
+                            and route_tensors_valid
+                            and route_is_valid
+                            and source_identity_valid
+                            and not leaked_legacy_keys
+                        ):
+                            raise RuntimeError(
+                                "DABE-v2-hard + A1 Clean-ECST-v5 two-source "
+                                "isolation failed: hard_static_matches="
+                                f"{hard_static_matches}, "
+                                f"hard_tensor_valid={hard_tensor_valid}, "
+                                "route_uses_a1_evidence="
+                                f"{route_uses_a1_evidence}, "
+                                f"route_tensors_valid={route_tensors_valid}, "
+                                f"route_is_valid={route_is_valid}, "
+                                f"source_identities={source_identities}, "
+                                f"legacy_keys={leaked_legacy_keys}, "
+                                f"route_stat_errors={route_stat_errors}."
+                            )
+                        logger.log(
+                            "[DABE-v2 Hard + A1 Clean-ECST v5 FirstBatch] "
+                            f"epoch={epoch:03d} | "
+                            "static_target=1[independent_p_dabe_68>0.5] | "
+                            "static_target_matches=True | "
+                            "route_target=A1_dabe_clean_target_68 | "
+                            "route_recoverability=A1_dabe_clean_recoverability_68 | "
+                            "route_evidence_matches=True | "
+                            "static_route_sources_isolated=True | "
+                            "static_weight_map=all_ones | "
+                            "legacy_ecst_regions_used=False | "
+                            "teacher_route_detached_finite_bounded=True"
+                        )
                     if use_source_arbiter_train:
                         teacher_source_weight = build_teacher_source_weight(
                             mode=source_arbiter_mode,
@@ -22502,6 +23894,95 @@ def main():
                         )
                         esa_asym_first_batch_logged = True
 
+                if ecst_causal_control_mode == "spatial_roll":
+                    if teacher_routing_mode != "ecst" or teacher_route_map is None:
+                        raise RuntimeError(
+                            "Spatial Roll causal control requires the constructed "
+                            "Full-ECST route map."
+                        )
+                    if "dataset_name" not in batch or "stem" not in batch:
+                        raise RuntimeError(
+                            "Spatial Roll requires dataset_name/stem sample identities."
+                        )
+                    original_route_map = teacher_route_map.detach()
+                    teacher_route_map = build_spatial_roll_map(
+                        original_route_map,
+                        batch["dataset_name"],
+                        batch["stem"],
+                        seed=int(
+                            getattr(
+                                cfg,
+                                "ECST_CAUSAL_CONTROL_SEED",
+                                ECST_CAUSAL_CONTROL_SEED,
+                            )
+                        ),
+                    )
+                    original_sorted = torch.sort(
+                        original_route_map.reshape(
+                            int(original_route_map.shape[0]), -1
+                        ),
+                        dim=1,
+                    ).values
+                    rolled_sorted = torch.sort(
+                        teacher_route_map.reshape(
+                            int(teacher_route_map.shape[0]), -1
+                        ),
+                        dim=1,
+                    ).values
+                    histogram_error = float(
+                        (original_sorted - rolled_sorted).abs().max().item()
+                    )
+                    if histogram_error > 1e-7:
+                        raise RuntimeError(
+                            "Spatial Roll changed the per-image ECST histogram: "
+                            f"max_abs_error={histogram_error:.9g}."
+                        )
+                    if ecst_stats is not None:
+                        ecst_stats["causal_control_mode"] = "spatial_roll"
+                        ecst_stats["spatial_roll_histogram_error"] = histogram_error
+                        ecst_stats["original_teacher_map_mean"] = float(
+                            original_route_map.mean().item()
+                        )
+                    if iter_idx == 0:
+                        logger.log(
+                            "[ECST Causal Control FirstBatch] "
+                            "mode=spatial_roll | per_image_histogram_preserved=True | "
+                            f"histogram_max_abs_error={histogram_error:.9g} | "
+                            "teacher_target_unchanged=True | weighted_bce_unchanged=True"
+                        )
+                elif ecst_causal_control_mode == "gradient_magnitude_global":
+                    if teacher_routing_mode != "ecst" or teacher_route_map is None:
+                        raise RuntimeError(
+                            "GMG causal control requires the constructed Full-ECST map."
+                        )
+                    if ecst_stats is not None:
+                        ecst_stats["causal_control_mode"] = (
+                            "gradient_magnitude_global"
+                        )
+                    if iter_idx == 0:
+                        gmg_first_batch_scalar = (
+                            compute_gradient_magnitude_match_scalar(
+                                student_logits.detach(),
+                                teacher_target_for_loss_68.detach(),
+                                teacher_route_map.detach(),
+                                norm="l1",
+                                eps=float(
+                                    getattr(
+                                        cfg,
+                                        "DABE_PU_WEIGHTED_BCE_EPS",
+                                        1e-6,
+                                    )
+                                ),
+                            )
+                        )
+                        logger.log(
+                            "[ECST Causal Control FirstBatch] "
+                            "mode=gradient_magnitude_global | "
+                            "original_map_constructed=True | spatial_positions_used=False | "
+                            "gradient_norm=l1 | teacher_target_unchanged=True | "
+                            f"gmg_scalar_final={float(gmg_first_batch_scalar.item()):.9f}"
+                        )
+
                 if (
                     teacher_routing_mode != LEGACY_TEACHER_ROUTING_MODE
                     and not use_pssf_train
@@ -22535,13 +24016,139 @@ def main():
                             teacher_route_map,
                             torch.ones_like(teacher_route_map),
                         )
-                        if teacher_routing_mode == "none" and (
+                        if teacher_routing_mode in {"none", "ectp", "eaogp"} and (
                             not map_all_ones
                             or teacher_route_map.requires_grad
                             or memory_active
                         ):
                             raise RuntimeError(
-                                "No-ECST first-batch routing invariant failed"
+                                "Identity first-batch routing invariant failed"
+                            )
+                        if dabev2hard_noecst_control_audit is not None:
+                            expected_shape = (
+                                int(pu_static_target.shape[0]),
+                                1,
+                                int(cfg.LOSS_SIZE),
+                                int(cfg.LOSS_SIZE),
+                            )
+                            if tuple(pu_static_target.shape) != expected_shape:
+                                raise RuntimeError(
+                                    "Strict-control static target shape mismatch: "
+                                    f"{list(pu_static_target.shape)} != "
+                                    f"{list(expected_shape)}."
+                                )
+                            if (
+                                pu_static_target.requires_grad
+                                or not bool(
+                                    torch.isfinite(pu_static_target).all().item()
+                                )
+                                or not torch.equal(
+                                    pu_static_target,
+                                    pu_static_target.bool().float(),
+                                )
+                            ):
+                                raise RuntimeError(
+                                    "Strict-control static target must be finite, "
+                                    "detached, and exactly binary."
+                                )
+                            strict_threshold = float(
+                                getattr(
+                                    cfg,
+                                    "DABE_CLEAN_DABE_V2_HARD_THRESHOLD",
+                                )
+                            )
+                            source_soft = batch[
+                                "dabe_clean_dabe_v2_soft_68"
+                            ].to(device, non_blocking=True).float().detach()
+                            source_hard = batch[
+                                "dabe_clean_static_target_68"
+                            ].to(device, non_blocking=True).float().detach()
+                            expected_hard = (
+                                source_soft > strict_threshold
+                            ).float().detach()
+                            strict_source_matches = bool(
+                                torch.equal(source_hard, expected_hard)
+                                and torch.equal(pu_static_target, expected_hard)
+                                and torch.equal(pseudo_68, expected_hard)
+                            )
+                            if not strict_source_matches:
+                                raise RuntimeError(
+                                    "Strict-control static target does not exactly "
+                                    "match 1[independent p_dabe_68 > 0.5]."
+                                )
+                            static_map_all_ones = bool(
+                                pu_static_weight_map is not None
+                                and not pu_static_weight_map.requires_grad
+                                and torch.equal(
+                                    pu_static_weight_map,
+                                    torch.ones_like(pu_static_weight_map),
+                                )
+                            )
+                            teacher_target_is_binary = bool(
+                                not teacher_full_target.requires_grad
+                                and torch.equal(
+                                    teacher_full_target,
+                                    teacher_full_target.bool().float(),
+                                )
+                                and torch.equal(
+                                    teacher_full_target,
+                                    teacher_binary,
+                                )
+                            )
+                            leaked_legacy_keys = sorted(
+                                key
+                                for key in batch
+                                if str(key).startswith("legacy_ecst_")
+                            )
+                            if (
+                                not static_map_all_ones
+                                or not teacher_target_is_binary
+                                or ecst_memory is not None
+                                or leaked_legacy_keys
+                            ):
+                                raise RuntimeError(
+                                    "Strict-control first-batch isolation failed: "
+                                    f"static_map_all_ones={static_map_all_ones}, "
+                                    "teacher_target_is_binary="
+                                    f"{teacher_target_is_binary}, "
+                                    "ecst_memory_initialized="
+                                    f"{ecst_memory is not None}, "
+                                    f"legacy_keys={leaked_legacy_keys}."
+                                )
+                            batch_source_values = sorted(
+                                set(
+                                    str(value)
+                                    for value in batch[
+                                        "dabe_clean_static_target_source"
+                                    ]
+                                )
+                            )
+                            expected_source_value = (
+                                "independent_dabe_v2_p_dabe_68_gt_0.5"
+                            )
+                            if batch_source_values != [expected_source_value]:
+                                raise RuntimeError(
+                                    "Strict-control Dataset source identity mismatch: "
+                                    f"{batch_source_values}."
+                                )
+                            logger.log(
+                                "[Strict Control FirstBatch] "
+                                "pseudo_source="
+                                "independent_dabe_v2_p_dabe_68_hard | "
+                                "static_target_matches_selected_source="
+                                f"{strict_source_matches} | "
+                                f"target_shape={list(pu_static_target.shape)} | "
+                                "target_min/mean/max="
+                                f"{float(pu_static_target.min()):.6f}/"
+                                f"{float(pu_static_target.mean()):.6f}/"
+                                f"{float(pu_static_target.max()):.6f} | "
+                                "target_finite=True | target_detached=True | "
+                                "static_weight_map=all_ones | "
+                                "teacher_target=binary | "
+                                "teacher_routing=identity | "
+                                "teacher_map_min/mean/max=1.000000/1.000000/1.000000 | "
+                                "temporal_memory_initialized=False | "
+                                "legacy_ecst_regions_used=False"
                             )
                         logger.log(
                             "[TeacherRouting FirstBatch] "
@@ -24030,7 +25637,7 @@ def main():
                         else:
                             loss_pu_teacher_final = teacher_route_bce_with_logits(
                                 student_logits,
-                                teacher_full_target,
+                                teacher_target_for_loss_68,
                                 teacher_route_map,
                                 cfg,
                                 teacher_routing_scale,
@@ -24046,10 +25653,13 @@ def main():
                             else loss_pu_static_final
                         )
                         loss_tversky = student_logits.sum() * 0.0
-                        loss_base = (
-                            pu_static_loss_weight * loss_pu_static_group
-                            + pu_teacher_loss_weight * loss_pu_teacher_group
-                        )
+                        if is_dabev2hard_static_only_config(cfg):
+                            loss_base = loss_pu_static_group
+                        else:
+                            loss_base = (
+                                pu_static_loss_weight * loss_pu_static_group
+                                + pu_teacher_loss_weight * loss_pu_teacher_group
+                            )
                     elif use_dabe_pu:
                         eps = float(getattr(cfg, "DABE_PU_WEIGHTED_BCE_EPS", 1e-6))
                         loss_pu_static_final = weighted_bce_with_logits(
@@ -24626,7 +26236,7 @@ def main():
                                 else:
                                     loss_pu_teacher_coarse = teacher_route_bce_with_logits(
                                         coarse_logits,
-                                        teacher_full_target,
+                                        teacher_target_for_loss_68,
                                         teacher_route_map,
                                         cfg,
                                         teacher_routing_scale,
@@ -24659,7 +26269,7 @@ def main():
                                 )
                                 loss_pu_teacher_base = teacher_route_bce_with_logits(
                                     base_logits,
-                                    teacher_full_target,
+                                    teacher_target_for_loss_68,
                                     teacher_route_map,
                                     cfg,
                                     teacher_routing_scale,
@@ -24676,18 +26286,23 @@ def main():
                             loss_pu_teacher_group = sum(
                                 w * term for w, term in zip(pu_aux_weights, teacher_terms)
                             ) / weight_sum
-                            loss = (
-                                pu_static_loss_weight * loss_pu_static_group
-                                + pu_teacher_loss_weight * loss_pu_teacher_group
-                            )
-                            loss_ndr_coarse_aux = (
-                                pu_static_loss_weight * loss_pu_static_coarse
-                                + pu_teacher_loss_weight * loss_pu_teacher_coarse
-                            )
-                            loss_aux_base = (
-                                pu_static_loss_weight * loss_pu_static_base
-                                + pu_teacher_loss_weight * loss_pu_teacher_base
-                            )
+                            if is_dabev2hard_static_only_config(cfg):
+                                loss = loss_pu_static_group
+                                loss_ndr_coarse_aux = loss_pu_static_coarse
+                                loss_aux_base = loss_pu_static_base
+                            else:
+                                loss = (
+                                    pu_static_loss_weight * loss_pu_static_group
+                                    + pu_teacher_loss_weight * loss_pu_teacher_group
+                                )
+                                loss_ndr_coarse_aux = (
+                                    pu_static_loss_weight * loss_pu_static_coarse
+                                    + pu_teacher_loss_weight * loss_pu_teacher_coarse
+                                )
+                                loss_aux_base = (
+                                    pu_static_loss_weight * loss_pu_static_base
+                                    + pu_teacher_loss_weight * loss_pu_teacher_base
+                                )
                     elif use_dabe_pu:
                         eps = float(getattr(cfg, "DABE_PU_WEIGHTED_BCE_EPS", 1e-6))
                         pu_static_loss_weight, pu_teacher_loss_weight = get_dabe_pu_schedule(epoch, cfg)
@@ -25192,7 +26807,7 @@ def main():
                         )
                         loss_pu_teacher_base = teacher_route_bce_with_logits(
                             base_logits,
-                            teacher_full_target,
+                            teacher_target_for_loss_68,
                             teacher_route_map,
                             cfg,
                             teacher_routing_scale,
@@ -25201,14 +26816,18 @@ def main():
                         )
                         loss_pu_static_group = (loss_pu_static_final + aux_lambda * loss_pu_static_base) / (1.0 + aux_lambda)
                         loss_pu_teacher_group = (loss_pu_teacher_final + aux_lambda * loss_pu_teacher_base) / (1.0 + aux_lambda)
-                        loss = (
-                            pu_static_loss_weight * loss_pu_static_group
-                            + pu_teacher_loss_weight * loss_pu_teacher_group
-                        )
-                        loss_aux_base = (
-                            pu_static_loss_weight * loss_pu_static_base
-                            + pu_teacher_loss_weight * loss_pu_teacher_base
-                        )
+                        if is_dabev2hard_static_only_config(cfg):
+                            loss = loss_pu_static_group
+                            loss_aux_base = loss_pu_static_base
+                        else:
+                            loss = (
+                                pu_static_loss_weight * loss_pu_static_group
+                                + pu_teacher_loss_weight * loss_pu_teacher_group
+                            )
+                            loss_aux_base = (
+                                pu_static_loss_weight * loss_pu_static_base
+                                + pu_teacher_loss_weight * loss_pu_teacher_base
+                            )
                     elif use_dabe_pu:
                         eps = float(getattr(cfg, "DABE_PU_WEIGHTED_BCE_EPS", 1e-6))
                         pu_static_loss_weight, pu_teacher_loss_weight = get_dabe_pu_schedule(epoch, cfg)
@@ -25783,6 +27402,64 @@ def main():
                         baseline_loss_before_oed
                         + oed_batch_result["weighted_loss"]
                     )
+                if is_dabev2hard_static_only_config(cfg):
+                    schedule_static, schedule_teacher = (
+                        get_dabe_pu_despl_schedule(epoch, cfg)
+                    )
+                    if schedule_static != 1.0 or schedule_teacher != 0.0:
+                        raise RuntimeError(
+                            "DABE-v2-hard static-only schedule must be exactly 1/0, "
+                            f"got {schedule_static}/{schedule_teacher}."
+                        )
+                    teacher_loss_values = {
+                        "final": float(loss_pu_teacher_final.detach().item()),
+                        "coarse": float(loss_pu_teacher_coarse.detach().item()),
+                        "base": float(loss_pu_teacher_base.detach().item()),
+                        "group": float(loss_pu_teacher_group.detach().item()),
+                    }
+                    if any(value != 0.0 for value in teacher_loss_values.values()):
+                        raise RuntimeError(
+                            "DABE-v2-hard static-only Teacher loss must be exact zero: "
+                            f"{teacher_loss_values}."
+                        )
+                    if not torch.equal(loss, loss_pu_static_group):
+                        raise RuntimeError(
+                            "DABE-v2-hard static-only total loss must exactly equal "
+                            "the static final/coarse/base group loss."
+                        )
+                    if iter_idx == 0:
+                        threshold = float(
+                            getattr(cfg, "DABE_CLEAN_DABE_V2_HARD_THRESHOLD")
+                        )
+                        source_soft = batch[
+                            "dabe_clean_dabe_v2_soft_68"
+                        ].to(device, non_blocking=True).float().detach()
+                        expected_hard = (source_soft > threshold).float().detach()
+                        if (
+                            pu_static_target.requires_grad
+                            or not torch.equal(pu_static_target, expected_hard)
+                            or not torch.equal(
+                                pu_static_weight_map,
+                                torch.ones_like(pu_static_weight_map),
+                            )
+                        ):
+                            raise RuntimeError(
+                                "DABE-v2-hard static-only first-batch target/map "
+                                "invariant failed."
+                            )
+                        logger.log(
+                            f"[DABE-v2 Hard StaticOnly FirstBatch] epoch={epoch:03d} | "
+                            "static/teacher=1.000000/0.000000 | "
+                            "teacher_loss_final/coarse/base/group="
+                            f"{teacher_loss_values['final']:.1f}/"
+                            f"{teacher_loss_values['coarse']:.1f}/"
+                            f"{teacher_loss_values['base']:.1f}/"
+                            f"{teacher_loss_values['group']:.1f} | "
+                            "loss_equals_static_group=True | "
+                            f"teacher_forward={'False' if pure_student_static_only else 'diagnostic_only'} | "
+                            f"ema_update={'False' if pure_student_static_only else 'diagnostic_only'} | "
+                            "teacher_target_used_for_gradient=False"
+                        )
                 if not bool(torch.isfinite(loss).item()):
                     if (
                         source_arbiter_mode
@@ -26016,8 +27693,15 @@ def main():
                                 f"clamped_lr={clamped_lr:.8f}"
                             )
                             lr_floor_activated_logged = True
-                # teacher pseudo 已在本轮 EMA 更新前生成，避免当前 student 更新泄漏进 target。
-                update_ema(student, teacher, global_step, ema_weight=float(cfg.EMA_WEIGHT))
+                # Pure-Student Hard-R1 has no Teacher module and no EMA state.
+                if not pure_student_static_only:
+                    # teacher pseudo 已在本轮 EMA 更新前生成，避免当前 student 更新泄漏进 target。
+                    update_ema(
+                        student,
+                        teacher,
+                        global_step,
+                        ema_weight=float(cfg.EMA_WEIGHT),
+                    )
                 if use_ap_stcr_train:
                     if ap_stcr_batch_result is None:
                         raise RuntimeError(
@@ -26392,6 +28076,45 @@ def main():
                                 teacher_full_target.detach(),
                                 reduction="mean",
                             ).item()
+                        )
+                    if use_ectp_train:
+                        if ectp_stats is None or ectp_epoch_accumulator is None:
+                            raise RuntimeError(
+                                "ECTP batch/epoch diagnostic state is unavailable."
+                            )
+                        accumulate_ectp_epoch(
+                            ectp_epoch_accumulator,
+                            ectp_stats,
+                            student_pred_area=student_prob_for_area,
+                            teacher_pred_area=teacher_target_binary_68,
+                        )
+                    if use_eaogp_train:
+                        if eaogp_stats is None or eaogp_epoch_accumulator is None:
+                            raise RuntimeError(
+                                "EAOGP batch/epoch diagnostic state is unavailable."
+                            )
+                        eaogp_metrics = {
+                            **eaogp_stats,
+                            "static_weight": float(pu_static_loss_weight),
+                            "teacher_weight": float(pu_teacher_loss_weight),
+                            "student_pred_area": float(
+                                student_prob_for_area.mean().item()
+                            ),
+                            "teacher_pred_area": float(
+                                teacher_target_binary_68.mean().item()
+                            ),
+                            "loss_static_final": float(
+                                loss_pu_static_final.detach().item()
+                            ),
+                            "loss_teacher_final": float(
+                                loss_pu_teacher_final.detach().item()
+                            ),
+                            "loss_total": float(loss.detach().item()),
+                        }
+                        accumulate_eaogp_epoch(
+                            eaogp_epoch_accumulator,
+                            eaogp_metrics,
+                            batch_size=int(student_logits.shape[0]),
                         )
                     if use_ecst:
                         if ecst_stats is None or ecst_epoch_accumulator is None:
@@ -28015,6 +29738,36 @@ def main():
                     static_weight_log, teacher_weight_log = get_dabe_pu_despl_schedule(epoch, cfg)
                 else:
                     static_weight_log, teacher_weight_log = get_dabe_pu_schedule(epoch, cfg)
+                if dabev2hard_static_only_audit is not None:
+                    teacher_loss_sums = {
+                        "final": dabe_pu_teacher_final_loss_sum,
+                        "coarse": dabe_pu_teacher_coarse_loss_sum,
+                        "base": dabe_pu_teacher_base_loss_sum,
+                        "group": dabe_pu_teacher_group_loss_sum,
+                    }
+                    if (
+                        static_weight_log != 1.0
+                        or teacher_weight_log != 0.0
+                        or any(
+                            value != 0.0
+                            for value in teacher_loss_sums.values()
+                        )
+                    ):
+                        raise RuntimeError(
+                            "DABE-v2-hard static-only epoch audit failed: "
+                            f"static/teacher={static_weight_log}/"
+                            f"{teacher_weight_log}, teacher_loss_sums="
+                            f"{teacher_loss_sums}."
+                        )
+                    logger.log(
+                        f"[DABE-v2 Hard StaticOnly] epoch={epoch:03d} | "
+                        "static_weight=1.000000 | teacher_weight=0.000000 | "
+                        "teacher_loss_final/coarse/base/group="
+                        "0.000000/0.000000/0.000000/0.000000 | "
+                        "teacher_target_used_for_gradient=False | "
+                        f"teacher_forward={'False' if pure_student_static_only else 'diagnostic_only'} | "
+                        f"ema_update={'False' if pure_student_static_only else 'diagnostic_only'}"
+                    )
                 if static_weight_audit_enabled:
                     if (
                         static_weight_epoch_accumulator is None
@@ -28255,7 +30008,7 @@ def main():
                     teacher_routing_row = finalize_teacher_routing(
                         teacher_routing_epoch_accumulator
                     )
-                    if teacher_routing_mode == "none":
+                    if teacher_routing_mode in {"none", "ectp", "eaogp"}:
                         if (
                             teacher_routing_row["map_min"] != 1.0
                             or teacher_routing_row["map_mean"] != 1.0
@@ -28263,9 +30016,120 @@ def main():
                             or teacher_routing_row["memory_active"]
                         ):
                             raise RuntimeError(
-                                "No-ECST epoch routing invariant failed: "
+                                "Identity Teacher routing invariant failed: "
                                 f"{teacher_routing_row}"
                             )
+                    if teacher_routing_mode == "ectp":
+                        if ectp_epoch_accumulator is None:
+                            raise RuntimeError(
+                                "ECTP epoch accumulator is unavailable."
+                            )
+                        ectp_epoch_row = finalize_ectp_epoch(
+                            ectp_epoch_accumulator
+                        )
+                        if (
+                            abs(
+                                float(ectp_epoch_row["static_weight"])
+                                - float(static_weight_log)
+                            )
+                            > 1e-6
+                            or abs(
+                                float(ectp_epoch_row["teacher_weight"])
+                                - float(teacher_weight_log)
+                            )
+                            > 1e-6
+                        ):
+                            raise RuntimeError(
+                                "ECTP did not consume the actual global "
+                                "static/Teacher schedule weights."
+                            )
+                        logger.log(
+                            f"[ECTP] epoch={epoch:03d} | "
+                            f"alpha={ectp_epoch_row['static_weight']:.6f} | "
+                            f"beta={ectp_epoch_row['teacher_weight']:.6f} | "
+                            f"overlap={ectp_epoch_row['overlap_rho']:.6f} | "
+                            f"conflict_ratio={ectp_epoch_row['conflict_ratio']:.6f} | "
+                            "fg_to_bg_conflict_ratio="
+                            f"{ectp_epoch_row['fg_to_bg_conflict_ratio']:.6f} | "
+                            "bg_to_fg_conflict_ratio="
+                            f"{ectp_epoch_row['bg_to_fg_conflict_ratio']:.6f} | "
+                            f"support_mean={ectp_epoch_row['support_mean']:.6f} | "
+                            "conflict_support_mean="
+                            f"{ectp_epoch_row['conflict_support_mean']:.6f} | "
+                            "projected_target_mean="
+                            f"{ectp_epoch_row['projected_target_mean']:.6f} | "
+                            "projected_shift_abs_mean="
+                            f"{ectp_epoch_row['projected_shift_abs_mean']:.6f} | "
+                            "fg_protection_mass="
+                            f"{ectp_epoch_row['fg_protection_mass']:.6f} | "
+                            "bg_protection_mass="
+                            f"{ectp_epoch_row['bg_protection_mass']:.6f} | "
+                            f"static_fg_area={ectp_epoch_row['static_fg_area']:.6f} | "
+                            "teacher_binary_area="
+                            f"{ectp_epoch_row['teacher_binary_area']:.6f} | "
+                            f"student_pred_area={ectp_epoch_row['student_pred_area']:.6f} | "
+                            f"teacher_pred_area={ectp_epoch_row['teacher_pred_area']:.6f}"
+                        )
+                    if teacher_routing_mode == "eaogp":
+                        if eaogp_epoch_accumulator is None:
+                            raise RuntimeError(
+                                "EAOGP epoch accumulator is unavailable."
+                            )
+                        eaogp_epoch_row = finalize_eaogp_epoch(
+                            eaogp_epoch_accumulator
+                        )
+                        if (
+                            abs(
+                                float(eaogp_epoch_row["static_weight"])
+                                - float(static_weight_log)
+                            )
+                            > 1e-6
+                            or abs(
+                                float(eaogp_epoch_row["teacher_weight"])
+                                - float(teacher_weight_log)
+                            )
+                            > 1e-6
+                            or abs(
+                                float(eaogp_epoch_row["eaogp_scale"])
+                                - float(get_eaogp_scale(cfg, epoch))
+                            )
+                            > 1e-6
+                        ):
+                            raise RuntimeError(
+                                "EAOGP did not consume the actual global schedule "
+                                "or shared DAGP scale."
+                            )
+                        logger.log(
+                            f"[EAOGP] epoch={epoch:03d} | "
+                            f"static_weight={eaogp_epoch_row['static_weight']:.6f} | "
+                            f"teacher_weight={eaogp_epoch_row['teacher_weight']:.6f} | "
+                            f"eaogp_scale={eaogp_epoch_row['eaogp_scale']:.9f} | "
+                            f"static_fg_area={eaogp_epoch_row['static_fg_area']:.6f} | "
+                            f"teacher_binary_area={eaogp_epoch_row['teacher_binary_area']:.6f} | "
+                            f"student_pred_area={eaogp_epoch_row['student_pred_area']:.6f} | "
+                            f"teacher_pred_area={eaogp_epoch_row['teacher_pred_area']:.6f} | "
+                            f"effective_target_mean={eaogp_epoch_row['effective_target_mean']:.6f} | "
+                            "effective_target_hard_area="
+                            f"{eaogp_epoch_row['effective_target_hard_area']:.6f} | "
+                            "anchor_confidence fg/bg/overall="
+                            f"{eaogp_epoch_row['anchor_confidence_fg_mean']:.6f}/"
+                            f"{eaogp_epoch_row['anchor_confidence_bg_mean']:.6f}/"
+                            f"{eaogp_epoch_row['anchor_confidence_mean']:.6f} | "
+                            "dino/dual/shift="
+                            f"{eaogp_epoch_row['dino_graph_consensus_mean']:.6f}/"
+                            f"{eaogp_epoch_row['dual_graph_consensus_mean']:.6f}/"
+                            f"{eaogp_epoch_row['dual_vs_dino_shift_abs_mean']:.6f} | "
+                            f"task_gate={eaogp_epoch_row['task_gate_mean']:.6f} | "
+                            f"dual_entropy={eaogp_epoch_row['dual_graph_entropy']:.6f} | "
+                            "anchor/graph_delta="
+                            f"{eaogp_epoch_row['anchor_delta_abs_mean']:.6f}/"
+                            f"{eaogp_epoch_row['graph_delta_abs_mean']:.6f} | "
+                            f"new_fg/new_bg={eaogp_epoch_row['new_fg_ratio']:.6f}/"
+                            f"{eaogp_epoch_row['new_bg_ratio']:.6f} | "
+                            "anchor/graph_mass="
+                            f"{eaogp_epoch_row['eaogp_anchor_mass']:.6f}/"
+                            f"{eaogp_epoch_row['eaogp_graph_mass']:.6f}"
+                        )
                     logger.log(
                         f"[TeacherRouting] epoch={epoch:03d} | "
                         f"mode={teacher_routing_mode} | "
@@ -30427,6 +32291,145 @@ def main():
                     f"Dataset: {dataset_name} | time={current_time_text()}"
                 )
                 logger.log(format_metric_table(result))
+
+            if use_ectp_train:
+                if ectp_epoch_row is None or ectp_epoch_stats_path is None:
+                    raise RuntimeError(
+                        "ECTP epoch row/path is unavailable after validation."
+                    )
+                camo_dataset = (
+                    "TE-CAMO"
+                    if "TE-CAMO" in val_results
+                    else next(
+                        (
+                            name
+                            for name in val_results
+                            if "CAMO" in str(name).upper()
+                            and "CHAMELEON" not in str(name).upper()
+                        ),
+                        None,
+                    )
+                )
+                if camo_dataset is None:
+                    raise RuntimeError(
+                        "ECTP epoch CSV requires a CAMO validation result."
+                    )
+                camo_metrics = val_results[camo_dataset]
+                ectp_csv_row = {
+                    "epoch": int(epoch),
+                    **ectp_epoch_row,
+                    "CAMO_Sm": float(camo_metrics["SMeasure"]),
+                    "CAMO_Fw": float(camo_metrics["WFM"]),
+                    "CAMO_Fm": float(camo_metrics["F_MEAN"]),
+                    "CAMO_Em": float(camo_metrics["E_MEAN"]),
+                    "CAMO_MAE": float(camo_metrics["MAE"]),
+                }
+                ectp_csv_headers = (
+                    "epoch",
+                    "static_weight",
+                    "teacher_weight",
+                    "overlap_rho",
+                    "static_fg_ratio",
+                    "teacher_fg_ratio",
+                    "student_pred_area",
+                    "teacher_pred_area",
+                    "conflict_ratio",
+                    "fg_to_bg_conflict_ratio",
+                    "bg_to_fg_conflict_ratio",
+                    "support_mean",
+                    "conflict_support_mean",
+                    "projected_target_mean",
+                    "projected_shift_abs_mean",
+                    "fg_protection_mass",
+                    "bg_protection_mass",
+                    "CAMO_Sm",
+                    "CAMO_Fw",
+                    "CAMO_Fm",
+                    "CAMO_Em",
+                    "CAMO_MAE",
+                )
+                write_csv_row(
+                    ectp_epoch_stats_path,
+                    ectp_csv_headers,
+                    ectp_csv_row,
+                )
+
+            if use_eaogp_train:
+                if eaogp_epoch_row is None or eaogp_epoch_stats_path is None:
+                    raise RuntimeError(
+                        "EAOGP epoch row/path is unavailable after validation."
+                    )
+                camo_dataset = (
+                    "TE-CAMO"
+                    if "TE-CAMO" in val_results
+                    else next(
+                        (
+                            name
+                            for name in val_results
+                            if "CAMO" in str(name).upper()
+                            and "CHAMELEON" not in str(name).upper()
+                        ),
+                        None,
+                    )
+                )
+                if camo_dataset is None:
+                    raise RuntimeError(
+                        "EAOGP epoch CSV requires a CAMO validation result."
+                    )
+                camo_metrics = val_results[camo_dataset]
+                eaogp_csv_row = {
+                    "epoch": int(epoch),
+                    **eaogp_epoch_row,
+                    "CAMO_Sm": float(camo_metrics["SMeasure"]),
+                    "CAMO_Fw": float(camo_metrics["WFM"]),
+                    "CAMO_Fm": float(camo_metrics["F_MEAN"]),
+                    "CAMO_Em": float(camo_metrics["E_MEAN"]),
+                    "CAMO_MAE": float(camo_metrics["MAE"]),
+                }
+                eaogp_csv_headers = (
+                    "epoch",
+                    "static_weight",
+                    "teacher_weight",
+                    "eaogp_scale",
+                    "static_fg_area",
+                    "teacher_binary_area",
+                    "student_pred_area",
+                    "teacher_pred_area",
+                    "effective_target_mean",
+                    "effective_target_hard_area",
+                    "eaogp_target_mean",
+                    "eaogp_target_hard_area",
+                    "anchor_confidence_mean",
+                    "anchor_confidence_fg_mean",
+                    "anchor_confidence_bg_mean",
+                    "teacher_uncertainty_mean",
+                    "dino_graph_consensus_mean",
+                    "dual_graph_consensus_mean",
+                    "dual_vs_dino_shift_abs_mean",
+                    "task_gate_mean",
+                    "dual_graph_entropy",
+                    "anchor_delta_abs_mean",
+                    "graph_delta_abs_mean",
+                    "new_fg_ratio",
+                    "new_bg_ratio",
+                    "eaogp_anchor_mass",
+                    "eaogp_graph_mass",
+                    "eaogp_new_fg_mass",
+                    "eaogp_new_bg_mass",
+                    "loss_static_final",
+                    "loss_teacher_final",
+                    "loss_total",
+                    "CAMO_Sm",
+                    "CAMO_Fw",
+                    "CAMO_Fm",
+                    "CAMO_Em",
+                    "CAMO_MAE",
+                )
+                write_csv_row(
+                    eaogp_epoch_stats_path,
+                    eaogp_csv_headers,
+                    eaogp_csv_row,
+                )
 
             r2b_stop_reasons = []
             r2b_stop_details = {}

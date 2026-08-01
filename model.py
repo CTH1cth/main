@@ -2020,6 +2020,49 @@ class DAGPSafeHead(nn.Module):
         output["dagp_topk_sem_weight_sum_error"] = sum_error.detach()
         return output
 
+    @staticmethod
+    def _attach_eaogp_aux(
+        output,
+        topk_idx,
+        raw_dino_weight,
+        teacher_embedding_37,
+        scale,
+    ):
+        if topk_idx is None or raw_dino_weight is None or teacher_embedding_37 is None:
+            raise RuntimeError("EAOGP auxiliary tensors were not materialized.")
+        topk_idx = topk_idx.detach()
+        raw_dino_weight = raw_dino_weight.detach()
+        teacher_embedding_37 = teacher_embedding_37.detach()
+        if topk_idx.ndim != 3 or tuple(raw_dino_weight.shape) != tuple(topk_idx.shape):
+            raise RuntimeError(
+                "EAOGP raw DINO graph shape mismatch: "
+                f"idx={list(topk_idx.shape)}, weight={list(raw_dino_weight.shape)}"
+            )
+        if teacher_embedding_37.ndim != 4 or tuple(
+            teacher_embedding_37.shape[1:]
+        ) != (64, 37, 37):
+            raise RuntimeError(
+                "EAOGP Teacher embedding must be [B,64,37,37], got "
+                f"{list(teacher_embedding_37.shape)}."
+            )
+        if not bool(torch.isfinite(raw_dino_weight).all().item()) or not bool(
+            torch.isfinite(teacher_embedding_37).all().item()
+        ):
+            raise RuntimeError("EAOGP model auxiliary contains NaN/Inf.")
+        row_sum_error = (raw_dino_weight.float().sum(dim=-1) - 1.0).abs().max()
+        if float(row_sum_error.item()) > 1e-5:
+            raise RuntimeError(
+                "EAOGP raw DINO Top-K weights are not normalized: "
+                f"max_error={float(row_sum_error.item()):.9g}."
+            )
+        output["eaogp_dino_topk_idx"] = topk_idx
+        output["eaogp_dino_topk_weight"] = raw_dino_weight
+        output["eaogp_teacher_embedding_37"] = teacher_embedding_37
+        output["eaogp_dagp_scale"] = teacher_embedding_37.new_tensor(
+            float(scale)
+        ).detach()
+        return output
+
     def _aux_output(
         self,
         logits,
@@ -2307,7 +2350,10 @@ class DAGPSafeHead(nn.Module):
         return_probe_aux=False,
         pa_return_aux=None,
         pa_compare_original=False,
+        return_eaogp_aux=False,
     ):
+        if return_eaogp_aux and not return_aux:
+            raise RuntimeError("return_eaogp_aux=True requires return_aux=True.")
         bsz, _, height, width = feat.shape
         base_logits = self.base_head(feat)
         scale = self._ramp_scale()
@@ -2321,6 +2367,13 @@ class DAGPSafeHead(nn.Module):
         if alpha_eff == 0.0 or gamma_eff == 0.0:
             graph_logits = torch.zeros_like(base_logits)
             semantic_feat = self.proj(feat) if return_aux and self.use_proto_contrast else None
+            eaogp_topk_idx = None
+            eaogp_raw_dino_weight = None
+            eaogp_teacher_embedding = None
+            if return_eaogp_aux:
+                with torch.no_grad():
+                    eaogp_raw_dino_weight, eaogp_topk_idx = self._topk_affinity(feat)
+                    eaogp_teacher_embedding = self.proj(feat).detach()
             pa_state = (
                 self.pa_dagp(feat, base_logits, topk_idx=None, edge_scale=pa_edge_scale)
                 if self.pa_dagp is not None and pa_return_aux
@@ -2348,6 +2401,14 @@ class DAGPSafeHead(nn.Module):
                     with torch.no_grad():
                         semantic_weight, ber_topk_idx = self._topk_affinity(feat)
                     output = self._attach_ber_graph_aux(output, ber_topk_idx, semantic_weight)
+                if return_eaogp_aux and isinstance(output, dict):
+                    output = self._attach_eaogp_aux(
+                        output,
+                        eaogp_topk_idx,
+                        eaogp_raw_dino_weight,
+                        eaogp_teacher_embedding,
+                        scale,
+                    )
                 return output
             if return_aux:
                 uncertainty_gate = self._uncertainty_output_gate(base_logits)
@@ -2367,6 +2428,14 @@ class DAGPSafeHead(nn.Module):
                     with torch.no_grad():
                         semantic_weight, ber_topk_idx = self._topk_affinity(feat)
                     output = self._attach_ber_graph_aux(output, ber_topk_idx, semantic_weight)
+                if return_eaogp_aux:
+                    output = self._attach_eaogp_aux(
+                        output,
+                        eaogp_topk_idx,
+                        eaogp_raw_dino_weight,
+                        eaogp_teacher_embedding,
+                        scale,
+                    )
                 return output
             return base_logits
 
@@ -2375,7 +2444,12 @@ class DAGPSafeHead(nn.Module):
                 attn, topk_idx = self._topk_affinity(feat)
         else:
             attn, topk_idx = self._topk_affinity(feat)
-        semantic_topk_weight = attn.detach() if return_ber_graph_aux else None
+        raw_dino_topk_weight = (
+            attn.detach()
+            if return_ber_graph_aux or return_eaogp_aux
+            else None
+        )
+        semantic_topk_weight = raw_dino_topk_weight if return_ber_graph_aux else None
         if self.use_prob_gate:
             attn = self._apply_prob_gate(attn, topk_idx, base_logits)
         attn_original = attn
@@ -2467,6 +2541,14 @@ class DAGPSafeHead(nn.Module):
                         topk_idx,
                         semantic_topk_weight,
                     )
+                if return_eaogp_aux:
+                    output = self._attach_eaogp_aux(
+                        output,
+                        topk_idx,
+                        raw_dino_topk_weight,
+                        z_map,
+                        scale,
+                    )
             return output
         if return_aux:
             output = self._aux_output(
@@ -2486,6 +2568,14 @@ class DAGPSafeHead(nn.Module):
                     output,
                     topk_idx,
                     semantic_topk_weight,
+                )
+            if return_eaogp_aux:
+                output = self._attach_eaogp_aux(
+                    output,
+                    topk_idx,
+                    raw_dino_topk_weight,
+                    z_map,
+                    scale,
                 )
             return output
         return logits

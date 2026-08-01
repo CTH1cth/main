@@ -1,0 +1,233 @@
+DABE-v2 Hard ECST vs no-ECST configuration audit
+status = PASS
+baseline_config = /home/dell01/CTH/MY-baseline/main/configs/dinov1_s8_dabe_clean_v1_dp_dabev2hard_ecst_dagp_uncgate_ndr_long45_lrfloor_2e5.py
+control_config = /home/dell01/CTH/MY-baseline/main/configs/dinov1_s8_dabe_clean_v1_dp_dabev2hard_noecst_dagp_uncgate_ndr_long45_lrfloor_2e5.py
+compared_uppercase_and_lowercase_field_count = 172
+allowed_differences = ['DABE_CLEAN_USE_LEGACY_ECST_REGIONS', 'EXP_NAME', 'TEACHER_ROUTING_MODE', 'USE_ECST', 'USE_ECST_MINIMAL']
+required_effective_differences = ['DABE_CLEAN_USE_LEGACY_ECST_REGIONS', 'EXP_NAME', 'TEACHER_ROUTING_MODE', 'USE_ECST']
+
+[Effective Differences]
+field = DABE_CLEAN_USE_LEGACY_ECST_REGIONS
+  baseline = True
+  control = False
+field = EXP_NAME
+  baseline = 'dinov1_s8_dabe_clean_v1_dp_dabev2hard_ecst_dagp_uncgate_ndr_long45_lrfloor_2e5'
+  control = 'dinov1_s8_dabe_clean_v1_dp_dabev2hard_noecst_dagp_uncgate_ndr_long45_lrfloor_2e5'
+field = TEACHER_ROUTING_MODE
+  baseline = 'ecst'
+  control = 'none'
+field = USE_ECST
+  baseline = True
+  control = False
+
+[Protected Key Fields]
+DABE_CLEAN_STATIC_TARGET_SOURCE: baseline='dabe_v2_hard_68' | control='dabe_v2_hard_68' | matches=True
+DABE_CLEAN_DABE_V2_ROOT: baseline='../datasets/cache/dabe_v2_pseudo_cache/dinov1-s8' | control='../datasets/cache/dabe_v2_pseudo_cache/dinov1-s8' | matches=True
+DABE_CLEAN_DABE_V2_VERSION: baseline='v2' | control='v2' | matches=True
+DABE_CLEAN_DABE_V2_HARD_THRESHOLD: baseline=0.5 | control=0.5 | matches=True
+DABE_CLEAN_STATIC_WEIGHT_MODE: baseline='ones' | control='ones' | matches=True
+STATIC_WEIGHT_MODE: baseline='ones' | control='ones' | matches=True
+TEACHER_FUSION_MODE: baseline='dabe_clean_despl_sched' | control='dabe_clean_despl_sched' | matches=True
+P_INIT_MODE: baseline='dabe_clean_v1_desplsched' | control='dabe_clean_v1_desplsched' | matches=True
+EMA_WEIGHT: baseline=0.99 | control=0.99 | matches=True
+FINETUNE_RESET_EPOCH: baseline=20 | control=20 | matches=True
+FINETUNE_RESET_TEACHER: baseline=True | control=True | matches=True
+FINETUNE_RESET_LR: baseline=2e-05 | control=2e-05 | matches=True
+LR: baseline=0.0006 | control=0.0006 | matches=True
+LR_FLOOR: baseline=2e-05 | control=2e-05 | matches=True
+MAX_EPOCH: baseline=45 | control=45 | matches=True
+HEAD_TYPE: baseline='dagp_safe' | control='dagp_safe' | matches=True
+DAGP_SAFE_TOPK: baseline=12 | control=12 | matches=True
+DAGP_SAFE_TAU: baseline=0.07 | control=0.07 | matches=True
+DAGP_SAFE_ALPHA_MAX: baseline=0.05 | control=0.05 | matches=True
+DAGP_SAFE_GAMMA_MAX: baseline=0.03 | control=0.03 | matches=True
+NDR_VERSION: baseline='<MISSING>' | control='<MISSING>' | matches=True
+NDR_BETA_MAX: baseline=0.1 | control=0.1 | matches=True
+LAMBDA_BASE_AUX: baseline=0.5 | control=0.5 | matches=True
+LAMBDA_BASE_AUX_AFTER_RESET: baseline=0.3 | control=0.3 | matches=True
+
+[Safety]
+creates_model = False
+creates_dataset = False
+starts_training = False
+starts_evaluation = False
+
+[Errors]
+none
+
+[JSON]
+{
+  "schema": "dabev2hard_ecst_vs_noecst_config_audit_v1",
+  "status": "PASS",
+  "baseline_config": "/home/dell01/CTH/MY-baseline/main/configs/dinov1_s8_dabe_clean_v1_dp_dabev2hard_ecst_dagp_uncgate_ndr_long45_lrfloor_2e5.py",
+  "control_config": "/home/dell01/CTH/MY-baseline/main/configs/dinov1_s8_dabe_clean_v1_dp_dabev2hard_noecst_dagp_uncgate_ndr_long45_lrfloor_2e5.py",
+  "compared_uppercase_and_lowercase_field_count": 172,
+  "allowed_differences": [
+    "DABE_CLEAN_USE_LEGACY_ECST_REGIONS",
+    "EXP_NAME",
+    "TEACHER_ROUTING_MODE",
+    "USE_ECST",
+    "USE_ECST_MINIMAL"
+  ],
+  "required_effective_differences": [
+    "DABE_CLEAN_USE_LEGACY_ECST_REGIONS",
+    "EXP_NAME",
+    "TEACHER_ROUTING_MODE",
+    "USE_ECST"
+  ],
+  "actual_differences": [
+    {
+      "field": "DABE_CLEAN_USE_LEGACY_ECST_REGIONS",
+      "baseline": true,
+      "control": false
+    },
+    {
+      "field": "EXP_NAME",
+      "baseline": "dinov1_s8_dabe_clean_v1_dp_dabev2hard_ecst_dagp_uncgate_ndr_long45_lrfloor_2e5",
+      "control": "dinov1_s8_dabe_clean_v1_dp_dabev2hard_noecst_dagp_uncgate_ndr_long45_lrfloor_2e5"
+    },
+    {
+      "field": "TEACHER_ROUTING_MODE",
+      "baseline": "ecst",
+      "control": "none"
+    },
+    {
+      "field": "USE_ECST",
+      "baseline": true,
+      "control": false
+    }
+  ],
+  "key_fields": {
+    "DABE_CLEAN_STATIC_TARGET_SOURCE": {
+      "baseline": "dabe_v2_hard_68",
+      "control": "dabe_v2_hard_68",
+      "matches": true
+    },
+    "DABE_CLEAN_DABE_V2_ROOT": {
+      "baseline": "../datasets/cache/dabe_v2_pseudo_cache/dinov1-s8",
+      "control": "../datasets/cache/dabe_v2_pseudo_cache/dinov1-s8",
+      "matches": true
+    },
+    "DABE_CLEAN_DABE_V2_VERSION": {
+      "baseline": "v2",
+      "control": "v2",
+      "matches": true
+    },
+    "DABE_CLEAN_DABE_V2_HARD_THRESHOLD": {
+      "baseline": 0.5,
+      "control": 0.5,
+      "matches": true
+    },
+    "DABE_CLEAN_STATIC_WEIGHT_MODE": {
+      "baseline": "ones",
+      "control": "ones",
+      "matches": true
+    },
+    "STATIC_WEIGHT_MODE": {
+      "baseline": "ones",
+      "control": "ones",
+      "matches": true
+    },
+    "TEACHER_FUSION_MODE": {
+      "baseline": "dabe_clean_despl_sched",
+      "control": "dabe_clean_despl_sched",
+      "matches": true
+    },
+    "P_INIT_MODE": {
+      "baseline": "dabe_clean_v1_desplsched",
+      "control": "dabe_clean_v1_desplsched",
+      "matches": true
+    },
+    "EMA_WEIGHT": {
+      "baseline": 0.99,
+      "control": 0.99,
+      "matches": true
+    },
+    "FINETUNE_RESET_EPOCH": {
+      "baseline": 20,
+      "control": 20,
+      "matches": true
+    },
+    "FINETUNE_RESET_TEACHER": {
+      "baseline": true,
+      "control": true,
+      "matches": true
+    },
+    "FINETUNE_RESET_LR": {
+      "baseline": 2e-05,
+      "control": 2e-05,
+      "matches": true
+    },
+    "LR": {
+      "baseline": 0.0006,
+      "control": 0.0006,
+      "matches": true
+    },
+    "LR_FLOOR": {
+      "baseline": 2e-05,
+      "control": 2e-05,
+      "matches": true
+    },
+    "MAX_EPOCH": {
+      "baseline": 45,
+      "control": 45,
+      "matches": true
+    },
+    "HEAD_TYPE": {
+      "baseline": "dagp_safe",
+      "control": "dagp_safe",
+      "matches": true
+    },
+    "DAGP_SAFE_TOPK": {
+      "baseline": 12,
+      "control": 12,
+      "matches": true
+    },
+    "DAGP_SAFE_TAU": {
+      "baseline": 0.07,
+      "control": 0.07,
+      "matches": true
+    },
+    "DAGP_SAFE_ALPHA_MAX": {
+      "baseline": 0.05,
+      "control": 0.05,
+      "matches": true
+    },
+    "DAGP_SAFE_GAMMA_MAX": {
+      "baseline": 0.03,
+      "control": 0.03,
+      "matches": true
+    },
+    "NDR_VERSION": {
+      "baseline": "<MISSING>",
+      "control": "<MISSING>",
+      "matches": true
+    },
+    "NDR_BETA_MAX": {
+      "baseline": 0.1,
+      "control": 0.1,
+      "matches": true
+    },
+    "LAMBDA_BASE_AUX": {
+      "baseline": 0.5,
+      "control": 0.5,
+      "matches": true
+    },
+    "LAMBDA_BASE_AUX_AFTER_RESET": {
+      "baseline": 0.3,
+      "control": 0.3,
+      "matches": true
+    }
+  },
+  "errors": [],
+  "safety": {
+    "creates_model": false,
+    "creates_dataset": false,
+    "starts_training": false,
+    "starts_evaluation": false
+  },
+  "teacher_routing_validation": {
+    "mode": "none",
+    "uses_ecst": false
+  }
+}

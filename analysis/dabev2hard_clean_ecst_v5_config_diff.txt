@@ -1,0 +1,768 @@
+DABE-v2 Hard + A1 Clean-ECST v5 configuration audit
+status = PASS
+parent_config = /home/dell01/CTH/MY-baseline/main/configs/dinov1_s8_dabe_clean_v1_dp_clean_ecst_v5_ab_contrec_a1_residual_only_e25_a10_c25_dagp_uncgate_ndr_long45_lrfloor_2e5.py
+control_config = /home/dell01/CTH/MY-baseline/main/configs/dinov1_s8_dabe_clean_v1_dp_dabev2hard_clean_ecst_v5_ab_contrec_a1_residual_only_e25_a10_c25_dagp_uncgate_ndr_long45_lrfloor_2e5.py
+compared_uppercase_and_lowercase_field_count = 204
+allowed_differences = ['DABE_CLEAN_DABE_V2_HARD_THRESHOLD', 'DABE_CLEAN_DABE_V2_ROOT', 'DABE_CLEAN_DABE_V2_VERSION', 'DABE_CLEAN_STATIC_TARGET_SOURCE', 'EXP_NAME']
+required_effective_differences = ['DABE_CLEAN_DABE_V2_HARD_THRESHOLD', 'DABE_CLEAN_DABE_V2_ROOT', 'DABE_CLEAN_DABE_V2_VERSION', 'DABE_CLEAN_STATIC_TARGET_SOURCE', 'EXP_NAME']
+
+[Effective Differences]
+field = DABE_CLEAN_DABE_V2_HARD_THRESHOLD
+  parent = '<MISSING>'
+  control = 0.5
+field = DABE_CLEAN_DABE_V2_ROOT
+  parent = '<MISSING>'
+  control = '../datasets/cache/dabe_v2_pseudo_cache/dinov1-s8'
+field = DABE_CLEAN_DABE_V2_VERSION
+  parent = '<MISSING>'
+  control = 'v2'
+field = DABE_CLEAN_STATIC_TARGET_SOURCE
+  parent = '<MISSING>'
+  control = 'dabe_v2_hard_68'
+field = EXP_NAME
+  parent = 'dinov1_s8_dabe_clean_v1_dp_clean_ecst_v5_ab_contrec_a1_residual_only_e25_a10_c25_dagp_uncgate_ndr_long45_lrfloor_2e5'
+  control = 'dinov1_s8_dabe_clean_v1_dp_dabev2hard_clean_ecst_v5_ab_contrec_a1_residual_only_e25_a10_c25_dagp_uncgate_ndr_long45_lrfloor_2e5'
+
+[Supervision Semantics]
+static_bce_source = 'dabe_v2_hard_68'
+static_bce_formula = '1[p_dabe_68 > 0.5]'
+clean_ecst_routing_target = 'dabe_clean_target_68'
+clean_ecst_routing_recoverability = 'dabe_clean_recoverability_68'
+routing_evidence_cache = '../datasets/cache/dabe_clean_v2_contrec_a1_residual_only_pseudo_cache/dinov1-s8'
+routing_evidence_unchanged_from_parent = True
+static_cache = '../datasets/cache/dabe_v2_pseudo_cache/dinov1-s8'
+single_variable_statement = 'Only static BCE changes to DABE-v2 Hard; A1 Clean target and continuous recoverability remain the Clean-ECST evidence.'
+
+[Protected Fields]
+DABE_BC_LAMBDA: parent=0.0 | control=0.0 | matches=True
+DABE_CLEAN_ABLATION: parent='a1_residual_only_no_weak_bc_multiplier' | control='a1_residual_only_no_weak_bc_multiplier' | matches=True
+DABE_CLEAN_EXPECTED_PAYLOAD_VERSION: parent='dabe_clean_v2_contrec' | control='dabe_clean_v2_contrec' | matches=True
+DABE_CLEAN_ROOT: parent='../datasets/cache/dabe_clean_v2_contrec_a1_residual_only_pseudo_cache/dinov1-s8' | control='../datasets/cache/dabe_clean_v2_contrec_a1_residual_only_pseudo_cache/dinov1-s8' | matches=True
+DABE_CLEAN_SOURCE_ROOT: parent='../datasets/cache/dabe_clean_v1_a1_residual_only_pseudo_cache/dinov1-s8' | control='../datasets/cache/dabe_clean_v1_a1_residual_only_pseudo_cache/dinov1-s8' | matches=True
+DABE_CLEAN_TARGET_MODE: parent='dp' | control='dp' | matches=True
+DABE_CLEAN_USE_LEGACY_ECST_REGIONS: parent=False | control=False | matches=True
+DABE_CLEAN_VERSION: parent='v2_contrec' | control='v2_contrec' | matches=True
+DABE_PU_DESPL_STAGE_END: parent=20 | control=20 | matches=True
+DABE_PU_DESPL_STAGE_START: parent=1 | control=1 | matches=True
+DABE_PU_DESPL_STATIC_END: parent=0.05 | control=0.05 | matches=True
+DABE_PU_DESPL_STATIC_START: parent=1.0 | control=1.0 | matches=True
+DABE_PU_DESPL_TEACHER_END: parent=0.95 | control=0.95 | matches=True
+DABE_PU_DESPL_TEACHER_ONLY_START: parent=21 | control=21 | matches=True
+DABE_PU_DESPL_TEACHER_START: parent=0.0 | control=0.0 | matches=True
+DAGP_SAFE_AFFINITY_DETACH: parent=True | control=True | matches=True
+DAGP_SAFE_ALPHA_MAX: parent=0.05 | control=0.05 | matches=True
+DAGP_SAFE_DEBUG_FIRST_BATCH: parent=True | control=True | matches=True
+DAGP_SAFE_EXCLUDE_SELF: parent=True | control=True | matches=True
+DAGP_SAFE_GAMMA_MAX: parent=0.03 | control=0.03 | matches=True
+DAGP_SAFE_HIDDEN: parent=64 | control=64 | matches=True
+DAGP_SAFE_PROB_GATE_EPS: parent=1e-06 | control=1e-06 | matches=True
+DAGP_SAFE_PROB_GATE_SIGMA: parent=0.25 | control=0.25 | matches=True
+DAGP_SAFE_RAMP_END_EPOCH: parent=15 | control=15 | matches=True
+DAGP_SAFE_RAMP_START_EPOCH: parent=7 | control=7 | matches=True
+DAGP_SAFE_TAU: parent=0.07 | control=0.07 | matches=True
+DAGP_SAFE_TOPK: parent=12 | control=12 | matches=True
+DAGP_SAFE_UNCERTAINTY_DETACH: parent=True | control=True | matches=True
+DAGP_SAFE_UNCERTAINTY_MAX: parent=1.0 | control=1.0 | matches=True
+DAGP_SAFE_UNCERTAINTY_MIN: parent=0.0 | control=0.0 | matches=True
+DAGP_SAFE_UNCERTAINTY_POWER: parent=1.0 | control=1.0 | matches=True
+DAGP_SAFE_USE_PROB_GATE: parent=True | control=True | matches=True
+DAGP_SAFE_USE_UNCERTAINTY_OUTPUT_GATE: parent=True | control=True | matches=True
+DAGP_SAFE_WARMUP_EPOCH: parent=6 | control=6 | matches=True
+DAGP_SAFE_ZERO_INIT_GRAPH_PRED: parent=True | control=True | matches=True
+DAGP_SAFE_ZERO_INIT_VALUE: parent=False | control=False | matches=True
+ECST_CLEAN_ADD_STRENGTH: parent=1.0 | control=1.0 | matches=True
+ECST_CLEAN_APPLY_TO_BASE_AUX: parent=True | control=True | matches=True
+ECST_CLEAN_APPLY_TO_COARSE_AUX: parent=True | control=True | matches=True
+ECST_CLEAN_APPLY_TO_FINAL: parent=True | control=True | matches=True
+ECST_CLEAN_CONFLICT_FLOOR: parent=0.2 | control=0.2 | matches=True
+ECST_CLEAN_ERASE_STRENGTH: parent=2.5 | control=2.5 | matches=True
+ECST_CLEAN_MARGIN_TAU: parent=0.05 | control=0.05 | matches=True
+ECST_CLEAN_MEMORY_DTYPE: parent='float16' | control='float16' | matches=True
+ECST_CLEAN_MEMORY_UPDATE_END_EPOCH: parent=20 | control=20 | matches=True
+ECST_CLEAN_MEMORY_UPDATE_START_EPOCH: parent=1 | control=1 | matches=True
+ECST_CLEAN_MIN_HISTORY: parent=3 | control=3 | matches=True
+ECST_CLEAN_NEGATIVE_WEIGHT_FLOOR: parent=0.25 | control=0.25 | matches=True
+ECST_CLEAN_RAMP_END_EPOCH: parent=10 | control=10 | matches=True
+ECST_CLEAN_RECOVERY_MODE: parent='latent_rw_geometric_mean' | control='latent_rw_geometric_mean' | matches=True
+ECST_CLEAN_RECOVERY_STRENGTH: parent=2.5 | control=2.5 | matches=True
+ECST_CLEAN_RESET_MEMORY_AT_FINETUNE_RESET: parent=True | control=True | matches=True
+ECST_CLEAN_START_EPOCH: parent=5 | control=5 | matches=True
+ECST_CLEAN_STOP_EPOCH: parent=21 | control=21 | matches=True
+ECST_CLEAN_STRENGTH_MODE: parent='directional_continuous' | control='directional_continuous' | matches=True
+ECST_CLEAN_TEMPORAL_RHO: parent=0.9 | control=0.9 | matches=True
+ECST_CLEAN_USE_HARD_RING: parent=False | control=False | matches=True
+ECST_CLEAN_USE_PREUPDATE_STATS: parent=True | control=True | matches=True
+ECST_CLEAN_VARIANCE_TAU: parent=0.02 | control=0.02 | matches=True
+ECST_CLEAN_VERSION: parent='v5_asym_continuous_recoverability' | control='v5_asym_continuous_recoverability' | matches=True
+ECST_CLEAN_WEIGHT_MAX: parent=1.0 | control=1.0 | matches=True
+ECST_CLEAN_WEIGHT_MIN: parent=0.2 | control=0.2 | matches=True
+EMA_WEIGHT: parent=0.99 | control=0.99 | matches=True
+FINETUNE_RESET_EPOCH: parent=20 | control=20 | matches=True
+FINETUNE_RESET_FORCE_LR_FLOOR: parent=True | control=True | matches=True
+FINETUNE_RESET_GLOBAL_STEP: parent=True | control=True | matches=True
+FINETUNE_RESET_LR: parent=2e-05 | control=2e-05 | matches=True
+FINETUNE_RESET_REBUILD_OPTIMIZER: parent=True | control=True | matches=True
+FINETUNE_RESET_REBUILD_SCHEDULER: parent=True | control=True | matches=True
+FINETUNE_RESET_TEACHER: parent=True | control=True | matches=True
+FINETUNE_RESET_TIMING: parent='after_epoch' | control='after_epoch' | matches=True
+HEAD_TYPE: parent='dagp_safe' | control='dagp_safe' | matches=True
+LAMBDA_BASE_AUX: parent=0.5 | control=0.5 | matches=True
+LAMBDA_BASE_AUX_AFTER_RESET: parent=0.3 | control=0.3 | matches=True
+LR: parent=0.0006 | control=0.0006 | matches=True
+LR_FLOOR: parent=2e-05 | control=2e-05 | matches=True
+MAX_EPOCH: parent=45 | control=45 | matches=True
+NDR_ACT: parent='gelu' | control='gelu' | matches=True
+NDR_BETA_MAX: parent=0.1 | control=0.1 | matches=True
+NDR_DEBUG_FIRST_BATCH: parent=True | control=True | matches=True
+NDR_GATE_MODE: parent='uncertainty_edge_boost' | control='uncertainty_edge_boost' | matches=True
+NDR_GN_GROUPS: parent=4 | control=4 | matches=True
+NDR_HIDDEN: parent=32 | control=32 | matches=True
+NDR_INPUT_COARSE_PROB: parent=True | control=True | matches=True
+NDR_INPUT_RGB: parent=True | control=True | matches=True
+NDR_INPUT_SOBEL: parent=True | control=True | matches=True
+NDR_IN_CHANNELS: parent=5 | control=5 | matches=True
+NDR_NUM_LAYERS: parent=3 | control=3 | matches=True
+NDR_RAMP_END_EPOCH: parent=15 | control=15 | matches=True
+NDR_RAMP_START_EPOCH: parent=7 | control=7 | matches=True
+NDR_RESIDUAL_CLIP: parent=2.0 | control=2.0 | matches=True
+NDR_RES_REG_WEIGHT: parent=0.001 | control=0.001 | matches=True
+NDR_USE_EDGE_GATE: parent=True | control=True | matches=True
+NDR_USE_GN: parent=True | control=True | matches=True
+NDR_USE_RES_REG: parent=False | control=False | matches=True
+NDR_USE_UNCERTAINTY_GATE: parent=True | control=True | matches=True
+NDR_WARMUP_EPOCH: parent=6 | control=6 | matches=True
+NDR_ZERO_INIT_OUT: parent=True | control=True | matches=True
+STOP_AFTER_EPOCH: parent=0 | control=0 | matches=True
+TEACHER_FUSION_MODE: parent='dabe_clean_despl_sched' | control='dabe_clean_despl_sched' | matches=True
+TEACHER_ROUTING_MODE: parent='clean_ecst' | control='clean_ecst' | matches=True
+USE_DABE_CLEAN_DESPL_SCHEDULE: parent=True | control=True | matches=True
+USE_DABE_PU_DESPL_SCHEDULE: parent=False | control=False | matches=True
+USE_DAGP_SAFE_HEAD: parent=True | control=True | matches=True
+USE_ECST: parent=False | control=False | matches=True
+USE_ECST_CLEAN: parent=True | control=True | matches=True
+USE_ECST_MINIMAL: parent=False | control=False | matches=True
+USE_NDR_BRANCH: parent=True | control=True | matches=True
+USE_NDR_COARSE_AUX: parent=True | control=True | matches=True
+
+[Safety]
+creates_model = False
+creates_dataset = False
+starts_training = False
+starts_evaluation = False
+
+[Errors]
+none
+
+[JSON]
+{
+  "schema": "dabev2hard_clean_ecst_v5_config_audit_v1",
+  "status": "PASS",
+  "parent_config": "/home/dell01/CTH/MY-baseline/main/configs/dinov1_s8_dabe_clean_v1_dp_clean_ecst_v5_ab_contrec_a1_residual_only_e25_a10_c25_dagp_uncgate_ndr_long45_lrfloor_2e5.py",
+  "control_config": "/home/dell01/CTH/MY-baseline/main/configs/dinov1_s8_dabe_clean_v1_dp_dabev2hard_clean_ecst_v5_ab_contrec_a1_residual_only_e25_a10_c25_dagp_uncgate_ndr_long45_lrfloor_2e5.py",
+  "compared_uppercase_and_lowercase_field_count": 204,
+  "allowed_differences": [
+    "DABE_CLEAN_DABE_V2_HARD_THRESHOLD",
+    "DABE_CLEAN_DABE_V2_ROOT",
+    "DABE_CLEAN_DABE_V2_VERSION",
+    "DABE_CLEAN_STATIC_TARGET_SOURCE",
+    "EXP_NAME"
+  ],
+  "required_effective_differences": [
+    "DABE_CLEAN_DABE_V2_HARD_THRESHOLD",
+    "DABE_CLEAN_DABE_V2_ROOT",
+    "DABE_CLEAN_DABE_V2_VERSION",
+    "DABE_CLEAN_STATIC_TARGET_SOURCE",
+    "EXP_NAME"
+  ],
+  "actual_differences": [
+    {
+      "field": "DABE_CLEAN_DABE_V2_HARD_THRESHOLD",
+      "parent": "<MISSING>",
+      "control": 0.5
+    },
+    {
+      "field": "DABE_CLEAN_DABE_V2_ROOT",
+      "parent": "<MISSING>",
+      "control": "../datasets/cache/dabe_v2_pseudo_cache/dinov1-s8"
+    },
+    {
+      "field": "DABE_CLEAN_DABE_V2_VERSION",
+      "parent": "<MISSING>",
+      "control": "v2"
+    },
+    {
+      "field": "DABE_CLEAN_STATIC_TARGET_SOURCE",
+      "parent": "<MISSING>",
+      "control": "dabe_v2_hard_68"
+    },
+    {
+      "field": "EXP_NAME",
+      "parent": "dinov1_s8_dabe_clean_v1_dp_clean_ecst_v5_ab_contrec_a1_residual_only_e25_a10_c25_dagp_uncgate_ndr_long45_lrfloor_2e5",
+      "control": "dinov1_s8_dabe_clean_v1_dp_dabev2hard_clean_ecst_v5_ab_contrec_a1_residual_only_e25_a10_c25_dagp_uncgate_ndr_long45_lrfloor_2e5"
+    }
+  ],
+  "protected_fields": {
+    "DABE_BC_LAMBDA": {
+      "parent": 0.0,
+      "control": 0.0,
+      "matches": true
+    },
+    "DABE_CLEAN_ABLATION": {
+      "parent": "a1_residual_only_no_weak_bc_multiplier",
+      "control": "a1_residual_only_no_weak_bc_multiplier",
+      "matches": true
+    },
+    "DABE_CLEAN_EXPECTED_PAYLOAD_VERSION": {
+      "parent": "dabe_clean_v2_contrec",
+      "control": "dabe_clean_v2_contrec",
+      "matches": true
+    },
+    "DABE_CLEAN_ROOT": {
+      "parent": "../datasets/cache/dabe_clean_v2_contrec_a1_residual_only_pseudo_cache/dinov1-s8",
+      "control": "../datasets/cache/dabe_clean_v2_contrec_a1_residual_only_pseudo_cache/dinov1-s8",
+      "matches": true
+    },
+    "DABE_CLEAN_SOURCE_ROOT": {
+      "parent": "../datasets/cache/dabe_clean_v1_a1_residual_only_pseudo_cache/dinov1-s8",
+      "control": "../datasets/cache/dabe_clean_v1_a1_residual_only_pseudo_cache/dinov1-s8",
+      "matches": true
+    },
+    "DABE_CLEAN_TARGET_MODE": {
+      "parent": "dp",
+      "control": "dp",
+      "matches": true
+    },
+    "DABE_CLEAN_USE_LEGACY_ECST_REGIONS": {
+      "parent": false,
+      "control": false,
+      "matches": true
+    },
+    "DABE_CLEAN_VERSION": {
+      "parent": "v2_contrec",
+      "control": "v2_contrec",
+      "matches": true
+    },
+    "DABE_PU_DESPL_STAGE_END": {
+      "parent": 20,
+      "control": 20,
+      "matches": true
+    },
+    "DABE_PU_DESPL_STAGE_START": {
+      "parent": 1,
+      "control": 1,
+      "matches": true
+    },
+    "DABE_PU_DESPL_STATIC_END": {
+      "parent": 0.05,
+      "control": 0.05,
+      "matches": true
+    },
+    "DABE_PU_DESPL_STATIC_START": {
+      "parent": 1.0,
+      "control": 1.0,
+      "matches": true
+    },
+    "DABE_PU_DESPL_TEACHER_END": {
+      "parent": 0.95,
+      "control": 0.95,
+      "matches": true
+    },
+    "DABE_PU_DESPL_TEACHER_ONLY_START": {
+      "parent": 21,
+      "control": 21,
+      "matches": true
+    },
+    "DABE_PU_DESPL_TEACHER_START": {
+      "parent": 0.0,
+      "control": 0.0,
+      "matches": true
+    },
+    "DAGP_SAFE_AFFINITY_DETACH": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "DAGP_SAFE_ALPHA_MAX": {
+      "parent": 0.05,
+      "control": 0.05,
+      "matches": true
+    },
+    "DAGP_SAFE_DEBUG_FIRST_BATCH": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "DAGP_SAFE_EXCLUDE_SELF": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "DAGP_SAFE_GAMMA_MAX": {
+      "parent": 0.03,
+      "control": 0.03,
+      "matches": true
+    },
+    "DAGP_SAFE_HIDDEN": {
+      "parent": 64,
+      "control": 64,
+      "matches": true
+    },
+    "DAGP_SAFE_PROB_GATE_EPS": {
+      "parent": 1e-06,
+      "control": 1e-06,
+      "matches": true
+    },
+    "DAGP_SAFE_PROB_GATE_SIGMA": {
+      "parent": 0.25,
+      "control": 0.25,
+      "matches": true
+    },
+    "DAGP_SAFE_RAMP_END_EPOCH": {
+      "parent": 15,
+      "control": 15,
+      "matches": true
+    },
+    "DAGP_SAFE_RAMP_START_EPOCH": {
+      "parent": 7,
+      "control": 7,
+      "matches": true
+    },
+    "DAGP_SAFE_TAU": {
+      "parent": 0.07,
+      "control": 0.07,
+      "matches": true
+    },
+    "DAGP_SAFE_TOPK": {
+      "parent": 12,
+      "control": 12,
+      "matches": true
+    },
+    "DAGP_SAFE_UNCERTAINTY_DETACH": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "DAGP_SAFE_UNCERTAINTY_MAX": {
+      "parent": 1.0,
+      "control": 1.0,
+      "matches": true
+    },
+    "DAGP_SAFE_UNCERTAINTY_MIN": {
+      "parent": 0.0,
+      "control": 0.0,
+      "matches": true
+    },
+    "DAGP_SAFE_UNCERTAINTY_POWER": {
+      "parent": 1.0,
+      "control": 1.0,
+      "matches": true
+    },
+    "DAGP_SAFE_USE_PROB_GATE": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "DAGP_SAFE_USE_UNCERTAINTY_OUTPUT_GATE": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "DAGP_SAFE_WARMUP_EPOCH": {
+      "parent": 6,
+      "control": 6,
+      "matches": true
+    },
+    "DAGP_SAFE_ZERO_INIT_GRAPH_PRED": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "DAGP_SAFE_ZERO_INIT_VALUE": {
+      "parent": false,
+      "control": false,
+      "matches": true
+    },
+    "ECST_CLEAN_ADD_STRENGTH": {
+      "parent": 1.0,
+      "control": 1.0,
+      "matches": true
+    },
+    "ECST_CLEAN_APPLY_TO_BASE_AUX": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "ECST_CLEAN_APPLY_TO_COARSE_AUX": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "ECST_CLEAN_APPLY_TO_FINAL": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "ECST_CLEAN_CONFLICT_FLOOR": {
+      "parent": 0.2,
+      "control": 0.2,
+      "matches": true
+    },
+    "ECST_CLEAN_ERASE_STRENGTH": {
+      "parent": 2.5,
+      "control": 2.5,
+      "matches": true
+    },
+    "ECST_CLEAN_MARGIN_TAU": {
+      "parent": 0.05,
+      "control": 0.05,
+      "matches": true
+    },
+    "ECST_CLEAN_MEMORY_DTYPE": {
+      "parent": "float16",
+      "control": "float16",
+      "matches": true
+    },
+    "ECST_CLEAN_MEMORY_UPDATE_END_EPOCH": {
+      "parent": 20,
+      "control": 20,
+      "matches": true
+    },
+    "ECST_CLEAN_MEMORY_UPDATE_START_EPOCH": {
+      "parent": 1,
+      "control": 1,
+      "matches": true
+    },
+    "ECST_CLEAN_MIN_HISTORY": {
+      "parent": 3,
+      "control": 3,
+      "matches": true
+    },
+    "ECST_CLEAN_NEGATIVE_WEIGHT_FLOOR": {
+      "parent": 0.25,
+      "control": 0.25,
+      "matches": true
+    },
+    "ECST_CLEAN_RAMP_END_EPOCH": {
+      "parent": 10,
+      "control": 10,
+      "matches": true
+    },
+    "ECST_CLEAN_RECOVERY_MODE": {
+      "parent": "latent_rw_geometric_mean",
+      "control": "latent_rw_geometric_mean",
+      "matches": true
+    },
+    "ECST_CLEAN_RECOVERY_STRENGTH": {
+      "parent": 2.5,
+      "control": 2.5,
+      "matches": true
+    },
+    "ECST_CLEAN_RESET_MEMORY_AT_FINETUNE_RESET": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "ECST_CLEAN_START_EPOCH": {
+      "parent": 5,
+      "control": 5,
+      "matches": true
+    },
+    "ECST_CLEAN_STOP_EPOCH": {
+      "parent": 21,
+      "control": 21,
+      "matches": true
+    },
+    "ECST_CLEAN_STRENGTH_MODE": {
+      "parent": "directional_continuous",
+      "control": "directional_continuous",
+      "matches": true
+    },
+    "ECST_CLEAN_TEMPORAL_RHO": {
+      "parent": 0.9,
+      "control": 0.9,
+      "matches": true
+    },
+    "ECST_CLEAN_USE_HARD_RING": {
+      "parent": false,
+      "control": false,
+      "matches": true
+    },
+    "ECST_CLEAN_USE_PREUPDATE_STATS": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "ECST_CLEAN_VARIANCE_TAU": {
+      "parent": 0.02,
+      "control": 0.02,
+      "matches": true
+    },
+    "ECST_CLEAN_VERSION": {
+      "parent": "v5_asym_continuous_recoverability",
+      "control": "v5_asym_continuous_recoverability",
+      "matches": true
+    },
+    "ECST_CLEAN_WEIGHT_MAX": {
+      "parent": 1.0,
+      "control": 1.0,
+      "matches": true
+    },
+    "ECST_CLEAN_WEIGHT_MIN": {
+      "parent": 0.2,
+      "control": 0.2,
+      "matches": true
+    },
+    "EMA_WEIGHT": {
+      "parent": 0.99,
+      "control": 0.99,
+      "matches": true
+    },
+    "FINETUNE_RESET_EPOCH": {
+      "parent": 20,
+      "control": 20,
+      "matches": true
+    },
+    "FINETUNE_RESET_FORCE_LR_FLOOR": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "FINETUNE_RESET_GLOBAL_STEP": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "FINETUNE_RESET_LR": {
+      "parent": 2e-05,
+      "control": 2e-05,
+      "matches": true
+    },
+    "FINETUNE_RESET_REBUILD_OPTIMIZER": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "FINETUNE_RESET_REBUILD_SCHEDULER": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "FINETUNE_RESET_TEACHER": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "FINETUNE_RESET_TIMING": {
+      "parent": "after_epoch",
+      "control": "after_epoch",
+      "matches": true
+    },
+    "HEAD_TYPE": {
+      "parent": "dagp_safe",
+      "control": "dagp_safe",
+      "matches": true
+    },
+    "LAMBDA_BASE_AUX": {
+      "parent": 0.5,
+      "control": 0.5,
+      "matches": true
+    },
+    "LAMBDA_BASE_AUX_AFTER_RESET": {
+      "parent": 0.3,
+      "control": 0.3,
+      "matches": true
+    },
+    "LR": {
+      "parent": 0.0006,
+      "control": 0.0006,
+      "matches": true
+    },
+    "LR_FLOOR": {
+      "parent": 2e-05,
+      "control": 2e-05,
+      "matches": true
+    },
+    "MAX_EPOCH": {
+      "parent": 45,
+      "control": 45,
+      "matches": true
+    },
+    "NDR_ACT": {
+      "parent": "gelu",
+      "control": "gelu",
+      "matches": true
+    },
+    "NDR_BETA_MAX": {
+      "parent": 0.1,
+      "control": 0.1,
+      "matches": true
+    },
+    "NDR_DEBUG_FIRST_BATCH": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "NDR_GATE_MODE": {
+      "parent": "uncertainty_edge_boost",
+      "control": "uncertainty_edge_boost",
+      "matches": true
+    },
+    "NDR_GN_GROUPS": {
+      "parent": 4,
+      "control": 4,
+      "matches": true
+    },
+    "NDR_HIDDEN": {
+      "parent": 32,
+      "control": 32,
+      "matches": true
+    },
+    "NDR_INPUT_COARSE_PROB": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "NDR_INPUT_RGB": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "NDR_INPUT_SOBEL": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "NDR_IN_CHANNELS": {
+      "parent": 5,
+      "control": 5,
+      "matches": true
+    },
+    "NDR_NUM_LAYERS": {
+      "parent": 3,
+      "control": 3,
+      "matches": true
+    },
+    "NDR_RAMP_END_EPOCH": {
+      "parent": 15,
+      "control": 15,
+      "matches": true
+    },
+    "NDR_RAMP_START_EPOCH": {
+      "parent": 7,
+      "control": 7,
+      "matches": true
+    },
+    "NDR_RESIDUAL_CLIP": {
+      "parent": 2.0,
+      "control": 2.0,
+      "matches": true
+    },
+    "NDR_RES_REG_WEIGHT": {
+      "parent": 0.001,
+      "control": 0.001,
+      "matches": true
+    },
+    "NDR_USE_EDGE_GATE": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "NDR_USE_GN": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "NDR_USE_RES_REG": {
+      "parent": false,
+      "control": false,
+      "matches": true
+    },
+    "NDR_USE_UNCERTAINTY_GATE": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "NDR_WARMUP_EPOCH": {
+      "parent": 6,
+      "control": 6,
+      "matches": true
+    },
+    "NDR_ZERO_INIT_OUT": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "STOP_AFTER_EPOCH": {
+      "parent": 0,
+      "control": 0,
+      "matches": true
+    },
+    "TEACHER_FUSION_MODE": {
+      "parent": "dabe_clean_despl_sched",
+      "control": "dabe_clean_despl_sched",
+      "matches": true
+    },
+    "TEACHER_ROUTING_MODE": {
+      "parent": "clean_ecst",
+      "control": "clean_ecst",
+      "matches": true
+    },
+    "USE_DABE_CLEAN_DESPL_SCHEDULE": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "USE_DABE_PU_DESPL_SCHEDULE": {
+      "parent": false,
+      "control": false,
+      "matches": true
+    },
+    "USE_DAGP_SAFE_HEAD": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "USE_ECST": {
+      "parent": false,
+      "control": false,
+      "matches": true
+    },
+    "USE_ECST_CLEAN": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "USE_ECST_MINIMAL": {
+      "parent": false,
+      "control": false,
+      "matches": true
+    },
+    "USE_NDR_BRANCH": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    },
+    "USE_NDR_COARSE_AUX": {
+      "parent": true,
+      "control": true,
+      "matches": true
+    }
+  },
+  "supervision_semantics": {
+    "static_bce_source": "dabe_v2_hard_68",
+    "static_bce_formula": "1[p_dabe_68 > 0.5]",
+    "clean_ecst_routing_target": "dabe_clean_target_68",
+    "clean_ecst_routing_recoverability": "dabe_clean_recoverability_68",
+    "routing_evidence_cache": "../datasets/cache/dabe_clean_v2_contrec_a1_residual_only_pseudo_cache/dinov1-s8",
+    "routing_evidence_unchanged_from_parent": true,
+    "static_cache": "../datasets/cache/dabe_v2_pseudo_cache/dinov1-s8",
+    "single_variable_statement": "Only static BCE changes to DABE-v2 Hard; A1 Clean target and continuous recoverability remain the Clean-ECST evidence."
+  },
+  "errors": [],
+  "safety": {
+    "creates_model": false,
+    "creates_dataset": false,
+    "starts_training": false,
+    "starts_evaluation": false
+  }
+}

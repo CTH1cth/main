@@ -15,6 +15,7 @@ from common.dabe_clean import (
     select_clean_target,
 )
 from common.dabe_clean_offline import DABE_CLEAN_OFFLINE_MODES
+from common.eaogp import build_same_source_background_evidence
 from common.found_static import (
     FOUND_STATIC_RESIZE_MODE,
     FOUND_STATIC_SOURCE,
@@ -770,63 +771,194 @@ def _load_dabe_pseudo(row, expected_dataset, expected_stem, cfg):
 
 
 def _load_dabe_clean_dabe_v2_static(row, expected_dataset, expected_stem, cfg):
-    """Load the exact independent DABE-v2 p_dabe_68 static source."""
+    """Load the selected independent DABE-v2/CVBR static source.
+
+    The legacy source is ``p_dabe_68``.  The Hard-R1 linear experiment instead
+    uses ``residual_pass1_37``, resized by bilinear interpolation to LOSS_SIZE
+    before applying the same strict hard threshold.  The CVBR student uses the
+    identically resized ``v1_cvbr_second_ring_37`` field from a separate,
+    immutable CVBR cache.
+    """
 
     payload = torch_load(row["cache_path"], map_location="cpu")
     if not isinstance(payload, dict):
         raise TypeError(
-            f"DABE-v2 static payload must be a dict: {row['cache_path']}"
+            f"Static pseudo payload must be a dict: {row['cache_path']}"
         )
     if (
         str(payload.get("dataset")) != str(expected_dataset)
         or str(payload.get("stem")) != str(expected_stem)
     ):
         raise RuntimeError(
-            "DABE-v2 static identity mismatch | "
+            "Static pseudo identity mismatch | "
             f"expected={expected_dataset}/{expected_stem} | "
             f"actual={payload.get('dataset')}/{payload.get('stem')} | "
             f"cache={row['cache_path']}"
         )
-    if str(payload.get("backbone_key")) != str(cfg.BACKBONE_KEY):
-        raise RuntimeError(
-            f"DABE-v2 static backbone mismatch: {row['cache_path']}"
-        )
+    static_source = str(
+        getattr(cfg, "DABE_CLEAN_STATIC_TARGET_SOURCE", "dabe_v2_hard_68")
+    ).strip().lower()
     expected_version = str(
         getattr(cfg, "DABE_CLEAN_DABE_V2_VERSION", "v2")
     ).strip().lower()
-    if str(payload.get("dabe_version", "")).strip().lower() != expected_version:
-        raise RuntimeError(
-            "DABE-v2 static version mismatch: "
-            f"{payload.get('dabe_version')} != {expected_version} | "
-            f"{row['cache_path']}"
+    if static_source == "cvbr_v1_second_ring_hard_68":
+        source_key = "v1_cvbr_second_ring_37"
+        expected_cvbr_version = str(
+            getattr(cfg, "DABE_CLEAN_CVBR_VERSION", "dabe_cvbr_v1")
+        ).strip().lower()
+        if (
+            str(payload.get("cvbr_version", "")).strip().lower()
+            != expected_cvbr_version
+        ):
+            raise RuntimeError(
+                "CVBR static version mismatch: "
+                f"{payload.get('cvbr_version')} != {expected_cvbr_version} | "
+                f"{row['cache_path']}"
+            )
+        if (
+            str(payload.get("source_dabe_version", "")).strip().lower()
+            != expected_version
+        ):
+            raise RuntimeError(
+                "CVBR source DABE version mismatch: "
+                f"{payload.get('source_dabe_version')} != {expected_version} | "
+                f"{row['cache_path']}"
+            )
+        expected_augs = [
+            str(item).strip().lower()
+            for item in getattr(
+                cfg,
+                "DABE_CLEAN_CVBR_AUGS",
+                ("identity", "hflip", "vflip", "rot180"),
+            )
+        ]
+        actual_augs = [
+            str(item).strip().lower()
+            for item in payload.get("source_augs", [])
+        ]
+        if actual_augs != expected_augs:
+            raise RuntimeError(
+                "CVBR source augmentation mismatch: "
+                f"{actual_augs} != {expected_augs} | {row['cache_path']}"
+            )
+        if int(payload.get("source_num_views", -1)) != len(expected_augs):
+            raise RuntimeError(
+                "CVBR source view-count mismatch: "
+                f"{payload.get('source_num_views')} != {len(expected_augs)} | "
+                f"{row['cache_path']}"
+            )
+    else:
+        source_key = (
+            "residual_pass1_37"
+            if static_source == "dabe_v2_r1_hard_68"
+            else "p_dabe_68"
         )
-    soft = payload.get("p_dabe_68")
+        if str(payload.get("backbone_key")) != str(cfg.BACKBONE_KEY):
+            raise RuntimeError(
+                f"DABE-v2 static backbone mismatch: {row['cache_path']}"
+            )
+        if (
+            str(payload.get("dabe_version", "")).strip().lower()
+            != expected_version
+        ):
+            raise RuntimeError(
+                "DABE-v2 static version mismatch: "
+                f"{payload.get('dabe_version')} != {expected_version} | "
+                f"{row['cache_path']}"
+            )
+    soft = payload.get(source_key)
     if not torch.is_tensor(soft):
         raise RuntimeError(
-            f"DABE-v2 static payload is missing p_dabe_68: {row['cache_path']}"
+            f"Static pseudo payload is missing {source_key}: {row['cache_path']}"
         )
     soft = soft.detach().cpu().float()
     expected_shape = (1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE))
-    if tuple(soft.shape) != expected_shape:
+    if source_key in {"residual_pass1_37", "v1_cvbr_second_ring_37"}:
+        if tuple(soft.shape) != (1, 37, 37):
+            raise RuntimeError(
+                f"Static {source_key} shape mismatch: "
+                f"{list(soft.shape)} != [1, 37, 37] | {row['cache_path']}"
+            )
+        _validate_unit_range(soft, source_key, row["cache_path"])
+        if soft.requires_grad or not bool(torch.isfinite(soft).all().item()):
+            raise RuntimeError(
+                f"Static {source_key} must be finite and detached: "
+                f"{row['cache_path']}"
+            )
+        soft = F.interpolate(
+            soft.unsqueeze(0),
+            size=expected_shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0).detach()
+    elif tuple(soft.shape) != expected_shape:
         raise RuntimeError(
             f"DABE-v2 p_dabe_68 shape mismatch: {list(soft.shape)} != "
             f"{list(expected_shape)} | {row['cache_path']}"
         )
-    _validate_unit_range(soft, "p_dabe_68", row["cache_path"])
+    _validate_unit_range(soft, source_key, row["cache_path"])
     if soft.requires_grad or not bool(torch.isfinite(soft).all().item()):
         raise RuntimeError(
-            f"DABE-v2 p_dabe_68 must be finite and detached: {row['cache_path']}"
+            f"DABE-v2 {source_key} must be finite and detached: {row['cache_path']}"
         )
     threshold = float(
         getattr(cfg, "DABE_CLEAN_DABE_V2_HARD_THRESHOLD", 0.5)
     )
     hard = (soft > threshold).float().detach()
-    return {
+    out = {
         "dabe_v2_soft_68": soft,
         "dabe_v2_hard_68": hard,
-        "dabe_v2_source_key": "p_dabe_68",
+        "dabe_v2_source_key": source_key,
         "dabe_v2_version": expected_version,
     }
+    if bool(getattr(cfg, "USE_EAOGP", False)):
+        if bool(payload.get("training_gt_read", False)):
+            raise RuntimeError(
+                f"EAOGP DABE-v2 payload reports training GT access: {row['cache_path']}"
+            )
+        bc_map = payload.get("bc_map_37")
+        residual_source_key = (
+            "residual_norm_37"
+            if torch.is_tensor(payload.get("residual_norm_37"))
+            else "residual_37"
+        )
+        residual = payload.get(residual_source_key)
+        for field_name, value in (
+            ("bc_map_37", bc_map),
+            (residual_source_key, residual),
+        ):
+            if not torch.is_tensor(value):
+                raise RuntimeError(
+                    f"EAOGP DABE-v2 payload is missing {field_name}: {row['cache_path']}"
+                )
+            value = value.detach().cpu().float()
+            if tuple(value.shape) != (1, 37, 37):
+                raise RuntimeError(
+                    f"EAOGP {field_name} shape mismatch: {list(value.shape)} != "
+                    f"[1, 37, 37] | {row['cache_path']}"
+                )
+            _validate_unit_range(value, field_name, row["cache_path"])
+            if value.requires_grad or not bool(torch.isfinite(value).all().item()):
+                raise RuntimeError(
+                    f"EAOGP {field_name} must be finite and detached: {row['cache_path']}"
+                )
+        bc_map = bc_map.detach().cpu().float()
+        residual = residual.detach().cpu().float()
+        background_37, background_68 = build_same_source_background_evidence(
+            bc_map.unsqueeze(0),
+            residual.unsqueeze(0),
+        )
+        out.update(
+            {
+                "dabe_v2_bc_map_37": bc_map,
+                "dabe_v2_residual_norm_37": residual,
+                "dabe_v2_residual_source_key": residual_source_key,
+                "dabe_v2_bg_evidence_37": background_37.squeeze(0),
+                "dabe_v2_bg_evidence_68": background_68.squeeze(0),
+                "dabe_v2_training_gt_read": False,
+            }
+        )
+    return out
 
 
 def _dabe_payload_first_tensor(payload, keys):
@@ -1616,12 +1748,15 @@ class CachedTrainDataset(Dataset):
         self.use_dabe_pseudo = bool(getattr(cfg, "USE_DABE_PSEUDO", False))
         self.use_dabe_pu = bool(getattr(cfg, "USE_DABE_PU", False))
         self.use_dabe_clean = bool(getattr(cfg, "USE_DABE_CLEAN", False))
+        self.use_eaogp = bool(getattr(cfg, "USE_EAOGP", False))
         self.dabe_clean_static_target_source = str(
             getattr(cfg, "DABE_CLEAN_STATIC_TARGET_SOURCE", "clean_target_68")
         ).strip().lower()
         if self.dabe_clean_static_target_source not in {
             "clean_target_68",
             "dabe_v2_hard_68",
+            "dabe_v2_r1_hard_68",
+            "cvbr_v1_second_ring_hard_68",
         }:
             raise RuntimeError(
                 "Unsupported DABE_CLEAN_STATIC_TARGET_SOURCE="
@@ -1629,7 +1764,12 @@ class CachedTrainDataset(Dataset):
             )
         self.use_dabe_clean_dabe_v2_hard = (
             self.use_dabe_clean
-            and self.dabe_clean_static_target_source == "dabe_v2_hard_68"
+            and self.dabe_clean_static_target_source
+            in {
+                "dabe_v2_hard_68",
+                "dabe_v2_r1_hard_68",
+                "cvbr_v1_second_ring_hard_68",
+            }
         )
         self.use_ecst_clean = bool(getattr(cfg, "USE_ECST_CLEAN", False))
         self.use_dabe_clean_offline = self.use_dabe_clean and str(
@@ -2438,10 +2578,21 @@ class CachedTrainDataset(Dataset):
                 self.pseudo_shape = list(
                     dabe_v2_static["dabe_v2_hard_68"].shape
                 )
-                self.pseudo_source = "independent_dabe_v2_p_dabe_68_hard"
+                dabe_v2_source_key = dabe_v2_static["dabe_v2_source_key"]
+                self.pseudo_source = (
+                    f"independent_dabe_v2_{dabe_v2_source_key}_hard"
+                )
                 self.pseudo_final_candidate = (
-                    "1[independent DABE-v2 p_dabe_68 > 0.5] + "
-                    "DESPL-style full binary EMA Teacher"
+                    f"1[independent DABE-v2 {dabe_v2_source_key} > 0.5]"
+                    + (
+                        " (pure Student, no Teacher)"
+                        if self.dabe_clean_static_target_source
+                        in {
+                            "dabe_v2_r1_hard_68",
+                            "cvbr_v1_second_ring_hard_68",
+                        }
+                        else " + DESPL-style full binary EMA Teacher"
+                    )
                 )
                 self.dabe_clean_dabe_v2_first_cache_path = (
                     self.dabe_clean_dabe_v2_map[
@@ -3109,10 +3260,43 @@ class CachedTrainDataset(Dataset):
                                 ].float()
                             ),
                             "dabe_clean_static_target_source": (
-                                "independent_dabe_v2_p_dabe_68_gt_0.5"
+                                "independent_dabe_v2_"
+                                f"{dabe_clean_dabe_v2_static['dabe_v2_source_key']}"
+                                "_gt_0.5"
                             ),
                         }
                     )
+                    if self.use_eaogp:
+                        sample.update(
+                            {
+                                "dabe_clean_dabe_v2_bc_map_37": (
+                                    dabe_clean_dabe_v2_static[
+                                        "dabe_v2_bc_map_37"
+                                    ].float()
+                                ),
+                                "dabe_clean_dabe_v2_residual_norm_37": (
+                                    dabe_clean_dabe_v2_static[
+                                        "dabe_v2_residual_norm_37"
+                                    ].float()
+                                ),
+                                "dabe_clean_dabe_v2_bg_evidence_37": (
+                                    dabe_clean_dabe_v2_static[
+                                        "dabe_v2_bg_evidence_37"
+                                    ].float()
+                                ),
+                                "dabe_clean_dabe_v2_bg_evidence_68": (
+                                    dabe_clean_dabe_v2_static[
+                                        "dabe_v2_bg_evidence_68"
+                                    ].float()
+                                ),
+                                "dabe_clean_dabe_v2_residual_source_key": (
+                                    dabe_clean_dabe_v2_static[
+                                        "dabe_v2_residual_source_key"
+                                    ]
+                                ),
+                                "dabe_clean_dabe_v2_training_gt_read": False,
+                            }
+                        )
                     if not torch.equal(
                         sample["pseudo"],
                         sample["dabe_clean_static_target_68"],
