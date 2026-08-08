@@ -21,11 +21,22 @@ IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
 
-def preprocess_image(image_path, size):
+def preprocess_image(image_path, size, interpolation="bicubic"):
     # DINO 特征提取使用固定方形输入和 ImageNet normalize。
     image = Image.open(image_path).convert("RGB")
     original_size = (image.height, image.width)
-    image = image.resize((size, size), Image.BICUBIC)
+    interpolation = str(interpolation).strip().lower()
+    try:
+        resampling = Image.Resampling
+    except AttributeError:
+        resampling = Image
+    modes = {
+        "bilinear": resampling.BILINEAR,
+        "bicubic": resampling.BICUBIC,
+    }
+    if interpolation not in modes:
+        raise ValueError(f"Unsupported feature resize interpolation: {interpolation}")
+    image = image.resize((size, size), modes[interpolation])
     array = np.asarray(image, dtype=np.float32) / 255.0
     tensor = torch.from_numpy(array).permute(2, 0, 1)
     tensor = (tensor - IMAGENET_MEAN) / IMAGENET_STD
@@ -128,7 +139,9 @@ def generate_feature_cache(cfg, split, overwrite=False, logger=print):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dino_cfg = cfg.DINO
     input_size = int(dino_cfg["feature_input_size"])
-    cache_root = Path(cfg.CACHE_ROOT) / "features_cache" / cfg.BACKBONE_KEY
+    cache_key = str(getattr(cfg, "FEATURE_CACHE_KEY", cfg.BACKBONE_KEY))
+    interpolation = str(getattr(cfg, "FEATURE_RESIZE_INTERPOLATION", "bicubic"))
+    cache_root = Path(cfg.CACHE_ROOT) / "features_cache" / cache_key
     split_root = cache_root / split
     manifest_path = cache_root / f"manifest_{split}.jsonl"
     ensure_dir(split_root)
@@ -148,6 +161,7 @@ def generate_feature_cache(cfg, split, overwrite=False, logger=print):
     logger(f"model_path = {dino_cfg['model_path']}")
     logger(f"key_hook = {key_path}")
     logger(f"feature_input_size = {input_size}")
+    logger(f"feature_resize_interpolation = {interpolation}")
     logger("feature_postprocess = none")
 
     rows = []
@@ -162,7 +176,9 @@ def generate_feature_cache(cfg, split, overwrite=False, logger=print):
             if out_path.exists() and not overwrite:
                 raise FileExistsError(f"Cache exists; pass --overwrite to regenerate: {out_path}")
 
-            inputs, original_size = preprocess_image(item["image_path"], input_size)
+            inputs, original_size = preprocess_image(
+                item["image_path"], input_size, interpolation=interpolation
+            )
             inputs = inputs.to(device)
             key_holder["tensor"] = None
             with torch.no_grad():
@@ -177,6 +193,9 @@ def generate_feature_cache(cfg, split, overwrite=False, logger=print):
                 "stem": stem,
                 "image_path": item["image_path"],
                 "original_size": original_size,
+                "backbone_key": str(cfg.BACKBONE_KEY),
+                "feature_cache_key": cache_key,
+                "resize_interpolation": interpolation,
                 "tensor": feature,
             }
             torch.save(payload, out_path)
@@ -185,6 +204,9 @@ def generate_feature_cache(cfg, split, overwrite=False, logger=print):
                 "stem": stem,
                 "image_path": item["image_path"],
                 "cache_path": str(out_path.resolve()),
+                "backbone_key": str(cfg.BACKBONE_KEY),
+                "feature_cache_key": cache_key,
+                "resize_interpolation": interpolation,
                 "shape": list(feature.shape),
             })
     finally:
@@ -200,10 +222,17 @@ def main():
     parser = argparse.ArgumentParser(description="Generate frozen DINO key feature cache.")
     parser.add_argument("--config", required=True)
     parser.add_argument("--split", required=True, choices=["train", "val", "test"])
+    parser.add_argument(
+        "--cache_root",
+        default=None,
+        help="Optional output cache root override (keeps generated data outside the source repo).",
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if args.cache_root:
+        cfg.CACHE_ROOT = str(Path(args.cache_root).expanduser().resolve())
     generate_feature_cache(cfg, split=args.split, overwrite=args.overwrite, logger=print)
 
 

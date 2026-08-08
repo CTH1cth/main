@@ -41,6 +41,29 @@ CVBR_V1_SECOND_RING_LINEAR_EXP_NAME = (
     "dinov1_s8_dabe_clean_v1_dp_cvbrv1_secondring_hard_linear_"
     "staticonly_purestudent_long45_lrfloor_2e5"
 )
+RPR_P1_SECOND_RING_LINEAR_EXP_NAME = (
+    "dinov1_s8_dabe_clean_v1_dp_rprp1_secondring_hard_linear_"
+    "staticonly_purestudent_long45_lrfloor_2e5"
+)
+RPR_P1_SECOND_RING_DAGP_NDR_EXP_NAME = (
+    "dinov1_s8_dabe_clean_v1_dp_rprp1_secondring_hard_dagp_uncgate_ndr_"
+    "staticonly_purestudent_long45_lrfloor_2e5"
+)
+GBSP_ABSMM_T063_LINEAR_EXP_NAME = (
+    "dinov1_s8_dabe_clean_v1_dp_gbsp_absmm_t063_hard_linear_"
+    "staticonly_purestudent_long45_lrfloor_2e5"
+)
+GBSP_ABSMM_T058_LINEAR_EXP_NAME = (
+    "dinov1_s8_dabe_clean_v1_dp_gbsp_absmm_t058_hard_linear_"
+    "staticonly_purestudent_long45_lrfloor_2e5"
+)
+GBSP_CF_BRC_HC_LINEAR_EXP_NAME = (
+    "dinov1_s8_dabe_clean_v1_dp_gbsp_cf_brc_hc_hard_linear_"
+    "staticonly_purestudent_long45_lrfloor_2e5"
+)
+R1HARD_DBA_EXP_NAME = (
+    "dinov1_s8_r1hard_dba_staticonly_purestudent_long45_lrfloor_2e5"
+)
 
 STATIC_ONLY_ENDPOINTS = {
     "DABE_PU_DESPL_STATIC_START": 1.0,
@@ -127,11 +150,23 @@ def is_dabev2hard_static_only_config(cfg):
     validation and fails, instead of silently falling back to Teacher handover.
     """
 
-    return str(getattr(cfg, "EXP_NAME", "")) in {
+    return bool(
+        getattr(cfg, "GT68_LINEAR_CACHED_DIAGNOSTIC", False)
+        or getattr(cfg, "R1_DECODER_ISOLATION_V1", False)
+        or getattr(cfg, "R1_HSD_V1", False)
+        or getattr(cfg, "R1_LAST4_EXPERIMENT", False)
+        or getattr(cfg, "DABEV2HARD_R1_DBA", False)
+    ) or str(getattr(cfg, "EXP_NAME", "")) in {
         STATIC_ONLY_EXP_NAME,
         R1HARD_LINEAR_EXP_NAME,
         R1HARD_DAGP_NDR_EXP_NAME,
         CVBR_V1_SECOND_RING_LINEAR_EXP_NAME,
+        RPR_P1_SECOND_RING_LINEAR_EXP_NAME,
+        RPR_P1_SECOND_RING_DAGP_NDR_EXP_NAME,
+        GBSP_ABSMM_T063_LINEAR_EXP_NAME,
+        GBSP_ABSMM_T058_LINEAR_EXP_NAME,
+        GBSP_CF_BRC_HC_LINEAR_EXP_NAME,
+        R1HARD_DBA_EXP_NAME,
     }
 
 
@@ -277,10 +312,24 @@ def validate_dabev2hard_static_only_config(cfg):
 
     if not is_dabev2hard_static_only_config(cfg):
         return None
-    if str(getattr(cfg, "EXP_NAME", "")) in {
+    if bool(getattr(cfg, "GT68_LINEAR_CACHED_DIAGNOSTIC", False)) or bool(
+        getattr(cfg, "R1_DECODER_ISOLATION_V1", False)
+    ) or bool(
+        getattr(cfg, "R1_HSD_V1", False)
+    ) or bool(
+        getattr(cfg, "R1_LAST4_EXPERIMENT", False)
+    ) or bool(
+        getattr(cfg, "DABEV2HARD_R1_DBA", False)
+    ) or str(getattr(cfg, "EXP_NAME", "")) in {
         R1HARD_LINEAR_EXP_NAME,
         R1HARD_DAGP_NDR_EXP_NAME,
         CVBR_V1_SECOND_RING_LINEAR_EXP_NAME,
+        RPR_P1_SECOND_RING_LINEAR_EXP_NAME,
+        RPR_P1_SECOND_RING_DAGP_NDR_EXP_NAME,
+        GBSP_ABSMM_T063_LINEAR_EXP_NAME,
+        GBSP_ABSMM_T058_LINEAR_EXP_NAME,
+        GBSP_CF_BRC_HC_LINEAR_EXP_NAME,
+        R1HARD_DBA_EXP_NAME,
     }:
         from common.r1hard_linear_pure_student import (
             validate_r1hard_linear_pure_student_config,

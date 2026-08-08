@@ -1,0 +1,46 @@
+"""Frozen protocol for GBSP-V2 B0--B5."""
+
+from configs.dinov1_s8_mbsp import *  # noqa: F401,F403
+
+
+EXP_NAME = "dinov1_s8_gbsp_v2"
+GBSP_V2_VERSION = "gbsp_v2_softbc_swor_v1"
+GBSP_V2_SOURCE_ROOT = "../workdir/gbsp_core_optimization/full_rank"
+GBSP_V2_OUTPUT_ROOT = "../workdir/gbsp_v2"
+GBSP_V2_TEST20_LIST = "../workdir/gbsp_threshold_v2/test20_ids.txt"
+
+GBSP_V2_GRID = 37
+GBSP_V2_FEATURE_DIM = 384
+GBSP_V2_VARIANTS = ("b0", "b1", "b2", "b3", "b4", "b5")
+GBSP_V2_RANK = 8
+GBSP_V2_ALPHA = 0.85
+GBSP_V2_RW_TOLERANCE = 1e-8
+GBSP_V2_RW_MAX_ITERATIONS = 200
+GBSP_V2_SOFT_SEED_TOPK = 16
+GBSP_V2_POOL_MULTIPLIER = 2
+GBSP_V2_EDGE_SIGMA_F = 0.10
+GBSP_V2_EDGE_SIGMA_C = 0.05
+GBSP_V2_EDGE_SIGMA_E = 0.30
+GBSP_V2_EPS = 1e-8
+GBSP_V2_THRESHOLDS = (0.50, 0.58)
+GBSP_V2_THRESHOLD_CURVE = (0.30, 0.70, 0.01)
+GBSP_V2_ADAPTIVE_THRESHOLDS = ("otsu", "multi_otsu_3")
+GBSP_V2_BOOTSTRAP_REPETITIONS = 2000
+GBSP_V2_BOOTSTRAP_SEED = 20260806
+
+GBSP_V2_EXPECTED_COUNTS = {
+    "CHAMELEON": 76,
+    "TE-CAMO": 250,
+    "TE-COD10K": 2026,
+    "NC4K": 4121,
+}
+
+GBSP_V2_BASELINE_REFERENCE = {
+    "pixel_AP": 0.7726448043,
+    "pixel_AUROC": 0.9524009755,
+    "S_m": 0.7236768642,
+    "F_beta_w": 0.6093427908,
+    "E_mean": 0.8088151742,
+    "MAE": 0.0897199697,
+}
+GBSP_V2_BASELINE_TOLERANCE = 1e-4

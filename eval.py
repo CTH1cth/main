@@ -22,11 +22,14 @@ from common.utils import (
     write_yaml,
 )
 from model import build_seg_head
+from models.online_dino_last4 import FrozenDINOv1Last4Extractor
 
 
 def infer_in_channels(student_state):
     # 从 checkpoint 的 head 权重反推 feature channel 数，兼容 simple/DAGP/context_residual。
-    if "consensus_encoder.proj12.0.weight" in student_state:
+    if "adapters.f9.0.weight" in student_state:
+        weight = student_state["adapters.f9.0.weight"]
+    elif "consensus_encoder.proj12.0.weight" in student_state:
         weight = student_state["consensus_encoder.proj12.0.weight"]
     elif "coarse_path.base_head.weight" in student_state:
         weight = student_state["coarse_path.base_head.weight"]
@@ -34,6 +37,8 @@ def infer_in_channels(student_state):
         weight = student_state["csd_residual.csd_feat_proj.0.weight"]
     elif "sem_proj.0.weight" in student_state:
         weight = student_state["sem_proj.0.weight"]
+    elif "feature_projection.weight" in student_state:
+        weight = student_state["feature_projection.weight"]
     elif "base_head.weight" in student_state:
         weight = student_state["base_head.weight"]
     elif "proj.weight" in student_state:
@@ -42,11 +47,18 @@ def infer_in_channels(student_state):
         weight = student_state["base.weight"]
     elif "base_head.proj.weight" in student_state:
         weight = student_state["base_head.proj.weight"]
+    elif "decoupling.weight" in student_state:
+        # DBA: the first 1x1 projection is [2 * embed_dim, in_channels, 1, 1].
+        weight = student_state["decoupling.weight"]
     elif "proj12.conv.weight" in student_state:
         weight = student_state["proj12.conv.weight"]
     else:
         raise KeyError("Cannot infer in_channels from checkpoint student state.")
-    return int(weight.shape[1])
+    channels = int(weight.shape[1])
+    if "proj.weight" in student_state and channels > 1024 and channels % 4 == 0:
+        # Last4LinearProbe concatenates four equal-width DINO features.
+        channels //= 4
+    return channels
 
 
 def use_multi_level_feature(cfg):
@@ -93,7 +105,58 @@ def use_ndr_branch(cfg):
     return bool(getattr(cfg, "USE_NDR_BRANCH", False))
 
 
-def make_model_input(cfg, batch, device):
+def use_hsd_decoder(cfg):
+    return str(getattr(cfg, "DECODER_TYPE", "")).strip().lower() == "hsd_v1"
+
+
+def use_last4_linear_probe(cfg):
+    return str(getattr(cfg, "DECODER_TYPE", "")).strip().lower() == "last4_linear"
+
+
+def use_f12_scalelift_decoder(cfg):
+    return str(getattr(cfg, "DECODER_TYPE", "")).strip().lower() == "f12_scalelift"
+
+
+def use_bcrd_sem_decoder(cfg):
+    return str(getattr(cfg, "DECODER_TYPE", "")).strip().lower() == "bcrd_sem_v1"
+
+
+def use_last4_feature_decoder(cfg):
+    return (
+        use_hsd_decoder(cfg)
+        or use_last4_linear_probe(cfg)
+        or use_f12_scalelift_decoder(cfg)
+        or use_bcrd_sem_decoder(cfg)
+    )
+
+
+def use_online_dino_last4(cfg):
+    return bool(getattr(cfg, "ONLINE_DINO_LAST4", False))
+
+
+def make_model_input(cfg, batch, device, online_dino=None):
+    if use_last4_feature_decoder(cfg):
+        if use_online_dino_last4(cfg):
+            if online_dino is None:
+                raise RuntimeError(
+                    "ONLINE_DINO_LAST4 evaluation requires a frozen extractor."
+                )
+            if "dino_input_296" not in batch:
+                raise KeyError("Online DINO eval batch is missing dino_input_296.")
+            inputs = batch["dino_input_296"].to(
+                device, non_blocking=True
+            ).float()
+            return online_dino(inputs)
+        required = tuple(f"feature_l{layer}" for layer in (9, 10, 11, 12))
+        missing = [field for field in required if field not in batch]
+        if missing:
+            raise KeyError(f"DINO last-four eval batch is missing: {missing}")
+        return {
+            f"f{layer}": batch[f"feature_l{layer}"].to(
+                device, non_blocking=True
+            ).float()
+            for layer in (9, 10, 11, 12)
+        }
     if use_cacd(cfg):
         required = ("feature_l10", "feature_l11", "feature")
         missing = [field for field in required if field not in batch]
@@ -137,6 +200,14 @@ def make_image_136(cfg, batch, device):
     if "image_136" not in batch:
         raise KeyError("HR-BFR eval requires batch['image_136'].")
     return batch["image_136"].to(device, non_blocking=True).float()
+
+
+def make_image_148(cfg, batch, device):
+    if not (use_hsd_decoder(cfg) and bool(getattr(cfg, "USE_DETAIL", False))):
+        return None
+    if "image_148" not in batch:
+        raise KeyError("HSD-Full eval requires batch['image_148'].")
+    return batch["image_148"].to(device, non_blocking=True).float()
 
 
 def extract_logits(output):
@@ -192,6 +263,7 @@ def eval_dataset(
     out_dir,
     logger,
     max_samples=-1,
+    online_dino=None,
 ):
     dataset = CachedEvalDataset(
         cfg,
@@ -236,10 +308,13 @@ def eval_dataset(
                 )
         gt = batch["gt"].to(device, non_blocking=True).float()
         stem = batch["stem"][0]
-        model_input = make_model_input(cfg, batch, device)
+        model_input = make_model_input(
+            cfg, batch, device, online_dino=online_dino
+        )
         image_68 = make_image_68(cfg, batch, device)
         sobel_68 = make_sobel_68(cfg, batch, device)
         image_136 = make_image_136(cfg, batch, device)
+        image_148 = make_image_148(cfg, batch, device)
         if use_cssd(cfg):
             if not bool(getattr(cfg, "CSSD_STRICT_SINGLE_VIEW_EVAL", True)):
                 raise RuntimeError("CSSD-v1a eval requires CSSD_STRICT_SINGLE_VIEW_EVAL=True.")
@@ -261,7 +336,10 @@ def eval_dataset(
                     "logits_source=normal_final_logits | test_time_scale_fusion=False"
                 )
                 cssd_single_view_logged = True
-        if str(getattr(cfg, "HEAD_TYPE", "simple")).lower() in {
+        if use_hsd_decoder(cfg):
+            output = student(model_input, image_148=image_148)
+            logits, _ = extract_logits_for_eval(output, cfg)
+        elif str(getattr(cfg, "HEAD_TYPE", "simple")).lower() in {
             "dagp_safe",
             "csd_v1",
             "dagp_safe_csd_v1r",
@@ -399,12 +477,17 @@ def main():
         student.set_epoch(int(getattr(cfg, "MAX_EPOCH", 25)))
     else:
         student.load_state_dict(student_state)
+    online_dino = None
+    if use_online_dino_last4(cfg):
+        online_dino = FrozenDINOv1Last4Extractor(cfg).to(device).eval()
 
     with Logger(out_dir / "eval.log") as logger:
         logger.log(f"device = {device}")
         logger.log(f"ckpt = {args.ckpt}")
         logger.log(f"eval_tag = {eval_tag}")
         logger.log("model_for_eval = student")
+        logger.log("look_twice = false")
+        logger.log("teacher_or_apm_at_inference = false")
         logger.log("evaluation_protocol = original_binary")
         logger.log("model_output_resize = bilinear_to_gt_size")
         logger.log("prediction_activation = sigmoid")
@@ -414,6 +497,10 @@ def main():
         logger.log("main_metric_input = binary_prediction")
         logger.log(f"prediction_dir = {out_dir / 'pred'}")
         logger.log(f"max_samples = {int(args.max_samples)}")
+        if online_dino is not None:
+            logger.log("feature_source = online frozen DINOv1-S/8 f9-f12")
+            logger.log("feature_cache_used = false")
+            logger.log(f"online_dino_key_paths = {online_dino.key_paths}")
         if bool(getattr(cfg, "USE_ECST", False)):
             logger.log("[Eval ECST] training_only=True")
             logger.log("[Eval ECST] temporal_memory_used=False")
@@ -511,7 +598,12 @@ def main():
             logger.log("[Eval CACD] teacher_forward=False")
             logger.log("[Eval CACD] extra_inference_branch=False")
             logger.log("[Eval CACD] post_processing=False")
-        if use_multi_level_feature(cfg):
+        if use_online_dino_last4(cfg):
+            logger.log(
+                "[Online DINO] test cache preflight skipped | "
+                "source=original JPEG"
+            )
+        elif use_multi_level_feature(cfg):
             _, ml_reason = check_ml_feature_cache(cfg, "test")
             logger.log(f"[Cache] feature_ml:test ready | {ml_reason}")
         else:
@@ -528,6 +620,7 @@ def main():
                 out_dir,
                 logger,
                 max_samples=args.max_samples,
+                online_dino=online_dino,
             )
 
 

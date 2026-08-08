@@ -16,6 +16,11 @@ EXP_NAME = (
 DABEV2HARD_R1_LINEAR = True
 DABEV2HARD_PURE_STUDENT = True
 
+# This pure-Student experiment only consumes the independent R1 cache.  Keep
+# USE_DABE_CLEAN=True for the established static-BCE training protocol, but do
+# not audit/load the legacy DABE-Clean payloads that cannot enter its loss.
+R1_ONLY_CACHE_IO = True
+
 # Static label: Hard(bilinear(residual_pass1_37, 68), threshold > 0.5).
 DABE_CLEAN_STATIC_TARGET_SOURCE = "dabe_v2_r1_hard_68"
 DABE_CLEAN_DABE_V2_SOURCE_KEY = "residual_pass1_37"

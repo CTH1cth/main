@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from models.cacd import CACDV1BaseHead
+from models.bcrd import BCRDSemV1Head
+from models.hsd import F12ScaleLiftHead, HSDV1Head, Last4LinearProbe
 
 
 class SimpleConvSegHead(nn.Module):
@@ -15,6 +17,104 @@ class SimpleConvSegHead(nn.Module):
 
     def forward(self, x):
         return self.proj(x)
+
+
+class DBASegHead(nn.Module):
+    """UCOD-DPL DBA decoder adapted only at the input channel count.
+
+    The foreground/background decoupling, spatial normalization, reverse
+    branch, and orthogonality objective follow the released DBA formulation.
+    The orthogonality scalar is evaluated through an equivalent Gram identity
+    so a [B, HW, HW] temporary tensor is not materialized at 68x68.
+    """
+
+    def __init__(self, in_channels, embed_dim=64, expected_size=68):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.embed_dim = int(embed_dim)
+        self.expected_size = int(expected_size)
+        if self.in_channels <= 0 or self.embed_dim <= 0:
+            raise ValueError(
+                "DBA in_channels/embed_dim must be positive, got "
+                f"{self.in_channels}/{self.embed_dim}."
+            )
+        self.decoupling = nn.Conv2d(
+            self.in_channels,
+            2 * self.embed_dim,
+            kernel_size=1,
+        )
+        self.learnable_embedding = nn.Parameter(
+            torch.randn(2, self.embed_dim)
+        )
+        self.conv_out_fg = nn.Conv2d(self.embed_dim, 1, kernel_size=1)
+        self.conv_out_bg = nn.Conv2d(self.embed_dim, 1, kernel_size=1)
+
+    @staticmethod
+    def _orthogonal_loss_exact(features_fg, features_bg):
+        # Original DBA objective:
+        # mean((A @ B^T * (1 - I)) ** 2), A/B=[B,HW,D].
+        # ||A B^T||_F^2 = tr((A^T A)(B^T B)); subtract the diagonal.
+        gram_fg = torch.bmm(features_fg.transpose(1, 2), features_fg)
+        gram_bg = torch.bmm(features_bg.transpose(1, 2), features_bg)
+        full_square_sum = (gram_fg * gram_bg.transpose(1, 2)).sum(
+            dim=(1, 2)
+        )
+        diagonal_square_sum = (
+            (features_fg * features_bg).sum(dim=2).square().sum(dim=1)
+        )
+        num_nodes = int(features_fg.shape[1])
+        denominator = max(1, num_nodes * num_nodes)
+        per_image = (full_square_sum - diagonal_square_sum).clamp_min(0.0)
+        return (per_image / denominator).mean()
+
+    def forward(self, x):
+        if not torch.is_tensor(x) or x.ndim != 4:
+            raise TypeError(
+                f"DBA input must be a [B,C,H,W] tensor, got {type(x)!r}."
+            )
+        if int(x.shape[1]) != self.in_channels:
+            raise RuntimeError(
+                f"DBA input channels mismatch: {int(x.shape[1])} != "
+                f"{self.in_channels}."
+            )
+        if tuple(x.shape[-2:]) != (self.expected_size, self.expected_size):
+            raise RuntimeError(
+                "DBA expects the protocol-aligned feature grid "
+                f"{self.expected_size}x{self.expected_size}, got "
+                f"{tuple(x.shape[-2:])}."
+            )
+
+        batch_size, _, height, width = x.shape
+        decoupled = self.decoupling(x)
+        decoupled_fg, decoupled_bg = torch.chunk(decoupled, 2, dim=1)
+
+        features_fg = decoupled_fg.flatten(2).transpose(1, 2)
+        features_bg = decoupled_bg.flatten(2).transpose(1, 2)
+        features_fg = F.normalize(
+            features_fg * self.learnable_embedding[0], p=2, dim=1
+        )
+        features_bg = F.normalize(
+            features_bg * self.learnable_embedding[1], p=2, dim=1
+        )
+        orthogonal_loss = self._orthogonal_loss_exact(
+            features_fg, features_bg
+        )
+
+        features_fg = features_fg.transpose(1, 2).reshape(
+            batch_size, self.embed_dim, height, width
+        )
+        features_bg = features_bg.transpose(1, 2).reshape(
+            batch_size, self.embed_dim, height, width
+        )
+        attention_fg = torch.sigmoid(features_fg * decoupled_fg) + decoupled_fg
+        attention_bg = torch.sigmoid(features_bg * decoupled_bg) + decoupled_bg
+        logits_fg = self.conv_out_fg(attention_fg)
+        logits_bg = self.conv_out_bg(attention_bg)
+        return {
+            "logits": logits_fg,
+            "reverse_logits": logits_bg,
+            "orthogonal_loss": orthogonal_loss,
+        }
 
 
 class DINOAffinityGraphPropagationHead(nn.Module):
@@ -3095,10 +3195,45 @@ def _build_pa_dagp(in_channels, cfg):
 
 def build_seg_head(in_channels, cfg):
     head_type = str(getattr(cfg, "HEAD_TYPE", "simple")).lower()
+    decoder_type = str(getattr(cfg, "DECODER_TYPE", "")).strip().lower()
+    if decoder_type == "last4_linear" or head_type == "last4_linear_probe":
+        return Last4LinearProbe(in_channels=in_channels)
+    if decoder_type == "f12_scalelift" or head_type == "f12_scalelift":
+        return F12ScaleLiftHead(
+            in_channels=in_channels,
+            channels=int(getattr(cfg, "SCALE_LIFT_DIM", 64)),
+            gn_groups=int(getattr(cfg, "SCALE_LIFT_GN_GROUPS", 8)),
+        )
+    if decoder_type == "bcrd_sem_v1" or head_type == "bcrd_sem_v1":
+        return BCRDSemV1Head(
+            in_channels=in_channels,
+            dim=int(getattr(cfg, "BCRD_DIM", 32)),
+            gn_groups=int(getattr(cfg, "BCRD_GN_GROUPS", 4)),
+            consistency_tau=float(
+                getattr(cfg, "BCRD_CONSISTENCY_TAU", 0.10)
+            ),
+            alpha=float(getattr(cfg, "BCRD_ALPHA", 0.25)),
+        )
+    if decoder_type == "hsd_v1" or head_type == "hsd_v1":
+        return HSDV1Head(
+            in_channels=in_channels,
+            semantic_channels=int(getattr(cfg, "HSD_SEMANTIC_CHANNELS", 64)),
+            detail_channels=int(getattr(cfg, "HSD_DETAIL_CHANNELS", 32)),
+            gn_groups=int(getattr(cfg, "HSD_GN_GROUPS", 8)),
+            use_detail=bool(getattr(cfg, "USE_DETAIL", False)),
+            output_size=int(getattr(cfg, "HSD_OUTPUT_SIZE", 148)),
+            coarse_size=int(getattr(cfg, "HSD_COARSE_SIZE", 37)),
+        )
     if head_type == "cacd_v1_base":
         return CACDV1BaseHead(in_channels=in_channels, cfg=cfg)
     if head_type == "simple":
         return SimpleConvSegHead(in_channels)
+    if head_type == "dba":
+        return DBASegHead(
+            in_channels=in_channels,
+            embed_dim=int(getattr(cfg, "DBA_EMBED_DIM", 64)),
+            expected_size=int(getattr(cfg, "DBA_OUTPUT_SIZE", 68)),
+        )
     if head_type == "dagp":
         num_layers = int(getattr(cfg, "DAGP_NUM_LAYERS", 1))
         if num_layers != 1:

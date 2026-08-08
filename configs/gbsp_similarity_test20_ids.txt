@@ -1,0 +1,22 @@
+# Fixed implementation-check identities: five images per dataset.
+CHAMELEON animal-1
+TE-CAMO camourflage_00012
+TE-COD10K COD10K-CAM-1-Aquatic-1-BatFish-2
+NC4K 1002
+CHAMELEON animal-10
+TE-CAMO camourflage_00018
+TE-COD10K COD10K-CAM-1-Aquatic-1-BatFish-4
+NC4K 1003
+CHAMELEON animal-11
+TE-CAMO camourflage_00061
+TE-COD10K COD10K-CAM-1-Aquatic-1-BatFish-5
+NC4K 1004
+CHAMELEON animal-12
+TE-CAMO camourflage_00064
+TE-COD10K COD10K-CAM-1-Aquatic-1-BatFish-6
+NC4K 1005
+CHAMELEON animal-13
+TE-CAMO camourflage_00071
+TE-COD10K COD10K-CAM-1-Aquatic-10-LeafySeaDragon-416
+NC4K 1006
+

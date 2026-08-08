@@ -45,6 +45,7 @@ from common.utils import (
     lceg_cover_manifest_path,
     manifest_to_map,
     ml_feature_cache_manifest_path,
+    ml_feature_labels,
     qra_manifest_path,
     read_jsonl,
     tce_cover_manifest_path,
@@ -491,7 +492,12 @@ def _load_multi_level_feature(row, expected_dataset, expected_stem, cfg):
     features = payload.get("features")
     if not isinstance(features, dict):
         raise KeyError(f"Multi-level feature payload missing features dict: {row['cache_path']}")
-    labels = [f"l{int(layer)}" for layer in getattr(cfg, "MULTI_LEVEL_LAYERS", [4, 8, 12])]
+    layers = [int(layer) for layer in getattr(cfg, "MULTI_LEVEL_LAYERS", [4, 8, 12])]
+    labels = ml_feature_labels(cfg)
+    if len(labels) != len(layers):
+        raise RuntimeError(
+            f"Multi-level feature key/layer mismatch: {labels} vs {layers}"
+        )
     expected_channels = _expected_feature_channels(cfg)
     out = {}
     spatial = None
@@ -512,6 +518,14 @@ def _load_multi_level_feature(row, expected_dataset, expected_stem, cfg):
             raise RuntimeError(f"Multi-level feature spatial mismatch in {row['cache_path']}")
         out[label] = tensor
     result = {f"feature_{label}": out[label] for label in labels}
+    # Preserve the established batch field names while allowing the cache
+    # itself to use the explicit HSD keys f9--f12.
+    result.update(
+        {
+            f"feature_l{layer}": out[label]
+            for layer, label in zip(layers, labels)
+        }
+    )
     result["feature"] = out[labels[-1]]
     result["payload"] = payload
     return result
@@ -771,13 +785,14 @@ def _load_dabe_pseudo(row, expected_dataset, expected_stem, cfg):
 
 
 def _load_dabe_clean_dabe_v2_static(row, expected_dataset, expected_stem, cfg):
-    """Load the selected independent DABE-v2/CVBR static source.
+    """Load the selected independent DABE-v2/CVBR/GBSP static source.
 
     The legacy source is ``p_dabe_68``.  The Hard-R1 linear experiment instead
     uses ``residual_pass1_37``, resized by bilinear interpolation to LOSS_SIZE
     before applying the same strict hard threshold.  The CVBR student uses the
     identically resized ``v1_cvbr_second_ring_37`` field from a separate,
-    immutable CVBR cache.
+    immutable CVBR cache. The GBSP verification uses the same resize-first
+    contract for ``gbsp_abs_minmax_37`` and a separately declared threshold.
     """
 
     payload = torch_load(row["cache_path"], map_location="cpu")
@@ -801,8 +816,85 @@ def _load_dabe_clean_dabe_v2_static(row, expected_dataset, expected_stem, cfg):
     expected_version = str(
         getattr(cfg, "DABE_CLEAN_DABE_V2_VERSION", "v2")
     ).strip().lower()
-    if static_source == "cvbr_v1_second_ring_hard_68":
-        source_key = "v1_cvbr_second_ring_37"
+    if static_source in {
+        "gbsp_abs_minmax_hard_68",
+        "gbsp_cf_brc_hc_hard_68",
+    }:
+        is_cf_brc_hc = static_source == "gbsp_cf_brc_hc_hard_68"
+        source_key = str(
+            getattr(cfg, "DABE_CLEAN_DABE_V2_SOURCE_KEY", "")
+        ).strip()
+        expected_source_key = "hc_mask" if is_cf_brc_hc else "gbsp_abs_minmax_37"
+        if source_key != expected_source_key:
+            raise RuntimeError(
+                f"GBSP static source key must be {expected_source_key}, got "
+                f"{source_key!r}."
+            )
+        version_field = "gbsp_threshold_version" if is_cf_brc_hc else "gbsp_version"
+        version_config = (
+            "DABE_CLEAN_GBSP_THRESHOLD_VERSION"
+            if is_cf_brc_hc
+            else "DABE_CLEAN_GBSP_VERSION"
+        )
+        version_default = "gbsp_cf_brc_hc_v1" if is_cf_brc_hc else "gbsp_pca_absmm_v1"
+        expected_gbsp_version = str(
+            getattr(cfg, version_config, version_default)
+        ).strip().lower()
+        if str(payload.get(version_field, "")).strip().lower() != expected_gbsp_version:
+            raise RuntimeError(
+                "GBSP static version mismatch: "
+                f"{payload.get(version_field)} != {expected_gbsp_version} | "
+                f"{row['cache_path']}"
+            )
+        if (
+            str(payload.get("source_dabe_version", "")).strip().lower()
+            != expected_version
+        ):
+            raise RuntimeError(
+                "GBSP source DABE version mismatch: "
+                f"{payload.get('source_dabe_version')} != {expected_version} | "
+                f"{row['cache_path']}"
+            )
+        if str(payload.get("backbone_key")) != str(cfg.BACKBONE_KEY):
+            raise RuntimeError(
+                f"GBSP static backbone mismatch: {row['cache_path']}"
+            )
+        expected_augs = [
+            str(item).strip().lower()
+            for item in getattr(cfg, "DABE_CLEAN_GBSP_AUGS", ("identity",))
+        ]
+        actual_augs = [
+            str(item).strip().lower()
+            for item in payload.get("source_augs", [])
+        ]
+        if actual_augs != expected_augs or int(
+            payload.get("source_num_views", -1)
+        ) != len(expected_augs):
+            raise RuntimeError(
+                "GBSP source augmentation/view mismatch: "
+                f"augs={actual_augs}, views={payload.get('source_num_views')} | "
+                f"expected={expected_augs} | {row['cache_path']}"
+            )
+        if bool(payload.get("gt_used_for_generation", True)):
+            raise RuntimeError(
+                f"GBSP cache reports GT use during generation: {row['cache_path']}"
+            )
+        if is_cf_brc_hc and (
+            bool(payload.get("r1_used_for_generation", True))
+            or bool(payload.get("target_area_prior_used", True))
+        ):
+            raise RuntimeError(
+                "CF-BRC-HC cache reports R1/target-area use during generation: "
+                f"{row['cache_path']}"
+            )
+    elif static_source in {
+        "cvbr_v1_second_ring_hard_68",
+        "rpr_p1_second_ring_hard_68",
+    }:
+        is_rpr = static_source == "rpr_p1_second_ring_hard_68"
+        source_key = (
+            "p1_rpr_secondring_37" if is_rpr else "v1_cvbr_second_ring_37"
+        )
         expected_cvbr_version = str(
             getattr(cfg, "DABE_CLEAN_CVBR_VERSION", "dabe_cvbr_v1")
         ).strip().lower()
@@ -815,6 +907,19 @@ def _load_dabe_clean_dabe_v2_static(row, expected_dataset, expected_stem, cfg):
                 f"{payload.get('cvbr_version')} != {expected_cvbr_version} | "
                 f"{row['cache_path']}"
             )
+        if is_rpr:
+            expected_rpr_version = str(
+                getattr(cfg, "DABE_CLEAN_RPR_VERSION", "dabe_rpr_v1")
+            ).strip().lower()
+            if (
+                str(payload.get("rpr_version", "")).strip().lower()
+                != expected_rpr_version
+            ):
+                raise RuntimeError(
+                    "RPR static version mismatch: "
+                    f"{payload.get('rpr_version')} != {expected_rpr_version} | "
+                    f"{row['cache_path']}"
+                )
         if (
             str(payload.get("source_dabe_version", "")).strip().lower()
             != expected_version
@@ -828,7 +933,7 @@ def _load_dabe_clean_dabe_v2_static(row, expected_dataset, expected_stem, cfg):
             str(item).strip().lower()
             for item in getattr(
                 cfg,
-                "DABE_CLEAN_CVBR_AUGS",
+                "DABE_CLEAN_RPR_AUGS" if is_rpr else "DABE_CLEAN_CVBR_AUGS",
                 ("identity", "hflip", "vflip", "rot180"),
             )
         ]
@@ -873,7 +978,14 @@ def _load_dabe_clean_dabe_v2_static(row, expected_dataset, expected_stem, cfg):
         )
     soft = soft.detach().cpu().float()
     expected_shape = (1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE))
-    if source_key in {"residual_pass1_37", "v1_cvbr_second_ring_37"}:
+    soft_37 = None
+    if source_key in {
+        "residual_pass1_37",
+        "v1_cvbr_second_ring_37",
+        "p1_rpr_secondring_37",
+        "gbsp_abs_minmax_37",
+        "hc_mask",
+    }:
         if tuple(soft.shape) != (1, 37, 37):
             raise RuntimeError(
                 f"Static {source_key} shape mismatch: "
@@ -885,6 +997,7 @@ def _load_dabe_clean_dabe_v2_static(row, expected_dataset, expected_stem, cfg):
                 f"Static {source_key} must be finite and detached: "
                 f"{row['cache_path']}"
             )
+        soft_37 = soft.detach().clone()
         soft = F.interpolate(
             soft.unsqueeze(0),
             size=expected_shape[-2:],
@@ -911,6 +1024,13 @@ def _load_dabe_clean_dabe_v2_static(row, expected_dataset, expected_stem, cfg):
         "dabe_v2_source_key": source_key,
         "dabe_v2_version": expected_version,
     }
+    if soft_37 is not None:
+        out.update(
+            {
+                "dabe_v2_soft_37": soft_37,
+                "dabe_v2_hard_37": (soft_37 > threshold).float().detach(),
+            }
+        )
     if bool(getattr(cfg, "USE_EAOGP", False)):
         if bool(payload.get("training_gt_read", False)):
             raise RuntimeError(
@@ -1703,11 +1823,67 @@ def _load_gt(gt_path):
     return torch.from_numpy(array).unsqueeze(0)
 
 
+def build_gt_hard_37(gt):
+    """Build the GT oracle target with the same 37-grid geometry as Hard-R1."""
+
+    if not torch.is_tensor(gt) or gt.ndim != 3 or int(gt.shape[0]) != 1:
+        shape = list(gt.shape) if torch.is_tensor(gt) else None
+        raise RuntimeError(f"Training GT must be [1,H,W], got {shape}.")
+    if not bool(torch.isfinite(gt).all().item()):
+        raise RuntimeError("Training GT contains NaN/Inf.")
+    gt_binary = (gt.float() > 0.5).float()
+    gt_37 = F.interpolate(
+        gt_binary.unsqueeze(0), size=(37, 37), mode="nearest"
+    ).squeeze(0)
+    if list(gt_37.shape) != [1, 37, 37]:
+        raise RuntimeError(f"GT_37 shape mismatch: {list(gt_37.shape)}.")
+    if not bool(((gt_37 == 0.0) | (gt_37 == 1.0)).all().item()):
+        raise RuntimeError("GT_37 must be strict binary.")
+    return gt_37
+
+
+def build_gt_hard_68(gt):
+    """Build a strict-binary GT oracle target on the legacy 68 loss grid."""
+
+    if not torch.is_tensor(gt) or gt.ndim != 3 or int(gt.shape[0]) != 1:
+        shape = list(gt.shape) if torch.is_tensor(gt) else None
+        raise RuntimeError(f"Training GT must be [1,H,W], got {shape}.")
+    if not bool(torch.isfinite(gt).all().item()):
+        raise RuntimeError("Training GT contains NaN/Inf.")
+    gt_binary = (gt.float() > 0.5).float()
+    gt_68 = F.interpolate(
+        gt_binary.unsqueeze(0), size=(68, 68), mode="nearest"
+    ).squeeze(0)
+    if list(gt_68.shape) != [1, 68, 68]:
+        raise RuntimeError(f"GT_68 shape mismatch: {list(gt_68.shape)}.")
+    if not bool(((gt_68 == 0.0) | (gt_68 == 1.0)).all().item()):
+        raise RuntimeError("GT_68 must be strict binary.")
+    return gt_68
+
+
 def _load_image_resize(image_path, size):
     image = Image.open(image_path).convert("RGB")
     image = image.resize((int(size), int(size)), resample=Image.BILINEAR)
     array = np.asarray(image, dtype=np.float32) / 255.0
     return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+
+
+_DINO_IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+_DINO_IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+
+def _load_online_dino_input(image_path, size=296):
+    """Match the immutable bicubic/ImageNet preprocessing used by the cache."""
+
+    image = Image.open(image_path).convert("RGB")
+    try:
+        bicubic = Image.Resampling.BICUBIC
+    except AttributeError:
+        bicubic = Image.BICUBIC
+    image = image.resize((int(size), int(size)), resample=bicubic)
+    array = np.asarray(image, dtype=np.float32) / 255.0
+    tensor = torch.from_numpy(array).permute(2, 0, 1).contiguous()
+    return (tensor - _DINO_IMAGENET_MEAN) / _DINO_IMAGENET_STD
 
 
 def _load_image_68(image_path, loss_size):
@@ -1757,6 +1933,9 @@ class CachedTrainDataset(Dataset):
             "dabe_v2_hard_68",
             "dabe_v2_r1_hard_68",
             "cvbr_v1_second_ring_hard_68",
+            "rpr_p1_second_ring_hard_68",
+            "gbsp_abs_minmax_hard_68",
+            "gbsp_cf_brc_hc_hard_68",
         }:
             raise RuntimeError(
                 "Unsupported DABE_CLEAN_STATIC_TARGET_SOURCE="
@@ -1769,7 +1948,13 @@ class CachedTrainDataset(Dataset):
                 "dabe_v2_hard_68",
                 "dabe_v2_r1_hard_68",
                 "cvbr_v1_second_ring_hard_68",
+                "rpr_p1_second_ring_hard_68",
+                "gbsp_abs_minmax_hard_68",
+                "gbsp_cf_brc_hc_hard_68",
             }
+        )
+        self.r1_only_cache_io = bool(
+            getattr(cfg, "R1_ONLY_CACHE_IO", False)
         )
         self.use_ecst_clean = bool(getattr(cfg, "USE_ECST_CLEAN", False))
         self.use_dabe_clean_offline = self.use_dabe_clean and str(
@@ -1811,6 +1996,16 @@ class CachedTrainDataset(Dataset):
         self.use_dre_safe_prior = self.use_despl_pseudo and bool(getattr(cfg, "USE_DRE_SAFE_PRIOR", False))
         self.use_despl_light_cache = self.use_despl_pseudo and bool(getattr(cfg, "USE_DESPL_LIGHT_CACHE", False))
         self.use_multi_level_feature = bool(getattr(cfg, "USE_MULTI_LEVEL_FEATURE", False))
+        self.use_online_dino_last4 = bool(
+            getattr(cfg, "ONLINE_DINO_LAST4", False)
+        )
+        self.use_gt_diagnostic_supervision = bool(
+            getattr(cfg, "GT_DIAGNOSTIC_SUPERVISION", False)
+        )
+        self.decoder_type = str(getattr(cfg, "DECODER_TYPE", "")).strip().lower()
+        self.use_hsd_detail = self.decoder_type == "hsd_v1" and bool(
+            getattr(cfg, "USE_DETAIL", False)
+        )
         self.use_ndr_branch = bool(getattr(cfg, "USE_NDR_BRANCH", False))
         self.use_csd_decoder = bool(getattr(cfg, "USE_CSD_DECODER", False))
         self.use_csd_v1r = bool(getattr(cfg, "USE_CSD_V1R", False)) or str(
@@ -1836,6 +2031,15 @@ class CachedTrainDataset(Dataset):
             self.use_multi_view_feature and "hflip" in self.multi_view_types
         ) or self.use_arbiter_hflip or self.use_cvsa
         self.multi_level_layers = [int(layer) for layer in getattr(cfg, "MULTI_LEVEL_LAYERS", [4, 8, 12])]
+        if self.use_online_dino_last4:
+            if not self.use_multi_level_feature:
+                raise RuntimeError(
+                    "ONLINE_DINO_LAST4=True requires USE_MULTI_LEVEL_FEATURE=True."
+                )
+            if self.multi_level_layers != [9, 10, 11, 12]:
+                raise RuntimeError(
+                    "ONLINE_DINO_LAST4 requires MULTI_LEVEL_LAYERS=[9,10,11,12]."
+                )
         if self.use_hflip_view and self.use_multi_level_feature:
             raise RuntimeError("HFlip multi-view feature currently supports single-level cached DINO features only.")
         if self.use_qra and self.use_ccr:
@@ -1883,6 +2087,40 @@ class CachedTrainDataset(Dataset):
                     "USE_DABE_CLEAN=True is an independent supervision path and "
                     "cannot be combined with DABE-PU/DABE-pseudo/DESPL."
                 )
+            if self.r1_only_cache_io:
+                forbidden_r1_only = {
+                    "USE_DABE_CLEAN_OFFLINE": self.use_dabe_clean_offline,
+                    "TEACHER_ONLY_NO_OFFLINE_PSEUDO": (
+                        self.use_teacher_only_no_offline_pseudo
+                    ),
+                    "DABE_CLEAN_USE_LEGACY_ECST_REGIONS": (
+                        self.dabe_clean_use_legacy_regions
+                    ),
+                    "USE_EAOGP": self.use_eaogp,
+                    "USE_ECST_CLEAN": self.use_ecst_clean,
+                    "USE_ECST": bool(getattr(cfg, "USE_ECST", False)),
+                    "USE_ECTP": bool(getattr(cfg, "USE_ECTP", False)),
+                }
+                enabled_r1_only = [
+                    name for name, enabled in forbidden_r1_only.items() if enabled
+                ]
+                if not self.use_dabe_clean_dabe_v2_hard:
+                    raise RuntimeError(
+                        "R1_ONLY_CACHE_IO=True requires an independent R1/CVBR "
+                        "static source."
+                    )
+                if not bool(
+                    getattr(cfg, "DABEV2HARD_PURE_STUDENT", False)
+                ) or not bool(getattr(cfg, "DABEV2HARD_STATIC_ONLY", False)):
+                    raise RuntimeError(
+                        "R1_ONLY_CACHE_IO=True requires pure-Student "
+                        "static-only training."
+                    )
+                if enabled_r1_only:
+                    raise RuntimeError(
+                        "R1_ONLY_CACHE_IO=True forbids legacy/online cache "
+                        f"consumers: {enabled_r1_only}."
+                    )
             allowed_clean_modes = (
                 DABE_CLEAN_OFFLINE_MODES
                 if self.use_dabe_clean_offline
@@ -1948,31 +2186,39 @@ class CachedTrainDataset(Dataset):
                     raise RuntimeError(
                         "Pure-offline DABE-Clean requires TEACHER_ROUTING_MODE='none'."
                     )
-        # 训练集只建立 image/cache 索引，不读取 GT，避免把训练 GT 引入监督。
-        self.items = build_image_items(cfg.DATA_ROOT, cfg.TRAIN_DATASETS, require_gt=False)
+        # Standard unsupervised runs never index/read training GT.  Only an
+        # explicitly named oracle diagnostic may opt into this path.
+        self.items = build_image_items(
+            cfg.DATA_ROOT,
+            cfg.TRAIN_DATASETS,
+            require_gt=self.use_gt_diagnostic_supervision,
+        )
         if max_samples >= 0:
             self.items = self.items[:max_samples]
         if not self.items:
             raise RuntimeError("Training dataset is empty.")
         self.keys = [(item["dataset"], item["stem"]) for item in self.items]
 
-        feature_manifest = (
-            ml_feature_cache_manifest_path(cfg, "train")
-            if self.use_multi_level_feature
-            else _feature_manifest_path(cfg, "train")
-        )
-        feature_rows = read_jsonl(feature_manifest)
-        self.feature_map = manifest_to_map(feature_rows, feature_manifest)
-        if max_samples < 0:
-            check_exact_keys(
-                "feature train cache", self.feature_map.keys(), self.keys
+        self.feature_map = None
+        if not self.use_online_dino_last4:
+            feature_manifest = (
+                ml_feature_cache_manifest_path(cfg, "train")
+                if self.use_multi_level_feature
+                else _feature_manifest_path(cfg, "train")
             )
-        else:
-            missing_features = sorted(set(self.keys) - set(self.feature_map))
-            if missing_features:
-                raise RuntimeError(
-                    f"feature train cache missing first 10: {missing_features[:10]}"
+            feature_rows = read_jsonl(feature_manifest)
+            self.feature_map = manifest_to_map(feature_rows, feature_manifest)
+            if max_samples < 0:
+                check_exact_keys(
+                    "feature train cache", self.feature_map.keys(), self.keys
                 )
+            else:
+                missing_features = sorted(set(self.keys) - set(self.feature_map))
+                if missing_features:
+                    raise RuntimeError(
+                        "feature train cache missing first 10: "
+                        f"{missing_features[:10]}"
+                    )
 
         self.cacd_feature_map = None
         self.cacd_first_cache_path = None
@@ -2255,7 +2501,11 @@ class CachedTrainDataset(Dataset):
             self.dabe_pu_cache_root = str(dabe_pu_manifest.parent.resolve())
             self.actual_pseudo_cache_root = self.dabe_pu_cache_root
             self.actual_pseudo_cache_pattern = f"{self.dabe_pu_cache_root}/<dataset>/<stem>.pt"
-        if self.use_dabe_clean and not self.use_teacher_only_no_offline_pseudo:
+        if (
+            self.use_dabe_clean
+            and not self.use_teacher_only_no_offline_pseudo
+            and not self.r1_only_cache_io
+        ):
             dabe_clean_manifest = (
                 found_static_manifest_path(cfg)
                 if self.use_found_static
@@ -2288,6 +2538,12 @@ class CachedTrainDataset(Dataset):
             self.actual_pseudo_cache_pattern = (
                 f"{self.dabe_clean_cache_root}/<dataset>/<stem>.pt"
             )
+        elif self.r1_only_cache_io:
+            self.dabe_clean_map = None
+            self.found_static_map = None
+            self.dabe_clean_cache_root = "not_used_r1_only"
+            self.actual_pseudo_cache_root = "pending_r1_only_static_cache"
+            self.actual_pseudo_cache_pattern = "pending_r1_only_static_cache"
         elif self.use_teacher_only_no_offline_pseudo:
             self.dabe_clean_map = None
             self.found_static_map = None
@@ -2332,6 +2588,13 @@ class CachedTrainDataset(Dataset):
             self.dabe_clean_dabe_v2_cache_root = str(
                 dabe_v2_manifest.parent.resolve()
             )
+            if self.r1_only_cache_io:
+                self.actual_pseudo_cache_root = (
+                    self.dabe_clean_dabe_v2_cache_root
+                )
+                self.actual_pseudo_cache_pattern = (
+                    f"{self.dabe_clean_dabe_v2_cache_root}/<dataset>/<stem>.pt"
+                )
         if self.dabe_clean_use_legacy_regions:
             legacy_manifest = dabe_clean_legacy_region_manifest_path(cfg)
             legacy_rows = read_jsonl(legacy_manifest)
@@ -2393,7 +2656,10 @@ class CachedTrainDataset(Dataset):
             self.lceg_cover_cache_root = str(lceg_manifest.parent.resolve())
 
         first_dataset, first_stem = self.keys[0]
-        if self.use_multi_level_feature:
+        if self.use_online_dino_last4:
+            self.feature_shape = [384, 37, 37]
+            self.in_channels = 384
+        elif self.use_multi_level_feature:
             ml_payload = _load_multi_level_feature(
                 self.feature_map[(first_dataset, first_stem)],
                 first_dataset,
@@ -2403,8 +2669,9 @@ class CachedTrainDataset(Dataset):
             feature = ml_payload["feature"]
         else:
             feature, _ = _load_feature(self.feature_map[(first_dataset, first_stem)], first_dataset, first_stem)
-        self.feature_shape = list(feature.shape)
-        self.in_channels = int(feature.shape[0])
+        if not self.use_online_dino_last4:
+            self.feature_shape = list(feature.shape)
+            self.in_channels = int(feature.shape[0])
         if self.use_drepp:
             drepp_payload = _load_drepp(
                 self.drepp_map[(first_dataset, first_stem)],
@@ -2542,32 +2809,39 @@ class CachedTrainDataset(Dataset):
             self.dabe_clean_first_cache_path = "not_used_teacher_only"
             self.first_pseudo_cache_path = "not_used_teacher_only"
         elif self.use_dabe_clean:
-            first_clean_map = (
-                self.found_static_map if self.use_found_static else self.dabe_clean_map
-            )
-            dabe_clean_payload = (
-                _load_found_static(
-                    first_clean_map[(first_dataset, first_stem)],
-                    first_dataset,
-                    first_stem,
-                    cfg,
+            first_clean_map = None
+            dabe_clean_payload = None
+            if not self.r1_only_cache_io:
+                first_clean_map = (
+                    self.found_static_map
+                    if self.use_found_static
+                    else self.dabe_clean_map
                 )
-                if self.use_found_static
-                else _load_dabe_clean(
-                    first_clean_map[(first_dataset, first_stem)],
-                    first_dataset,
-                    first_stem,
-                    cfg,
+                dabe_clean_payload = (
+                    _load_found_static(
+                        first_clean_map[(first_dataset, first_stem)],
+                        first_dataset,
+                        first_stem,
+                        cfg,
+                    )
+                    if self.use_found_static
+                    else _load_dabe_clean(
+                        first_clean_map[(first_dataset, first_stem)],
+                        first_dataset,
+                        first_stem,
+                        cfg,
+                    )
                 )
-            )
             clean_target_key = (
                 "target_offline_68"
                 if self.use_dabe_clean_offline
                 else "dabe_clean_target_68"
             )
-            self.dabe_clean_first_cache_path = first_clean_map[
-                (first_dataset, first_stem)
-            ]["cache_path"]
+            self.dabe_clean_first_cache_path = (
+                "not_used_r1_only"
+                if self.r1_only_cache_io
+                else first_clean_map[(first_dataset, first_stem)]["cache_path"]
+            )
             if self.use_dabe_clean_dabe_v2_hard:
                 dabe_v2_static = _load_dabe_clean_dabe_v2_static(
                     self.dabe_clean_dabe_v2_map[(first_dataset, first_stem)],
@@ -2583,13 +2857,18 @@ class CachedTrainDataset(Dataset):
                     f"independent_dabe_v2_{dabe_v2_source_key}_hard"
                 )
                 self.pseudo_final_candidate = (
-                    f"1[independent DABE-v2 {dabe_v2_source_key} > 0.5]"
+                    "1[independent DABE-v2 "
+                    f"{dabe_v2_source_key} > "
+                    f"{float(getattr(cfg, 'DABE_CLEAN_DABE_V2_HARD_THRESHOLD', 0.5)):g}]"
                     + (
                         " (pure Student, no Teacher)"
                         if self.dabe_clean_static_target_source
                         in {
                             "dabe_v2_r1_hard_68",
                             "cvbr_v1_second_ring_hard_68",
+                            "rpr_p1_second_ring_hard_68",
+                            "gbsp_abs_minmax_hard_68",
+                            "gbsp_cf_brc_hc_hard_68",
                         }
                         else " + DESPL-style full binary EMA Teacher"
                     )
@@ -2782,7 +3061,15 @@ class CachedTrainDataset(Dataset):
         stem = item["stem"]
         key = (dataset, stem)
 
-        if self.use_multi_level_feature:
+        if self.use_online_dino_last4:
+            feature = torch.empty(0, dtype=torch.float32)
+            feature_payload = {
+                "dataset": dataset,
+                "stem": stem,
+                "source": "online_dinov1_s8_last4",
+            }
+            ml_feature_payload = None
+        elif self.use_multi_level_feature:
             ml_feature_payload = _load_multi_level_feature(self.feature_map[key], dataset, stem, self.cfg)
             feature = ml_feature_payload["feature"]
             feature_payload = ml_feature_payload["payload"]
@@ -2974,15 +3261,17 @@ class CachedTrainDataset(Dataset):
             dabe_clean_payload = None
             dabe_clean_legacy_regions = None
         elif self.use_dabe_clean:
-            dabe_clean_payload = (
-                _load_found_static(
-                    self.found_static_map[key], dataset, stem, self.cfg
+            dabe_clean_payload = None
+            if not self.r1_only_cache_io:
+                dabe_clean_payload = (
+                    _load_found_static(
+                        self.found_static_map[key], dataset, stem, self.cfg
+                    )
+                    if self.use_found_static
+                    else _load_dabe_clean(
+                        self.dabe_clean_map[key], dataset, stem, self.cfg
+                    )
                 )
-                if self.use_found_static
-                else _load_dabe_clean(
-                    self.dabe_clean_map[key], dataset, stem, self.cfg
-                )
-            )
             clean_target_key = (
                 "target_offline_68"
                 if self.use_dabe_clean_offline
@@ -3033,6 +3322,29 @@ class CachedTrainDataset(Dataset):
             "image_path": item["image_path"],
             "sample_index": int(index),
         }
+        if self.use_gt_diagnostic_supervision:
+            if "gt_path" not in item:
+                raise RuntimeError(
+                    f"GT diagnostic item is missing gt_path: {dataset}/{stem}."
+                )
+            training_gt = _load_gt(item["gt_path"])
+            gt_hard_37 = build_gt_hard_37(training_gt)
+            sample.update(
+                {
+                    "gt_hard_37": gt_hard_37,
+                    "gt_path": item["gt_path"],
+                    "gt_diagnostic_training_read": True,
+                }
+            )
+            if bool(
+                getattr(self.cfg, "GT68_LINEAR_CACHED_DIAGNOSTIC", False)
+            ):
+                sample["gt_hard_68"] = build_gt_hard_68(training_gt)
+        if self.use_online_dino_last4:
+            sample["dino_input_296"] = _load_online_dino_input(
+                item["image_path"],
+                int(self.cfg.DINO["feature_input_size"]),
+            )
         if self.use_cacd:
             sample["feature_l10"] = cacd_features["feature_l10"]
             sample["feature_l11"] = cacd_features["feature_l11"]
@@ -3045,6 +3357,10 @@ class CachedTrainDataset(Dataset):
                 sample["sobel_68"] = _normalized_sobel_from_image(image_68)
             if self.use_hflip_view:
                 sample["image_hflip_68"] = torch.flip(image_68, dims=[-1])
+        if self.use_hsd_detail:
+            sample["image_148"] = _load_image_resize(
+                item["image_path"], int(getattr(self.cfg, "HSD_OUTPUT_SIZE", 148))
+            )
         if self.use_hr_bfr:
             sample["image_136"] = _load_image_136(
                 item["image_path"],
@@ -3054,7 +3370,7 @@ class CachedTrainDataset(Dataset):
             sample["feature_hflip"] = hflip_feature.float()
         if self.use_cvsa:
             sample["cvsa_fixed_hflip_68"] = cvsa_fixed_hflip.float()
-        if self.use_multi_level_feature:
+        if self.use_multi_level_feature and not self.use_online_dino_last4:
             sample.update(
                 {
                     f"feature_l{int(layer)}": ml_feature_payload[f"feature_l{int(layer)}"]
@@ -3214,6 +3530,13 @@ class CachedTrainDataset(Dataset):
                         "pseudo_despl": zero_pseudo,
                         "p_fixed_area": 0.0,
                         "p_despl_area": 0.0,
+                        "use_fixed_in_pseudo": False,
+                        "fixed_used_for_training": False,
+                    }
+                )
+                if not self.r1_only_cache_io:
+                    sample.update(
+                        {
                         "dabe_clean_target_37": dabe_clean_payload[
                             "dabe_clean_target_37"
                         ].float(),
@@ -3238,10 +3561,8 @@ class CachedTrainDataset(Dataset):
                         "dabe_clean_version": str(
                             dabe_clean_payload["dabe_clean_version"]
                         ),
-                        "use_fixed_in_pseudo": False,
-                        "fixed_used_for_training": False,
-                    }
-                )
+                        }
+                    )
                 if self.use_dabe_clean_dabe_v2_hard:
                     if dabe_clean_dabe_v2_static is None:
                         raise RuntimeError(
@@ -3262,10 +3583,22 @@ class CachedTrainDataset(Dataset):
                             "dabe_clean_static_target_source": (
                                 "independent_dabe_v2_"
                                 f"{dabe_clean_dabe_v2_static['dabe_v2_source_key']}"
-                                "_gt_0.5"
+                                "_gt_"
+                                f"{float(getattr(self.cfg, 'DABE_CLEAN_DABE_V2_HARD_THRESHOLD', 0.5)):g}"
                             ),
                         }
                     )
+                    if dabe_clean_dabe_v2_static.get("dabe_v2_hard_37") is not None:
+                        sample.update(
+                            {
+                                "r1_hard_37": dabe_clean_dabe_v2_static[
+                                    "dabe_v2_hard_37"
+                                ].float(),
+                                "dabe_clean_static_target_37": dabe_clean_dabe_v2_static[
+                                    "dabe_v2_hard_37"
+                                ].float(),
+                            }
+                        )
                     if self.use_eaogp:
                         sample.update(
                             {
@@ -3313,7 +3646,7 @@ class CachedTrainDataset(Dataset):
                     "dabe_clean_recoverability_37",
                     "dabe_clean_recoverability_68",
                 ):
-                    if field in dabe_clean_payload:
+                    if dabe_clean_payload is not None and field in dabe_clean_payload:
                         sample[field] = dabe_clean_payload[field].float()
             if dabe_clean_legacy_regions is not None:
                 sample.update(
@@ -3478,6 +3811,13 @@ class CachedEvalDataset(Dataset):
             raise RuntimeError(f"{split} dataset is empty.")
         self.keys = [(item["dataset"], item["stem"]) for item in self.items]
         self.use_multi_level_feature = bool(getattr(cfg, "USE_MULTI_LEVEL_FEATURE", False))
+        self.use_online_dino_last4 = bool(
+            getattr(cfg, "ONLINE_DINO_LAST4", False)
+        )
+        self.decoder_type = str(getattr(cfg, "DECODER_TYPE", "")).strip().lower()
+        self.use_hsd_detail = self.decoder_type == "hsd_v1" and bool(
+            getattr(cfg, "USE_DETAIL", False)
+        )
         self.use_ndr_branch = bool(getattr(cfg, "USE_NDR_BRANCH", False))
         self.use_csd_decoder = bool(getattr(cfg, "USE_CSD_DECODER", False))
         self.use_csd_v1r = bool(getattr(cfg, "USE_CSD_V1R", False)) or str(
@@ -3489,16 +3829,20 @@ class CachedEvalDataset(Dataset):
         ).lower() == "cacd_v1_base"
         self.multi_level_layers = [int(layer) for layer in getattr(cfg, "MULTI_LEVEL_LAYERS", [4, 8, 12])]
 
-        feature_manifest = (
-            ml_feature_cache_manifest_path(cfg, split)
-            if self.use_multi_level_feature
-            else _feature_manifest_path(cfg, split)
-        )
-        feature_rows = read_jsonl(feature_manifest)
-        self.feature_map = manifest_to_map(feature_rows, feature_manifest)
-        missing = sorted(set(self.keys) - set(self.feature_map.keys()))
-        if missing:
-            raise RuntimeError(f"feature {split} cache missing first 10: {missing[:10]}")
+        self.feature_map = None
+        if not self.use_online_dino_last4:
+            feature_manifest = (
+                ml_feature_cache_manifest_path(cfg, split)
+                if self.use_multi_level_feature
+                else _feature_manifest_path(cfg, split)
+            )
+            feature_rows = read_jsonl(feature_manifest)
+            self.feature_map = manifest_to_map(feature_rows, feature_manifest)
+            missing = sorted(set(self.keys) - set(self.feature_map.keys()))
+            if missing:
+                raise RuntimeError(
+                    f"feature {split} cache missing first 10: {missing[:10]}"
+                )
 
         self.cacd_feature_map = None
         self.cacd_first_cache_path = None
@@ -3512,7 +3856,10 @@ class CachedEvalDataset(Dataset):
             self.cacd_first_cache_path = self.cacd_feature_map[self.keys[0]]["cache_path"]
 
         first_dataset, first_stem = self.keys[0]
-        if self.use_multi_level_feature:
+        if self.use_online_dino_last4:
+            self.feature_shape = [384, 37, 37]
+            self.in_channels = 384
+        elif self.use_multi_level_feature:
             ml_payload = _load_multi_level_feature(
                 self.feature_map[(first_dataset, first_stem)],
                 first_dataset,
@@ -3522,8 +3869,9 @@ class CachedEvalDataset(Dataset):
             feature = ml_payload["feature"]
         else:
             feature, _ = _load_feature(self.feature_map[(first_dataset, first_stem)], first_dataset, first_stem)
-        self.feature_shape = list(feature.shape)
-        self.in_channels = int(feature.shape[0])
+        if not self.use_online_dino_last4:
+            self.feature_shape = list(feature.shape)
+            self.in_channels = int(feature.shape[0])
 
     def __len__(self):
         return len(self.items)
@@ -3533,7 +3881,15 @@ class CachedEvalDataset(Dataset):
         dataset = item["dataset"]
         stem = item["stem"]
         key = (dataset, stem)
-        if self.use_multi_level_feature:
+        if self.use_online_dino_last4:
+            feature = torch.empty(0, dtype=torch.float32)
+            payload = {
+                "dataset": dataset,
+                "stem": stem,
+                "source": "online_dinov1_s8_last4",
+            }
+            ml_feature_payload = None
+        elif self.use_multi_level_feature:
             ml_feature_payload = _load_multi_level_feature(self.feature_map[key], dataset, stem, self.cfg)
             feature = ml_feature_payload["feature"]
             payload = ml_feature_payload["payload"]
@@ -3555,6 +3911,11 @@ class CachedEvalDataset(Dataset):
             "gt_path": item["gt_path"],
             "original_size": original_size,
         }
+        if self.use_online_dino_last4:
+            sample["dino_input_296"] = _load_online_dino_input(
+                item["image_path"],
+                int(self.cfg.DINO["feature_input_size"]),
+            )
         if self.use_cacd:
             sample["feature_l10"] = cacd_features["feature_l10"]
             sample["feature_l11"] = cacd_features["feature_l11"]
@@ -3563,12 +3924,16 @@ class CachedEvalDataset(Dataset):
             sample["image_68"] = image_68
             if self.use_cacd:
                 sample["sobel_68"] = _normalized_sobel_from_image(image_68)
+        if self.use_hsd_detail:
+            sample["image_148"] = _load_image_resize(
+                item["image_path"], int(getattr(self.cfg, "HSD_OUTPUT_SIZE", 148))
+            )
         if self.use_hr_bfr:
             sample["image_136"] = _load_image_136(
                 item["image_path"],
                 int(getattr(self.cfg, "HR_BFR_SIZE", 136)),
             )
-        if self.use_multi_level_feature:
+        if self.use_multi_level_feature and not self.use_online_dino_last4:
             sample.update(
                 {
                     f"feature_l{int(layer)}": ml_feature_payload[f"feature_l{int(layer)}"]

@@ -451,12 +451,29 @@ def pseudo_manifest_path(cfg):
 
 
 def ml_feature_cache_dir(cfg):
+    if str(getattr(cfg, "DINO_FEATURE_MODE", "")).strip().lower() == "last4":
+        return Path(
+            getattr(
+                cfg,
+                "LAST4_FEATURE_CACHE_ROOT",
+                "../datasets/cache/dinov1_s8_last4_296",
+            )
+        )
     root = getattr(cfg, "MULTI_LEVEL_FEATURE_ROOT", "../datasets/cache/features_cache_ml")
     return Path(root) / cfg.BACKBONE_KEY
 
 
 def ml_feature_cache_manifest_path(cfg, split):
     return ml_feature_cache_dir(cfg) / f"manifest_{split}.jsonl"
+
+
+def ml_feature_labels(cfg):
+    if str(getattr(cfg, "DINO_FEATURE_MODE", "")).strip().lower() == "last4":
+        return [str(key) for key in getattr(cfg, "DINO_FEATURE_KEYS", ("f9", "f10", "f11", "f12"))]
+    return [
+        f"l{int(layer)}"
+        for layer in getattr(cfg, "MULTI_LEVEL_LAYERS", [4, 8, 12])
+    ]
 
 
 def hflip_feature_cache_dir(cfg):
@@ -668,7 +685,14 @@ def check_ml_feature_cache(cfg, split, max_samples=None):
         raise RuntimeError(_ml_feature_error(split, f"missing manifest rows first 10: {missing[:10]}"))
 
     layers = [int(layer) for layer in getattr(cfg, "MULTI_LEVEL_LAYERS", [4, 8, 12])]
-    labels = [f"l{layer}" for layer in layers]
+    labels = ml_feature_labels(cfg)
+    if len(labels) != len(layers):
+        raise RuntimeError(
+            _ml_feature_error(
+                split,
+                f"feature key/layer count mismatch: {labels} vs {layers}",
+            )
+        )
     feature_type = str(getattr(cfg, "MULTI_LEVEL_FEATURE_TYPE", "key"))
     expected_dtype = getattr(cfg, "MULTI_LEVEL_FEATURE_DTYPE", None)
     if expected_dtype is not None:
@@ -1770,6 +1794,179 @@ def check_dabe_pu_cache(cfg, max_samples=None):
             f"{float(per_image_max.mean()):.8f}/"
             f"{float(per_image_max.max()):.8f}"
         )
+    return True, reason
+
+
+def check_r1_only_static_cache(cfg, max_samples=None, payload_samples=2):
+    """Audit the only cache consumed by a static Hard-R1 pure Student.
+
+    All manifest identities and file paths are checked, while only a small,
+    deterministic sample of payloads is deserialized.  This intentionally
+    avoids touching the legacy DABE-Clean cache, which is not a supervision
+    input for this protocol.
+    """
+
+    if not bool(getattr(cfg, "R1_ONLY_CACHE_IO", False)):
+        raise RuntimeError("R1-only cache audit requires R1_ONLY_CACHE_IO=True.")
+    static_source = str(
+        getattr(cfg, "DABE_CLEAN_STATIC_TARGET_SOURCE", "")
+    ).strip().lower()
+    source_keys = {
+        "dabe_v2_r1_hard_68": "residual_pass1_37",
+        "cvbr_v1_second_ring_hard_68": "v1_cvbr_second_ring_37",
+        "rpr_p1_second_ring_hard_68": "p1_rpr_secondring_37",
+        "gbsp_abs_minmax_hard_68": "gbsp_abs_minmax_37",
+    }
+    if static_source not in source_keys:
+        raise RuntimeError(
+            "R1-only cache I/O requires an independent 37x37 static source, "
+            f"got {static_source!r}."
+        )
+    if not bool(getattr(cfg, "DABEV2HARD_PURE_STUDENT", False)) or not bool(
+        getattr(cfg, "DABEV2HARD_STATIC_ONLY", False)
+    ):
+        raise RuntimeError(
+            "R1-only cache I/O requires pure-Student static-only training."
+        )
+
+    root = Path(str(getattr(cfg, "DABE_CLEAN_DABE_V2_ROOT", "")).strip())
+    manifest_path = root / "manifest_train.jsonl"
+    if not manifest_path.is_file():
+        raise RuntimeError(f"R1 static manifest is missing: {manifest_path}")
+    expected_items = build_image_items(
+        cfg.DATA_ROOT, cfg.TRAIN_DATASETS, require_gt=False
+    )
+    if max_samples is not None and int(max_samples) >= 0:
+        expected_items = expected_items[: int(max_samples)]
+    expected_keys = [
+        (item["dataset"], item["stem"]) for item in expected_items
+    ]
+    rows = read_jsonl(manifest_path)
+    row_map = {}
+    for row in rows:
+        key = (row.get("dataset"), row.get("stem"))
+        if None in key:
+            raise RuntimeError(f"Bad R1 static manifest row: {row}")
+        if key in row_map:
+            raise RuntimeError(f"Duplicate R1 static manifest key: {key}")
+        row_map[key] = row
+    missing = sorted(set(expected_keys) - set(row_map))
+    if missing:
+        raise RuntimeError(
+            f"R1 static cache missing first 10 keys: {missing[:10]}"
+        )
+    if max_samples is None or int(max_samples) < 0:
+        extra = sorted(set(row_map) - set(expected_keys))
+        if extra:
+            raise RuntimeError(
+                f"R1 static cache has unexpected first 10 keys: {extra[:10]}"
+            )
+        if len(expected_keys) != 4040:
+            raise RuntimeError(
+                "Full Hard-R1 training protocol requires exactly 4040 rows, "
+                f"got {len(expected_keys)}."
+            )
+
+    expected_backbone = str(cfg.BACKBONE_KEY)
+    expected_version = str(
+        getattr(cfg, "DABE_CLEAN_DABE_V2_VERSION", "v2")
+    ).strip().lower()
+    for key in expected_keys:
+        row = row_map[key]
+        cache_path = Path(str(row.get("cache_path", "")))
+        if not cache_path.is_file():
+            raise RuntimeError(f"R1 static cache is missing: {cache_path}")
+        if row.get("backbone_key") is not None and str(
+            row.get("backbone_key")
+        ) != expected_backbone:
+            raise RuntimeError(
+                f"R1 manifest backbone mismatch for {key}: "
+                f"{row.get('backbone_key')} != {expected_backbone}."
+            )
+        if static_source == "dabe_v2_r1_hard_68":
+            if row.get("dabe_version") is not None and str(
+                row.get("dabe_version")
+            ).strip().lower() != expected_version:
+                raise RuntimeError(
+                    f"R1 manifest version mismatch for {key}: "
+                    f"{row.get('dabe_version')} != {expected_version}."
+                )
+            if row.get("shape_37") is not None and list(
+                row.get("shape_37")
+            ) != [1, 37, 37]:
+                raise RuntimeError(
+                    f"R1 manifest shape mismatch for {key}: "
+                    f"{row.get('shape_37')}."
+                )
+        elif static_source == "gbsp_abs_minmax_hard_68":
+            expected_gbsp_version = str(
+                getattr(cfg, "DABE_CLEAN_GBSP_VERSION", "")
+            ).strip().lower()
+            if str(row.get("gbsp_version", "")).strip().lower() != expected_gbsp_version:
+                raise RuntimeError(
+                    f"GBSP manifest version mismatch for {key}: "
+                    f"{row.get('gbsp_version')} != {expected_gbsp_version}."
+                )
+            if list(row.get("shape", [])) != [1, 37, 37]:
+                raise RuntimeError(
+                    f"GBSP manifest shape mismatch for {key}: {row.get('shape')}."
+                )
+
+    sample_count = min(max(int(payload_samples), 0), len(expected_keys))
+    sample_indices = []
+    if sample_count:
+        sample_indices = sorted(
+            set(
+                round(index * (len(expected_keys) - 1) / max(sample_count - 1, 1))
+                for index in range(sample_count)
+            )
+        )
+    source_key = source_keys[static_source]
+    for index in sample_indices:
+        key = expected_keys[index]
+        cache_path = Path(str(row_map[key]["cache_path"]))
+        payload = torch_load(cache_path, map_location="cpu")
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"R1 static payload must be a dict: {cache_path}")
+        if str(payload.get("dataset")) != str(key[0]) or str(
+            payload.get("stem")
+        ) != str(key[1]):
+            raise RuntimeError(f"R1 static payload identity mismatch: {cache_path}")
+        if static_source == "gbsp_abs_minmax_hard_68":
+            expected_gbsp_version = str(
+                getattr(cfg, "DABE_CLEAN_GBSP_VERSION", "")
+            ).strip().lower()
+            if (
+                str(payload.get("gbsp_version", "")).strip().lower()
+                != expected_gbsp_version
+            ):
+                raise RuntimeError(
+                    f"GBSP payload version mismatch: {cache_path}"
+                )
+            if bool(payload.get("gt_used_for_generation", True)):
+                raise RuntimeError(
+                    f"GBSP payload reports GT use during generation: {cache_path}"
+                )
+        source = payload.get(source_key)
+        if not torch.is_tensor(source) or tuple(source.shape) != (1, 37, 37):
+            raise RuntimeError(
+                f"R1 source {source_key} must be [1,37,37]: {cache_path}"
+            )
+        source = source.detach().cpu().float()
+        if not torch.isfinite(source).all() or float(source.min()) < 0.0 or float(
+            source.max()
+        ) > 1.0:
+            raise RuntimeError(
+                f"R1 source {source_key} is not finite in [0,1]: {cache_path}"
+            )
+
+    reason = (
+        f"complete: {manifest_path} | rows_checked={len(expected_keys)} | "
+        "manifest_only=True | "
+        f"payload_samples_checked={len(sample_indices)} | "
+        "dabe_clean_payloads_read=False | "
+        f"source_key={source_key}"
+    )
     return True, reason
 
 

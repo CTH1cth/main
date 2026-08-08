@@ -224,7 +224,22 @@ def validate_teacher_routing_config(cfg):
                 is_r1hard_linear_pure_student_config(cfg)
             )
             r1hard_dagp_ndr = is_r1hard_dagp_ndr_pure_student_config(cfg)
-            r1hard_linear_pure_student = (
+            r1hard_hsd = bool(getattr(cfg, "R1_HSD_V1", False))
+            r1hard_last4 = bool(
+                getattr(cfg, "R1_LAST4_EXPERIMENT", False)
+            )
+            r1hard_dba = bool(
+                getattr(cfg, "DABEV2HARD_R1_DBA", False)
+            )
+            r1_decoder_isolation = bool(
+                getattr(cfg, "R1_DECODER_ISOLATION_V1", False)
+            )
+            if r1hard_hsd and r1hard_last4:
+                raise RuntimeError(
+                    "Hard-R1 pure-Student cannot enable both R1_HSD_V1 "
+                    "and R1_LAST4_EXPERIMENT."
+                )
+            r1hard_non_dagp_pure_student = (
                 r1hard_pure_student and not r1hard_dagp_ndr
             )
             expected_clean = {
@@ -250,7 +265,7 @@ def validate_teacher_routing_config(cfg):
                     "USE_DABE_CLEAN_DESPL_SCHEDULE",
                     "USE_DABE_PU_STATIC_LOSS",
                 )
-                if r1hard_linear_pure_student
+                if r1hard_non_dagp_pure_student
                 else (
                     "USE_DABE_CLEAN",
                     "USE_DABE_CLEAN_DESPL_SCHEDULE",
@@ -269,11 +284,62 @@ def validate_teacher_routing_config(cfg):
                     "DABE-Clean no-ECST requires flags: "
                     f"{missing_clean}"
                 )
-            if r1hard_linear_pure_student:
-                if str(getattr(cfg, "HEAD_TYPE", "")).lower() != "simple":
-                    raise RuntimeError(
-                        "Hard-R1 pure-Student requires HEAD_TYPE='simple'."
+            if r1hard_non_dagp_pure_student:
+                decoder_to_head = {
+                    "last4_linear": "last4_linear_probe",
+                    "f12_scalelift": "f12_scalelift",
+                    "hsd_v1": "hsd_v1",
+                    "bcrd_sem_v1": "bcrd_sem_v1",
+                }
+                if r1_decoder_isolation:
+                    expected_decoder = str(
+                        getattr(cfg, "DECODER_TYPE", "")
+                    ).lower()
+                    expected_head = decoder_to_head.get(expected_decoder)
+                    if expected_head is None:
+                        raise RuntimeError(
+                            "Unsupported R1 decoder-isolation type: "
+                            f"{expected_decoder!r}."
+                        )
+                else:
+                    expected_head = (
+                        "dba"
+                        if r1hard_dba
+                        else (
+                            "hsd_v1"
+                            if r1hard_hsd
+                            else (
+                                "last4_linear_probe"
+                                if r1hard_last4
+                                else "simple"
+                            )
+                        )
                     )
+                    expected_decoder = (
+                        "hsd_v1"
+                        if r1hard_hsd
+                        else (
+                            "last4_linear"
+                            if r1hard_last4
+                            else None
+                        )
+                    )
+                actual_head = str(getattr(cfg, "HEAD_TYPE", "")).lower()
+                if actual_head != expected_head:
+                    raise RuntimeError(
+                        "Hard-R1 pure-Student decoder contract requires "
+                        f"HEAD_TYPE={expected_head!r}, got {actual_head!r}."
+                    )
+                if expected_decoder is not None:
+                    actual_decoder = str(
+                        getattr(cfg, "DECODER_TYPE", "")
+                    ).lower()
+                    if actual_decoder != expected_decoder:
+                        raise RuntimeError(
+                            "Hard-R1 pure-Student decoder contract requires "
+                            f"DECODER_TYPE={expected_decoder!r}, "
+                            f"got {actual_decoder!r}."
+                        )
                 forbidden_linear = [
                     name
                     for name in ("USE_DAGP_SAFE_HEAD", "USE_NDR_BRANCH")
@@ -281,7 +347,7 @@ def validate_teacher_routing_config(cfg):
                 ]
                 if forbidden_linear:
                     raise RuntimeError(
-                        "Hard-R1 pure-Student linear head forbids flags: "
+                        "Hard-R1 pure-Student non-DAGP decoder forbids flags: "
                         f"{forbidden_linear}"
                     )
             if dabev2hard_static_only:

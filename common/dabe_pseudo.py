@@ -489,9 +489,19 @@ def _validate_feature(feature, grid):
     if not torch.is_tensor(feature):
         raise TypeError("DABE feature must be a torch.Tensor.")
     feature = feature.detach().cpu().float()
-    expected_shape = [384, int(grid), int(grid)]
-    if list(feature.shape) != expected_shape:
-        raise RuntimeError(f"DABE expects feature shape {expected_shape}, got {list(feature.shape)}")
+    if feature.ndim != 3 or int(feature.shape[0]) <= 0:
+        raise RuntimeError(
+            "DABE expects feature shape [C,grid,grid] with C>0, "
+            f"got {list(feature.shape)}"
+        )
+    expected_spatial = [int(grid), int(grid)]
+    if list(feature.shape[-2:]) != expected_spatial:
+        raise RuntimeError(
+            f"DABE expects feature spatial shape {expected_spatial}, "
+            f"got {list(feature.shape[-2:])} from {list(feature.shape)}"
+        )
+    if not bool(torch.isfinite(feature).all().item()):
+        raise RuntimeError("DABE feature contains NaN/Inf.")
     return feature.contiguous()
 
 

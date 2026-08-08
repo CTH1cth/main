@@ -29,6 +29,7 @@ from common.utils import (  # noqa: E402
     despl_light_cache_manifest_path,
     ensure_dir,
     feature_manifest_path,
+    check_exact_keys,
     load_config,
     manifest_to_map,
     pseudo_manifest_path,
@@ -67,7 +68,20 @@ def _params_from_cfg(cfg):
     return params
 
 
-def _load_feature(row, dataset, stem):
+def _expected_feature_shape(cfg):
+    embed_dim = int(cfg.DINO["embed_dim"])
+    input_size = int(cfg.DINO["feature_input_size"])
+    patch_size = int(cfg.DINO["patch_size"])
+    if input_size % patch_size != 0:
+        raise RuntimeError(
+            f"feature_input_size={input_size} is not divisible by "
+            f"patch_size={patch_size}"
+        )
+    grid = input_size // patch_size
+    return [embed_dim, grid, grid]
+
+
+def _load_feature(row, dataset, stem, cfg):
     payload = torch_load(row["cache_path"], map_location="cpu")
     if not isinstance(payload, dict):
         raise TypeError(f"Feature payload must be dict: {row['cache_path']}")
@@ -76,9 +90,15 @@ def _load_feature(row, dataset, stem):
     tensor = payload.get("tensor")
     if not torch.is_tensor(tensor):
         raise TypeError(f"Feature payload missing tensor: {row['cache_path']}")
-    tensor = tensor.float()
-    if list(tensor.shape) != [384, 37, 37]:
-        raise RuntimeError(f"DABE expects feature [384,37,37], got {list(tensor.shape)}: {row['cache_path']}")
+    tensor = tensor.detach().cpu().float().contiguous()
+    expected_shape = _expected_feature_shape(cfg)
+    if list(tensor.shape) != expected_shape:
+        raise RuntimeError(
+            f"Expected feature {expected_shape}, got {list(tensor.shape)}: "
+            f"{row['cache_path']}"
+        )
+    if not bool(torch.isfinite(tensor).all().item()):
+        raise RuntimeError(f"Feature tensor contains NaN/Inf: {row['cache_path']}")
     return tensor
 
 
@@ -532,8 +552,8 @@ def generate_dabe_cache(
     overwrite=False,
     logger=print,
 ):
-    if getattr(cfg, "BACKBONE_KEY", None) != "dinov1-s8":
-        raise RuntimeError("DABE only supports BACKBONE_KEY=dinov1-s8.")
+    if getattr(cfg, "BACKBONE_KEY", None) not in getattr(cfg, "DINO_CONFIGS", {}):
+        raise RuntimeError(f"Unknown DABE BACKBONE_KEY={getattr(cfg, 'BACKBONE_KEY', None)!r}.")
     dabe_version = str(dabe_version).lower()
     if dabe_version not in {"v1", "v2", "v3", "v3_1", "gc", "rac", "rac_safe", "pu", "pu_v11"}:
         raise ValueError(f"Unsupported --dabe_version: {dabe_version}")
@@ -557,8 +577,21 @@ def generate_dabe_cache(
         raise FileExistsError(f"Manifest exists; pass --overwrite to regenerate: {manifest_path}")
 
     feature_manifest = feature_manifest_path(cfg, split)
-    feature_map = manifest_to_map(read_jsonl(feature_manifest), feature_manifest)
-    items = _selected_items(cfg, split, max_samples)
+    feature_rows = read_jsonl(feature_manifest)
+    feature_map = manifest_to_map(feature_rows, feature_manifest)
+    all_items = _selected_items(cfg, split, -1)
+    all_item_map = {(item["dataset"], item["stem"]): item for item in all_items}
+    check_exact_keys("DABE feature manifest", feature_map, all_item_map)
+    expected_feature_shape = _expected_feature_shape(cfg)
+    for row in feature_rows:
+        if "shape" in row and list(row["shape"]) != expected_feature_shape:
+            raise RuntimeError(
+                f"Feature manifest shape mismatch: expected {expected_feature_shape}, "
+                f"got {row['shape']} for {row.get('dataset')}/{row.get('stem')}"
+            )
+    items = all_items
+    if max_samples is not None and int(max_samples) >= 0:
+        items = items[: int(max_samples)]
     params = _params_from_cfg(cfg)
     params["VERSION"] = dabe_version
     if dabe_version == "v1":
@@ -613,6 +646,8 @@ def generate_dabe_cache(
 
     logger(f"backbone_key = {cfg.BACKBONE_KEY}")
     logger(f"feature_manifest = {feature_manifest}")
+    logger(f"expected_feature_shape = {expected_feature_shape}")
+    logger(f"feature_manifest_num_samples = {len(feature_rows)}")
     logger(f"dabe_out_root = {out_root}")
     logger(f"manifest_path = {manifest_path}")
     logger(f"split = {split}")
@@ -620,6 +655,8 @@ def generate_dabe_cache(
     logger(f"num_items = {len(items)}")
     logger(f"augs = {augs}")
     logger("gt_used_for_generation = false")
+    logger("dino_forward_used = false")
+    logger("training_used = false")
     logger(f"save_vis = {bool(save_vis)}")
     if save_vis:
         logger(f"vis_mode = {vis_mode}")
@@ -722,6 +759,9 @@ def generate_dabe_cache(
 
     rows = []
     num_vis = 0
+    all_feature_finite = True
+    all_r1_finite = True
+    all_r1_in_unit_range = True
     for item in tqdm(items, desc=f"cache DABE pseudo {split}"):
         dataset = item["dataset"]
         stem = item["stem"]
@@ -734,14 +774,28 @@ def generate_dabe_cache(
         if out_path.exists() and not overwrite:
             raise FileExistsError(f"Cache exists; pass --overwrite to regenerate: {out_path}")
 
-        feature = _load_feature(feature_map[key], dataset, stem)
+        feature = _load_feature(feature_map[key], dataset, stem, cfg)
+        all_feature_finite = all_feature_finite and bool(torch.isfinite(feature).all().item())
         result = generate_dabe_pseudo(feature, item["image_path"], params=params, augs=augs)
+        r1 = result.get("residual_pass1_37")
+        if not torch.is_tensor(r1) or tuple(r1.shape) != (1, 37, 37):
+            raise RuntimeError(
+                f"residual_pass1_37 must be Tensor[1,37,37]: {dataset}/{stem}"
+            )
+        r1_finite = bool(torch.isfinite(r1).all().item())
+        r1_unit = r1_finite and float(r1.min()) >= 0.0 and float(r1.max()) <= 1.0
+        if not r1_finite:
+            raise RuntimeError(f"R1 contains NaN/Inf: {dataset}/{stem}")
+        if not r1_unit:
+            raise RuntimeError(f"R1 outside [0,1]: {dataset}/{stem}")
+        all_r1_finite = all_r1_finite and r1_finite
+        all_r1_in_unit_range = all_r1_in_unit_range and r1_unit
         payload = {
             "dataset": dataset,
             "stem": stem,
             "image_path": item["image_path"],
             "gt_path": item["gt_path"],
-            "backbone_key": "dinov1-s8",
+            "backbone_key": str(cfg.BACKBONE_KEY),
             "dabe_version": str(result.get("dabe_version", dabe_version)),
             **_tensor_payload(result),
             "area": float(result["area"]),
@@ -860,7 +914,7 @@ def generate_dabe_cache(
             "cache_path": str(out_path.resolve()),
             "image_path": item["image_path"],
             "gt_path": item["gt_path"],
-            "backbone_key": "dinov1-s8",
+            "backbone_key": str(cfg.BACKBONE_KEY),
             "dabe_version": payload["dabe_version"],
             "shape_37": list(payload["p_dabe_37"].shape),
             "shape_68": list(payload["p_dabe_68"].shape),
@@ -970,6 +1024,9 @@ def generate_dabe_cache(
     write_jsonl(manifest_path, rows)
     logger(f"wrote_manifest = {manifest_path}")
     logger(f"num_rows = {len(rows)}")
+    logger(f"all_feature_finite = {str(bool(all_feature_finite)).lower()}")
+    logger(f"all_r1_finite = {str(bool(all_r1_finite)).lower()}")
+    logger(f"all_r1_in_unit_range = {str(bool(all_r1_in_unit_range)).lower()}")
     if save_vis:
         logger(f"num_visualizations = {num_vis}")
     return manifest_path

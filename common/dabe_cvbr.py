@@ -418,3 +418,93 @@ def build_cvbr_candidates(
             "raw_v2_37": _map(v2.raw_residual, grid),
         })
     return result
+
+
+def build_cvbr_rpr_p1_support(
+    *,
+    feature_37: torch.Tensor,
+    image_path: str,
+    cached_r1_37=None,
+    effective_params: dict,
+) -> dict:
+    """Build only the frozen CVBR fields required by P1-RPR.
+
+    This path deliberately stops after B0, the B1 cross-reconstruction and
+    second-ring reliability ``q_v1``.  It does not construct B1/V1/V2 residual
+    responses or any all-border V2 state.
+    """
+
+    grid = int(effective_params["GRID"])
+    if grid != 37:
+        raise ValueError("CVBR-v1 requires GRID=37")
+    feature = _validate_feature(feature_37, grid)
+    cached = None
+    if cached_r1_37 is not None:
+        cached = cached_r1_37.detach().cpu().float().contiguous()
+        if tuple(cached.shape) != (1, grid, grid) or not torch.isfinite(cached).all():
+            raise ValueError("cached_r1_37 must be finite Tensor[1,37,37]")
+
+    rgb_chw = _load_rgb_grid(image_path, grid)
+    rgb_n = rgb_chw.permute(1, 2, 0).reshape(grid * grid, 3).float()
+    feat_n = torch_f.normalize(
+        feature.permute(1, 2, 0).reshape(grid * grid, 384), dim=1, p=2
+    )
+    edge = _sobel_magnitude(rgb_chw).reshape(-1)
+    neigh_idx, neigh_weight = _build_local_graph(
+        feat_n, rgb_n, edge, grid, effective_params
+    )
+    ring1, ring2_only, ring2_full = border_ring_masks(grid)
+
+    params_b0, params_b1 = dict(effective_params), dict(effective_params)
+    params_b0["BORDER_WIDTH"], params_b1["BORDER_WIDTH"] = 2, 1
+    bc_b0, source_b0 = _background_connectivity(
+        neigh_idx, neigh_weight, grid, params_b0
+    )
+    if not torch.equal(source_b0, ring2_full):
+        raise RuntimeError("current B0 border mask changed")
+    anchor_b0 = _background_anchor(bc_b0, source_b0, params_b0)
+    current_b0 = _background_residual(feat_n, rgb_n, anchor_b0, params_b0)
+    current_error = (
+        0.0
+        if cached is None
+        else float((current_b0.reshape_as(cached) - cached).abs().max())
+    )
+    if current_error > 1e-6:
+        raise RuntimeError(f"B0 baseline mismatch: current={current_error}")
+
+    bc_b1, source_b1 = _background_connectivity(
+        neigh_idx, neigh_weight, grid, params_b1
+    )
+    if not torch.equal(source_b1, ring1):
+        raise RuntimeError("current B1 border mask changed")
+    anchor_b1 = _background_anchor(bc_b1, source_b1, params_b1)
+    cross = cross_reconstruct_boundary(
+        feat_n, rgb_n, anchor_b1, ring2_full, params_b1
+    )
+    q_all, reference = cvbr_reliability(cross.boundary_cv_error, ring1)
+    q_v1 = torch.zeros(grid * grid, dtype=torch.float32)
+    q_v1[ring1], q_v1[ring2_only] = 1.0, q_all[ring2_only]
+
+    diagnostics = {
+        "generation_mode": "rpr_p1_support_only",
+        "b0_external_cache_checked": cached is not None,
+        "b0_cached_r1_max_abs": current_error,
+        "ring1_count": int(ring1.sum()),
+        "ring2_only_count": int(ring2_only.sum()),
+        "ring2_full_count": int(ring2_full.sum()),
+        "bw1_anchor_count": int(anchor_b1.sum()),
+        "bw2_anchor_count": int(anchor_b0.sum()),
+        "cross_fallback_count": int(cross.fallback_mask.sum()),
+        "ring2_q_mean": float(q_all[ring2_only].mean()),
+        **reference,
+    }
+    return {
+        "b0_r1_bw2_37": _map(current_b0, grid),
+        "bc_b0_37": _map(bc_b0, grid),
+        "anchor_b0_37": _map(anchor_b0.float(), grid),
+        "border_ring1_37": _map(ring1.float(), grid),
+        "border_ring2_only_37": _map(ring2_only.float(), grid),
+        "border_ring2_full_37": _map(ring2_full.float(), grid),
+        "source_q_v1_37": _map(q_v1, grid),
+        "diagnostics": diagnostics,
+    }

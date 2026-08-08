@@ -203,6 +203,7 @@ from common.utils import (
     cache_status,
     check_cacd_feature_cache,
     check_dabe_clean_cache,
+    check_r1_only_static_cache,
     check_dabe_pu_cache,
     check_dabe_pseudo_cache,
     check_ccr_cache,
@@ -236,6 +237,7 @@ from losses.oed_loss import (
     validate_oed_config,
 )
 from model import build_seg_head, update_ema
+from models.online_dino_last4 import FrozenDINOv1Last4Extractor
 from models.pssf import PredictiveSupervisionStateFilter
 from models.supervision.cvsa import (
     CVSAPatchRouter,
@@ -2047,6 +2049,9 @@ def get_dabe_clean_static_target_source(cfg):
         "dabe_v2_hard_68",
         "dabe_v2_r1_hard_68",
         "cvbr_v1_second_ring_hard_68",
+        "rpr_p1_second_ring_hard_68",
+        "gbsp_abs_minmax_hard_68",
+        "gbsp_cf_brc_hc_hard_68",
     }
     if source not in allowed:
         raise RuntimeError(
@@ -2061,6 +2066,9 @@ def uses_independent_dabe_v2_hard_source(source):
         "dabe_v2_hard_68",
         "dabe_v2_r1_hard_68",
         "cvbr_v1_second_ring_hard_68",
+        "rpr_p1_second_ring_hard_68",
+        "gbsp_abs_minmax_hard_68",
+        "gbsp_cf_brc_hc_hard_68",
     }
 
 
@@ -4090,7 +4098,14 @@ def compute_linear_floor_two_stage_lr(epoch, iter_idx, num_iters_per_epoch, cfg)
     reset_epoch = get_reset_epoch(cfg)
     num_iters_per_epoch = max(1, int(num_iters_per_epoch))
 
-    if epoch < reset_epoch:
+    # Pure-Student/static-label experiments disable the historical Teacher
+    # handover by setting FINETUNE_RESET_EPOCH=0.  In that case the requested
+    # linear policy is a single full-run decay, not the post-reset stage of a
+    # two-stage schedule.
+    if reset_epoch <= 0:
+        stage_epochs = int(getattr(cfg, "LR_LINEAR_STAGE1_EPOCHS", cfg.MAX_EPOCH))
+        stage_epoch_idx = epoch - 1
+    elif epoch < reset_epoch:
         stage_epochs = int(getattr(cfg, "LR_LINEAR_STAGE1_EPOCHS", reset_epoch - 1))
         stage_epoch_idx = epoch - 1
     else:
@@ -4268,6 +4283,94 @@ def use_cacd(cfg):
     ).lower() == "cacd_v1_base"
 
 
+def use_hsd_decoder(cfg):
+    return str(getattr(cfg, "DECODER_TYPE", "")).strip().lower() == "hsd_v1"
+
+
+def use_dba_head(cfg):
+    return (
+        str(getattr(cfg, "HEAD_TYPE", "simple")).strip().lower() == "dba"
+        and bool(getattr(cfg, "DABEV2HARD_R1_DBA", False))
+    )
+
+
+def use_last4_linear_probe(cfg):
+    return str(getattr(cfg, "DECODER_TYPE", "")).strip().lower() == "last4_linear"
+
+
+def use_f12_scalelift_decoder(cfg):
+    return str(getattr(cfg, "DECODER_TYPE", "")).strip().lower() == "f12_scalelift"
+
+
+def use_bcrd_sem_decoder(cfg):
+    return str(getattr(cfg, "DECODER_TYPE", "")).strip().lower() == "bcrd_sem_v1"
+
+
+def use_last4_feature_decoder(cfg):
+    return (
+        use_hsd_decoder(cfg)
+        or use_last4_linear_probe(cfg)
+        or use_f12_scalelift_decoder(cfg)
+        or use_bcrd_sem_decoder(cfg)
+    )
+
+
+def use_direct_r1_37_decoder(cfg):
+    return bool(getattr(cfg, "R1_DECODER_DIRECT_R1_37", False))
+
+
+def use_gt_decoder_supervision(cfg):
+    return bool(getattr(cfg, "GT_DIAGNOSTIC_SUPERVISION", False)) and str(
+        getattr(cfg, "DECODER_SUPERVISION_SOURCE", "")
+    ).strip().lower() == "gt_hard_37"
+
+
+def use_gt68_cached_linear_supervision(cfg):
+    return (
+        bool(getattr(cfg, "GT_DIAGNOSTIC_SUPERVISION", False))
+        and bool(getattr(cfg, "GT68_LINEAR_CACHED_DIAGNOSTIC", False))
+        and str(getattr(cfg, "DECODER_SUPERVISION_SOURCE", ""))
+        .strip()
+        .lower()
+        == "gt_hard_68"
+    )
+
+
+def gt68_cached_linear_target(cfg, batch, device):
+    if not use_gt68_cached_linear_supervision(cfg):
+        raise RuntimeError("GT_68 cached-linear supervision is not enabled.")
+    if "gt_hard_68" not in batch:
+        raise KeyError("GT_68 cached-linear supervision requires batch['gt_hard_68'].")
+    target = batch["gt_hard_68"].to(
+        device, non_blocking=True
+    ).float().detach()
+    expected_shape = [int(target.shape[0]), 1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE)]
+    if int(cfg.LOSS_SIZE) != 68 or list(target.shape) != expected_shape:
+        raise RuntimeError(
+            "GT_68 cached-linear target must be [B,1,68,68], got "
+            f"{list(target.shape)} with LOSS_SIZE={cfg.LOSS_SIZE}."
+        )
+    if target.requires_grad or not bool(torch.isfinite(target).all().item()):
+        raise RuntimeError("GT_68 cached-linear target must be finite and detached.")
+    if not bool(((target == 0.0) | (target == 1.0)).all().item()):
+        raise RuntimeError("GT_68 cached-linear target must be strict binary.")
+    return target
+
+
+def decoder_supervision_target_37(cfg, batch, device):
+    field = "gt_hard_37" if use_gt_decoder_supervision(cfg) else "r1_hard_37"
+    if field not in batch:
+        raise KeyError(
+            f"Decoder supervision source requires batch[{field!r}]."
+        )
+    target = batch[field].to(device, non_blocking=True).float()
+    return _strict_direct_r1_37(target), field
+
+
+def use_online_dino_last4(cfg):
+    return bool(getattr(cfg, "ONLINE_DINO_LAST4", False))
+
+
 def use_pa_dagp(cfg):
     return bool(getattr(cfg, "USE_PA_DAGP", False))
 
@@ -4327,6 +4430,21 @@ def make_image_136(cfg, batch, device):
     return batch["image_136"].to(device, non_blocking=True).float()
 
 
+def make_image_148(cfg, batch, device):
+    if not (use_hsd_decoder(cfg) and bool(getattr(cfg, "USE_DETAIL", False))):
+        return None
+    if "image_148" not in batch:
+        raise KeyError("HSD-Full requires batch['image_148'].")
+    image = batch["image_148"].to(device, non_blocking=True).float()
+    expected = int(getattr(cfg, "HSD_OUTPUT_SIZE", 148))
+    if image.ndim != 4 or list(image.shape[1:]) != [3, expected, expected]:
+        raise RuntimeError(
+            f"HSD-Full image_148 shape mismatch: {list(image.shape)} != "
+            f"[B,3,{expected},{expected}]."
+        )
+    return image
+
+
 def make_hflip_image_68(cfg, batch, device):
     if not use_ndr_branch(cfg):
         return None
@@ -4342,6 +4460,7 @@ def forward_seg_head(
     image_68=None,
     image_136=None,
     sobel_68=None,
+    image_148=None,
     return_aux=False,
     bg_reliable_68=None,
     pa_compare_original=False,
@@ -4349,6 +4468,8 @@ def forward_seg_head(
 ):
     if return_eaogp_aux and not use_dagp_safe_head(cfg):
         raise RuntimeError("EAOGP auxiliary output requires HEAD_TYPE='dagp_safe'.")
+    if use_hsd_decoder(cfg):
+        return model(model_input, image_148=image_148)
     if use_cacd(cfg):
         return model(
             model_input,
@@ -4389,7 +4510,31 @@ SAP_DEBUG_KEYS = (
 )
 
 
-def make_model_input(cfg, batch, device):
+def make_model_input(cfg, batch, device, online_dino=None):
+    if use_last4_feature_decoder(cfg):
+        if use_online_dino_last4(cfg):
+            if online_dino is None:
+                raise RuntimeError(
+                    "ONLINE_DINO_LAST4 requires a frozen online extractor."
+                )
+            if "dino_input_296" not in batch:
+                raise KeyError(
+                    "Online DINO batch is missing 'dino_input_296'."
+                )
+            inputs = batch["dino_input_296"].to(
+                device, non_blocking=True
+            ).float()
+            return online_dino(inputs)
+        required = tuple(f"feature_l{layer}" for layer in (9, 10, 11, 12))
+        missing = [field for field in required if field not in batch]
+        if missing:
+            raise KeyError(f"DINO last-four batch is missing feature fields: {missing}")
+        return {
+            f"f{layer}": batch[f"feature_l{layer}"].to(
+                device, non_blocking=True
+            ).float()
+            for layer in (9, 10, 11, 12)
+        }
     if use_cacd(cfg):
         required = ("feature_l10", "feature_l11", "feature")
         missing = [field for field in required if field not in batch]
@@ -10561,6 +10706,494 @@ def output_debug_value(output, name):
     return float(value)
 
 
+def build_hsd_r1_group_loss(cfg, epoch, output, r1_hard_37):
+    """Build the effective HSD loss from one immutable strict-binary R1 map."""
+
+    coarse_size = int(getattr(cfg, "HSD_COARSE_SIZE", 37))
+    coarse_key = f"coarse_logits_{coarse_size}"
+    required = ("final_logits", coarse_key, "base_logits_37")
+    if not isinstance(output, dict):
+        raise TypeError("HSD output must be a dict.")
+    missing = [name for name in required if name not in output]
+    if missing:
+        raise KeyError(f"HSD output is missing supervised branches: {missing}")
+    target_37 = r1_hard_37.detach().float()
+    if target_37.ndim != 4 or list(target_37.shape[1:]) != [1, 37, 37]:
+        raise RuntimeError(
+            f"HSD R1 target must be [B,1,37,37], got {list(target_37.shape)}."
+        )
+    if target_37.requires_grad or not bool(torch.isfinite(target_37).all().item()):
+        raise RuntimeError("HSD R1 target must be finite and detached.")
+    if not bool(((target_37 == 0.0) | (target_37 == 1.0)).all().item()):
+        raise RuntimeError("HSD R1 target must be strict binary 1[R1 > 0.5].")
+
+    output_size = int(getattr(cfg, "HSD_OUTPUT_SIZE", 148))
+    target_148 = F.interpolate(
+        target_37,
+        size=(output_size, output_size),
+        mode="nearest",
+    ).detach()
+    target_coarse = (
+        target_37
+        if coarse_size == 37
+        else F.interpolate(
+            target_37,
+            size=(coarse_size, coarse_size),
+            mode="nearest",
+        ).detach()
+    )
+    expected_shapes = {
+        "base_logits_37": list(target_37.shape),
+        coarse_key: list(target_coarse.shape),
+        "final_logits": list(target_148.shape),
+    }
+    for name, expected in expected_shapes.items():
+        if list(output[name].shape) != expected:
+            raise RuntimeError(
+                f"HSD {name} shape mismatch: {list(output[name].shape)} != {expected}."
+            )
+
+    loss_final = F.binary_cross_entropy_with_logits(
+        output["final_logits"], target_148, reduction="mean"
+    )
+    loss_base = F.binary_cross_entropy_with_logits(
+        output["base_logits_37"], target_37, reduction="mean"
+    )
+    supervision_mode = str(
+        getattr(cfg, "HSD_SUPERVISION_MODE", "triple")
+    ).strip().lower()
+    if supervision_mode == "triple":
+        loss_coarse = F.binary_cross_entropy_with_logits(
+            output[coarse_key], target_coarse, reduction="mean"
+        )
+        coarse_weight = float(getattr(cfg, "LAMBDA_NDR_COARSE_AUX", 0.5))
+        base_weight = (
+            float(getattr(cfg, "LAMBDA_BASE_AUX", 0.5))
+            if is_before_finetune_reset(cfg, epoch)
+            else float(getattr(cfg, "LAMBDA_BASE_AUX_AFTER_RESET", 0.3))
+        )
+        coarse_supervised = True
+    elif supervision_mode == "final_base":
+        # Keep the 74x74 output available for diagnostics, but deliberately do
+        # not evaluate a coarse BCE term.
+        loss_coarse = output[coarse_key].sum() * 0.0
+        coarse_weight = 0.0
+        base_weight = float(getattr(cfg, "LAMBDA_BASE_AUX", 0.25))
+        coarse_supervised = False
+    else:
+        raise RuntimeError(
+            f"Unsupported HSD_SUPERVISION_MODE={supervision_mode!r}."
+        )
+    weight_sum = 1.0 + coarse_weight + base_weight
+    loss = (
+        loss_final + coarse_weight * loss_coarse + base_weight * loss_base
+    ) / weight_sum
+    return {
+        "loss": loss,
+        "loss_final": loss_final,
+        "loss_coarse": loss_coarse,
+        "loss_base": loss_base,
+        "coarse_weight": coarse_weight,
+        "base_weight": base_weight,
+        "weight_sum": weight_sum,
+        "supervision_mode": supervision_mode,
+        "coarse_supervised": coarse_supervised,
+        "target_37": target_37,
+        "target_coarse": target_coarse,
+        "target_148": target_148,
+    }
+
+
+def build_dba_r1_group_loss(cfg, output, r1_hard_68):
+    """Original DBA objective under the immutable S/8 Hard-R1_68 target."""
+
+    if not isinstance(output, dict):
+        raise TypeError("DBA output must be a dict.")
+    required = ("logits", "reverse_logits", "orthogonal_loss")
+    missing = [name for name in required if name not in output]
+    if missing:
+        raise KeyError(f"DBA output is missing required fields: {missing}")
+
+    target = r1_hard_68.detach().float()
+    expected_size = int(getattr(cfg, "DBA_OUTPUT_SIZE", 68))
+    if target.ndim != 4 or list(target.shape[1:]) != [
+        1,
+        expected_size,
+        expected_size,
+    ]:
+        raise RuntimeError(
+            "DBA Hard-R1 target must be "
+            f"[B,1,{expected_size},{expected_size}], got {list(target.shape)}."
+        )
+    if target.requires_grad or not bool(torch.isfinite(target).all().item()):
+        raise RuntimeError("DBA Hard-R1 target must be finite and detached.")
+    if not bool(((target == 0.0) | (target == 1.0)).all().item()):
+        raise RuntimeError("DBA Hard-R1 target must be strict binary.")
+
+    foreground_logits = output["logits"]
+    background_logits = output["reverse_logits"]
+    for name, logits in (
+        ("logits", foreground_logits),
+        ("reverse_logits", background_logits),
+    ):
+        if list(logits.shape) != list(target.shape):
+            raise RuntimeError(
+                f"DBA {name} shape mismatch: {list(logits.shape)} "
+                f"!= {list(target.shape)}."
+            )
+        if not bool(torch.isfinite(logits).all().item()):
+            raise RuntimeError(f"DBA {name} contains NaN/Inf.")
+
+    orthogonal_loss = output["orthogonal_loss"]
+    if not torch.is_tensor(orthogonal_loss) or orthogonal_loss.numel() != 1:
+        raise RuntimeError("DBA orthogonal_loss must be a scalar tensor.")
+    if not bool(torch.isfinite(orthogonal_loss).item()):
+        raise RuntimeError("DBA orthogonal_loss contains NaN/Inf.")
+
+    loss_foreground = F.binary_cross_entropy_with_logits(
+        foreground_logits,
+        target,
+        reduction="mean",
+    )
+    loss_background = F.binary_cross_entropy_with_logits(
+        background_logits,
+        1.0 - target,
+        reduction="mean",
+    )
+    orthogonal_weight = float(getattr(cfg, "DBA_ORTHOGONAL_WEIGHT", 1.0))
+    if not math.isfinite(orthogonal_weight) or orthogonal_weight < 0.0:
+        raise RuntimeError(
+            "DBA_ORTHOGONAL_WEIGHT must be finite and non-negative, got "
+            f"{orthogonal_weight}."
+        )
+    loss_orthogonal_weighted = orthogonal_weight * orthogonal_loss
+    loss = loss_foreground + loss_background + loss_orthogonal_weighted
+    return {
+        "loss": loss,
+        "loss_foreground": loss_foreground,
+        "loss_background": loss_background,
+        "loss_orthogonal": orthogonal_loss,
+        "loss_orthogonal_weighted": loss_orthogonal_weighted,
+        "orthogonal_weight": orthogonal_weight,
+        "target_68": target,
+    }
+
+
+def _strict_direct_r1_37(r1_hard_37):
+    target = r1_hard_37.detach().float()
+    if target.ndim != 4 or list(target.shape[1:]) != [1, 37, 37]:
+        raise RuntimeError(
+            f"Direct Hard-R1 target must be [B,1,37,37], got {list(target.shape)}."
+        )
+    if target.requires_grad or not bool(torch.isfinite(target).all().item()):
+        raise RuntimeError("Direct Hard-R1 target must be finite and detached.")
+    if not bool(((target == 0.0) | (target == 1.0)).all().item()):
+        raise RuntimeError("Direct Hard-R1 target must be strict binary.")
+    return target
+
+
+def build_r1_decoder_isolation_loss(cfg, output, r1_hard_37):
+    """Direct strict-R1_37 loss for Last4, Scale-Lift, and BCRD isolation."""
+
+    target_37 = _strict_direct_r1_37(r1_hard_37)
+    decoder_type = str(getattr(cfg, "DECODER_TYPE", "")).strip().lower()
+    if decoder_type == "last4_linear":
+        final_logits = extract_logits(output)
+        if list(final_logits.shape) != list(target_37.shape):
+            raise RuntimeError(
+                f"Last4 linear logits shape mismatch: {list(final_logits.shape)} "
+                f"!= {list(target_37.shape)}."
+            )
+        loss_final = F.binary_cross_entropy_with_logits(final_logits, target_37)
+        zero = final_logits.sum() * 0.0
+        return {
+            "loss": loss_final,
+            "loss_final": loss_final,
+            "loss_coarse": zero,
+            "loss_base": zero,
+            "coarse_weight": 0.0,
+            "base_weight": 0.0,
+            "weight_sum": 1.0,
+            "supervision_mode": "final_only",
+            "coarse_supervised": False,
+            "target_37": target_37,
+        }
+
+    if decoder_type == "f12_scalelift":
+        if not isinstance(output, dict):
+            raise TypeError("F12 Scale-Lift output must be a dict.")
+        required = ("final_logits", "coarse_logits_74", "base_logits_37")
+        missing = [key for key in required if key not in output]
+        if missing:
+            raise KeyError(f"F12 Scale-Lift output is missing: {missing}")
+        target_74 = F.interpolate(target_37, size=(74, 74), mode="nearest").detach()
+        target_148 = F.interpolate(target_37, size=(148, 148), mode="nearest").detach()
+        expected = {
+            "final_logits": target_148,
+            "coarse_logits_74": target_74,
+            "base_logits_37": target_37,
+        }
+        for name, target in expected.items():
+            if list(output[name].shape) != list(target.shape):
+                raise RuntimeError(
+                    f"Scale-Lift {name} shape mismatch: {list(output[name].shape)} "
+                    f"!= {list(target.shape)}."
+                )
+        loss_final = F.binary_cross_entropy_with_logits(
+            output["final_logits"], target_148
+        )
+        loss_base = F.binary_cross_entropy_with_logits(
+            output["base_logits_37"], target_37
+        )
+        mode = str(
+            getattr(cfg, "SCALE_LIFT_SUPERVISION_MODE", "triple")
+        ).strip().lower()
+        if mode == "triple":
+            loss_coarse = F.binary_cross_entropy_with_logits(
+                output["coarse_logits_74"], target_74
+            )
+            coarse_weight = float(getattr(cfg, "LAMBDA_NDR_COARSE_AUX", 0.5))
+            base_weight = float(getattr(cfg, "LAMBDA_BASE_AUX", 0.5))
+            coarse_supervised = True
+        elif mode == "final_base":
+            loss_coarse = output["coarse_logits_74"].sum() * 0.0
+            coarse_weight = 0.0
+            base_weight = float(getattr(cfg, "LAMBDA_BASE_AUX", 0.25))
+            coarse_supervised = False
+        else:
+            raise RuntimeError(
+                f"Unsupported SCALE_LIFT_SUPERVISION_MODE={mode!r}."
+            )
+        weight_sum = 1.0 + coarse_weight + base_weight
+        return {
+            "loss": (
+                loss_final
+                + coarse_weight * loss_coarse
+                + base_weight * loss_base
+            ) / weight_sum,
+            "loss_final": loss_final,
+            "loss_coarse": loss_coarse,
+            "loss_base": loss_base,
+            "coarse_weight": coarse_weight,
+            "base_weight": base_weight,
+            "weight_sum": weight_sum,
+            "supervision_mode": mode,
+            "coarse_supervised": coarse_supervised,
+            "target_37": target_37,
+            "target_74": target_74,
+            "target_148": target_148,
+        }
+
+    if decoder_type == "bcrd_sem_v1":
+        if not isinstance(output, dict):
+            raise TypeError("BCRD-Sem output must be a dict.")
+        for name in ("final_logits_37", "base_logits_37"):
+            if name not in output:
+                raise KeyError(f"BCRD-Sem output is missing {name}.")
+            if list(output[name].shape) != list(target_37.shape):
+                raise RuntimeError(
+                    f"BCRD-Sem {name} shape mismatch: {list(output[name].shape)} "
+                    f"!= {list(target_37.shape)}."
+                )
+        loss_final = F.binary_cross_entropy_with_logits(
+            output["final_logits_37"], target_37
+        )
+        loss_base = F.binary_cross_entropy_with_logits(
+            output["base_logits_37"], target_37
+        )
+        base_weight = float(getattr(cfg, "LAMBDA_BASE_AUX", 0.25))
+        weight_sum = 1.0 + base_weight
+        zero = output["final_logits_37"].sum() * 0.0
+        return {
+            "loss": (loss_final + base_weight * loss_base) / weight_sum,
+            "loss_final": loss_final,
+            "loss_coarse": zero,
+            "loss_base": loss_base,
+            "coarse_weight": 0.0,
+            "base_weight": base_weight,
+            "weight_sum": weight_sum,
+            "supervision_mode": "final_base",
+            "coarse_supervised": False,
+            "target_37": target_37,
+        }
+
+    raise RuntimeError(
+        f"Direct R1 decoder isolation does not support DECODER_TYPE={decoder_type!r}."
+    )
+
+
+def _binary_change_stats(source, target):
+    source = source.bool()
+    target = target.bool()
+    return (
+        float((~source & target).float().mean().item()),
+        float((source & ~target).float().mean().item()),
+    )
+
+
+def log_hsd_first_batch(logger, student, output):
+    target_model = student.module if hasattr(student, "module") else student
+    params = sum(
+        parameter.numel()
+        for parameter in target_model.parameters()
+        if parameter.requires_grad
+    )
+    macs = (
+        int(target_model.estimated_conv_macs_per_image())
+        if hasattr(target_model, "estimated_conv_macs_per_image")
+        else -1
+    )
+    flops = 2 * macs if macs >= 0 else -1
+
+    base = torch.sigmoid(output["base_logits_37"].detach()) > 0.5
+    coarse = torch.sigmoid(output["coarse_logits"].detach()) > 0.5
+    final = torch.sigmoid(output["final_logits"].detach()) > 0.5
+    coarse_up = F.interpolate(coarse.float(), size=final.shape[-2:], mode="nearest").bool()
+    base_up = F.interpolate(
+        base.float(), size=coarse.shape[-2:], mode="nearest"
+    ).bool()
+    base_01, base_10 = _binary_change_stats(base_up, coarse)
+    final_01, final_10 = _binary_change_stats(coarse_up, final)
+    logger.log(
+        "[HSD FirstBatch] base/coarse/final area = "
+        f"{float(base.float().mean()):.8f}/"
+        f"{float(coarse.float().mean()):.8f}/"
+        f"{float(final.float().mean()):.8f}"
+    )
+    logger.log(
+        "[HSD FirstBatch] base->coarse 0->1/1->0 | coarse->final 0->1/1->0 = "
+        f"{base_01:.8f}/{base_10:.8f} | {final_01:.8f}/{final_10:.8f}"
+    )
+    logger.log(
+        "[HSD FirstBatch] cross gate f11/f10/f9 mean = "
+        f"{float(output['cross_gate_11'].detach().mean()):.8f}/"
+        f"{float(output['cross_gate_10'].detach().mean()):.8f}/"
+        f"{float(output['cross_gate_9'].detach().mean()):.8f}"
+    )
+    if "detail_gate_148" in output:
+        gate = output["detail_gate_148"].detach()
+        logger.log(
+            "[HSD FirstBatch] detail gate mean/min/max = "
+            f"{float(gate.mean()):.8f}/{float(gate.min()):.8f}/{float(gate.max()):.8f}"
+        )
+    residual = output["detail_logits_residual_148"].detach()
+    logger.log(
+        "[HSD FirstBatch] residual pos/neg/abs mean = "
+        f"{float(residual.clamp_min(0).mean()):.8f}/"
+        f"{float((-residual).clamp_min(0).mean()):.8f}/"
+        f"{float(residual.abs().mean()):.8f}"
+    )
+    logger.log(
+        "[HSD FirstBatch] trainable_params/conv_MACs/conv_FLOPs_per_image = "
+        f"{params}/{macs}/{flops}"
+    )
+
+
+def _model_complexity(student):
+    target_model = student.module if hasattr(student, "module") else student
+    params = sum(
+        parameter.numel()
+        for parameter in target_model.parameters()
+        if parameter.requires_grad
+    )
+    macs = (
+        int(target_model.estimated_conv_macs_per_image())
+        if hasattr(target_model, "estimated_conv_macs_per_image")
+        else -1
+    )
+    return params, macs, (2 * macs if macs >= 0 else -1)
+
+
+def log_last4_linear_first_batch(logger, student, output):
+    logits = extract_logits(output).detach()
+    area = float((torch.sigmoid(logits) > 0.5).float().mean())
+    params, macs, flops = _model_complexity(student)
+    logger.log(
+        f"[Last4Linear FirstBatch] logits_shape={list(logits.shape)} | "
+        f"pred_area={area:.8f}"
+    )
+    logger.log(
+        "[Last4Linear FirstBatch] trainable_params/conv_MACs/conv_FLOPs_per_image = "
+        f"{params}/{macs}/{flops}"
+    )
+
+
+def log_scalelift_first_batch(logger, student, output):
+    base = torch.sigmoid(output["base_logits_37"].detach()) > 0.5
+    coarse = torch.sigmoid(output["coarse_logits_74"].detach()) > 0.5
+    final = torch.sigmoid(output["final_logits"].detach()) > 0.5
+    base_up = F.interpolate(base.float(), size=(74, 74), mode="nearest").bool()
+    coarse_up = F.interpolate(coarse.float(), size=(148, 148), mode="nearest").bool()
+    base_01, base_10 = _binary_change_stats(base_up, coarse)
+    final_01, final_10 = _binary_change_stats(coarse_up, final)
+    params, macs, flops = _model_complexity(student)
+    logger.log(
+        "[ScaleLift FirstBatch] base/coarse/final area = "
+        f"{float(base.float().mean()):.8f}/"
+        f"{float(coarse.float().mean()):.8f}/"
+        f"{float(final.float().mean()):.8f}"
+    )
+    logger.log(
+        "[ScaleLift FirstBatch] base->coarse 0->1/1->0 | "
+        "coarse->final 0->1/1->0 = "
+        f"{base_01:.8f}/{base_10:.8f} | {final_01:.8f}/{final_10:.8f}"
+    )
+    logger.log(
+        "[ScaleLift FirstBatch] trainable_params/conv_MACs/conv_FLOPs_per_image = "
+        f"{params}/{macs}/{flops}"
+    )
+
+
+def _signed_tensor_stats(value):
+    value = value.detach()
+    return (
+        float(value.clamp_min(0).mean()),
+        float((-value).clamp_min(0).mean()),
+        float(value.abs().mean()),
+        float(value.abs().max()),
+    )
+
+
+def log_bcrd_first_batch(logger, student, output):
+    base = torch.sigmoid(output["base_logits_37"].detach()) > 0.5
+    final = torch.sigmoid(output["final_logits_37"].detach()) > 0.5
+    change_01, change_10 = _binary_change_stats(base, final)
+    logger.log(
+        "[BCRD FirstBatch] base/final area | 0->1/1->0 = "
+        f"{float(base.float().mean()):.8f}/"
+        f"{float(final.float().mean()):.8f} | "
+        f"{change_01:.8f}/{change_10:.8f}"
+    )
+    for key in ("f9", "f10", "f11"):
+        pos, neg, absolute, maximum = _signed_tensor_stats(
+            output[f"proposal_{key}"]
+        )
+        logger.log(
+            f"[BCRD FirstBatch] proposal_{key} pos/neg/abs/max = "
+            f"{pos:.8f}/{neg:.8f}/{absolute:.8f}/{maximum:.8f}"
+        )
+    for name in ("proposal_variance", "consistency_gate", "base_uncertainty"):
+        value = output[name].detach()
+        logger.log(
+            f"[BCRD FirstBatch] {name} mean/min/max = "
+            f"{float(value.mean()):.8f}/"
+            f"{float(value.min()):.8f}/"
+            f"{float(value.max()):.8f}"
+        )
+    pos, neg, absolute, maximum = _signed_tensor_stats(
+        output["applied_residual"]
+    )
+    logger.log(
+        "[BCRD FirstBatch] applied_residual pos/neg/abs/max = "
+        f"{pos:.8f}/{neg:.8f}/{absolute:.8f}/{maximum:.8f}"
+    )
+    params, macs, flops = _model_complexity(student)
+    logger.log(
+        "[BCRD FirstBatch] trainable_params/conv_MACs/conv_FLOPs_per_image = "
+        f"{params}/{macs}/{flops}"
+    )
+
+
 def dataloader_worker_kwargs(cfg):
     num_workers = int(cfg.NUM_WORKERS)
     kwargs = {}
@@ -10591,7 +11224,14 @@ def build_loaders(cfg, max_train_samples=-1):
 
 
 @torch.no_grad()
-def validate_one_dataset(cfg, student, dataset_name, device, max_samples=-1):
+def validate_one_dataset(
+    cfg,
+    student,
+    dataset_name,
+    device,
+    max_samples=-1,
+    online_dino=None,
+):
     # 每轮验证只用 student，验证阶段不保存预测图。
     dataset = CachedEvalDataset(
         cfg,
@@ -10612,10 +11252,13 @@ def validate_one_dataset(cfg, student, dataset_name, device, max_samples=-1):
     student.eval()
     for batch in loader:
         gt = batch["gt"].to(device, non_blocking=True).float()
-        model_input = make_model_input(cfg, batch, device)
+        model_input = make_model_input(
+            cfg, batch, device, online_dino=online_dino
+        )
         image_68 = make_image_68(cfg, batch, device)
         sobel_68 = make_sobel_68(cfg, batch, device)
         image_136 = make_image_136(cfg, batch, device)
+        image_148 = make_image_148(cfg, batch, device)
         output = forward_seg_head(
             student,
             model_input,
@@ -10623,6 +11266,7 @@ def validate_one_dataset(cfg, student, dataset_name, device, max_samples=-1):
             image_68=image_68,
             image_136=image_136,
             sobel_68=sobel_68,
+            image_148=image_148,
             return_aux=False,
         )
         logits = extract_logits_for_eval(
@@ -13465,15 +14109,23 @@ def log_cache_summary(logger, cfg, train_dataset):
     logger.log(f"backbone_key = {cfg.BACKBONE_KEY}")
     logger.log(f"train datasets = {' + '.join(cfg.TRAIN_DATASETS)}")
     logger.log(f"num_train_samples = {len(train_dataset)}")
-    feature_root = (
-        ml_feature_cache_dir(cfg)
-        if use_multi_level_feature(cfg)
-        else Path(cfg.CACHE_ROOT) / "features_cache" / cfg.BACKBONE_KEY
-    )
-    logger.log(
-        "feature cache path = "
-        f"{feature_root.resolve()}"
-    )
+    if use_online_dino_last4(cfg):
+        logger.log("feature source = online frozen DINOv1-S/8 f9-f12")
+        logger.log("feature cache path = not_used")
+        logger.log(
+            "online DINO model path = "
+            f"{Path(cfg.DINO['model_path']).resolve()}"
+        )
+    else:
+        feature_root = (
+            ml_feature_cache_dir(cfg)
+            if use_multi_level_feature(cfg)
+            else Path(cfg.CACHE_ROOT) / "features_cache" / cfg.BACKBONE_KEY
+        )
+        logger.log(
+            "feature cache path = "
+            f"{feature_root.resolve()}"
+        )
     logger.log(
         "original pseudo cache path = "
         f"{train_dataset.original_pseudo_cache_root}"
@@ -13490,9 +14142,40 @@ def log_cache_summary(logger, cfg, train_dataset):
         f"{train_dataset.first_pseudo_cache_path}"
     )
     logger.log(f"pseudo source = {train_dataset.pseudo_source}")
-    logger.log(
-        f"pseudo final candidate = {train_dataset.pseudo_final_candidate}"
-    )
+    if use_gt68_cached_linear_supervision(cfg):
+        logger.log(
+            "dataset compatibility pseudo candidate = "
+            f"{train_dataset.pseudo_final_candidate}"
+        )
+        logger.log(
+            "effective training target = strict binary training GT; "
+            "nearest resize directly to GT_68"
+        )
+    elif bool(getattr(cfg, "R1_FORMAL_ONLINE_V1", False)):
+        logger.log(
+            "dataset compatibility pseudo candidate = "
+            f"{train_dataset.pseudo_final_candidate}"
+        )
+        if use_gt_decoder_supervision(cfg):
+            logger.log(
+                "effective training target = strict binary training GT; "
+                "nearest resize to GT_37, then nearest lift only where required"
+            )
+        elif use_direct_r1_37_decoder(cfg):
+            logger.log(
+                "effective training target = strict binary "
+                "R1_37=1[residual_pass1_37>0.5], consumed directly "
+                "by the decoder-isolation loss"
+            )
+        else:
+            logger.log(
+                "effective training target = strict binary "
+                "1[bilinear(residual_pass1_37,68)>0.5]"
+            )
+    else:
+        logger.log(
+            f"pseudo final candidate = {train_dataset.pseudo_final_candidate}"
+        )
     logger.log(f"feature shape example = {train_dataset.feature_shape}")
     if use_cssd(cfg):
         logger.log(
@@ -13576,6 +14259,9 @@ def log_cache_summary(logger, cfg, train_dataset):
             "first DABE-Clean cache file = "
             f"{train_dataset.dabe_clean_first_cache_path}"
         )
+        if bool(getattr(cfg, "R1_ONLY_CACHE_IO", False)):
+            logger.log("R1-only cache I/O = true")
+            logger.log("DABE-Clean payload read = false")
         clean_static_source = get_dabe_clean_static_target_source(cfg)
         logger.log(
             f"DABE-Clean static target source = {clean_static_source}"
@@ -13593,7 +14279,10 @@ def log_cache_summary(logger, cfg, train_dataset):
                 "DABE-v2 static source key = "
                 f"{getattr(cfg, 'DABE_CLEAN_DABE_V2_SOURCE_KEY', 'p_dabe_68')}"
             )
-            logger.log("DABE-v2 static threshold operator = strict > 0.5")
+            logger.log(
+                "DABE-v2 static threshold operator = strict > "
+                f"{float(getattr(cfg, 'DABE_CLEAN_DABE_V2_HARD_THRESHOLD', 0.5)):g}"
+            )
     if getattr(cfg, "USE_TCE", False):
         logger.log(f"TCE cover cache path = {train_dataset.tce_cover_cache_root}")
         logger.log(f"first TCE cover file = {train_dataset.tce_cover_first_cache_path}")
@@ -13678,9 +14367,54 @@ def log_first_batch_pseudo(logger, cfg, train_dataset):
         pin_memory=False,
     )
     batch = next(iter(diagnostic_loader))
-    pseudo = batch["pseudo"].float()
-    logger.log(f"first batch pseudo source = {train_dataset.pseudo_source}")
-    logger.log(f"first batch pseudo final candidate = {train_dataset.pseudo_final_candidate}")
+    if use_gt68_cached_linear_supervision(cfg):
+        pseudo = batch["gt_hard_68"].float()
+        logger.log("first batch effective target source = training_gt_hard_68")
+        logger.log(
+            "first batch dataset compatibility pseudo source = "
+            f"{train_dataset.pseudo_source}"
+        )
+        logger.log(
+            "first batch effective target = strict training GT_68 direct"
+        )
+        logger.log(f"first batch GT_68 shape = {list(pseudo.shape)}")
+        logger.log(f"first batch GT_68 area = {float(pseudo.mean()):.6f}")
+    else:
+        pseudo = batch["pseudo"].float()
+        logger.log(f"first batch pseudo source = {train_dataset.pseudo_source}")
+    if use_gt68_cached_linear_supervision(cfg):
+        logger.log(
+            "first batch dataset compatibility pseudo candidate = "
+            f"{train_dataset.pseudo_final_candidate}"
+        )
+    elif bool(getattr(cfg, "R1_FORMAL_ONLINE_V1", False)):
+        logger.log(
+            "first batch dataset compatibility pseudo candidate = "
+            f"{train_dataset.pseudo_final_candidate}"
+        )
+        if use_gt_decoder_supervision(cfg):
+            gt_37 = batch["gt_hard_37"].float()
+            logger.log(
+                "first batch effective target = strict training GT_37 direct; "
+                "any larger supervision target uses nearest lifting"
+            )
+            logger.log(f"first batch GT_37 shape = {list(gt_37.shape)}")
+            logger.log(f"first batch GT_37 area = {float(gt_37.mean()):.6f}")
+        elif use_direct_r1_37_decoder(cfg):
+            logger.log(
+                "first batch effective target = strict R1_37 direct; "
+                "any larger supervision target uses nearest lifting"
+            )
+        else:
+            logger.log(
+                "first batch effective target = "
+                "1[bilinear(residual_pass1_37,68)>0.5]"
+            )
+    else:
+        logger.log(
+            "first batch pseudo final candidate = "
+            f"{train_dataset.pseudo_final_candidate}"
+        )
     logger.log(f"first batch pseudo tensor shape = {list(pseudo.shape)}")
     logger.log(f"first sample pseudo tensor shape = {list(pseudo[0].shape)}")
     logger.log(f"pseudo min = {float(pseudo.min().item()):.6f}")
@@ -13694,7 +14428,18 @@ def log_first_batch_pseudo(logger, cfg, train_dataset):
         "first batch stems = "
         + ",".join(str(value) for value in batch["stem"])
     )
-    if use_multi_level_feature(cfg):
+    if use_online_dino_last4(cfg):
+        tensor = batch["dino_input_296"].float()
+        logger.log(
+            "first batch online DINO input tensor shape = "
+            f"{list(tensor.shape)}"
+        )
+        logger.log(
+            "first batch online DINO input mean/std = "
+            f"{float(tensor.mean().item()):.6f}/"
+            f"{float(tensor.std(unbiased=False).item()):.6f}"
+        )
+    elif use_multi_level_feature(cfg):
         for layer in getattr(cfg, "MULTI_LEVEL_LAYERS", [4, 8, 12]):
             name = f"feature_l{int(layer)}"
             tensor = batch[name].float()
@@ -15480,12 +16225,18 @@ def main():
         validate_dabev2hard_static_only_config(cfg)
     )
     pure_student_static_only = is_r1hard_linear_pure_student_config(cfg)
+    r1_only_cache_io = bool(getattr(cfg, "R1_ONLY_CACHE_IO", False))
     r1hard_dagp_ndr_pure_student = (
         is_r1hard_dagp_ndr_pure_student_config(cfg)
     )
     if pure_student_static_only and dabev2hard_static_only_audit is None:
         raise RuntimeError(
             "Hard-R1 linear pure-Student config must pass its static-only audit."
+        )
+    if r1_only_cache_io and not pure_student_static_only:
+        raise RuntimeError(
+            "R1_ONLY_CACHE_IO=True is restricted to the audited Hard-R1 "
+            "pure-Student protocol."
         )
     dabev2hard_clean_ecst_v5_audit = (
         validate_dabev2hard_clean_ecst_v5_control(cfg)
@@ -16112,7 +16863,11 @@ def main():
             "STATIC_WEIGHT_MODE": "ones",
             "TEACHER_TARGET_MODE": "binary",
             "MAX_EPOCH": 45,
-            "FINETUNE_RESET_EPOCH": 20,
+            "FINETUNE_RESET_EPOCH": (
+                0
+                if bool(getattr(cfg, "R1_FORMAL_ONLINE_V1", False))
+                else 20
+            ),
             "FINETUNE_RESET_TIMING": "after_epoch",
             "DABE_PU_DESPL_TEACHER_ONLY_START": 21,
             "LOSS_SIZE": 68,
@@ -16151,10 +16906,23 @@ def main():
             hard_threshold = float(
                 getattr(cfg, "DABE_CLEAN_DABE_V2_HARD_THRESHOLD", float("nan"))
             )
-            if not math.isfinite(hard_threshold) or abs(hard_threshold - 0.5) > 1e-12:
+            expected_hard_threshold = (
+                (
+                    0.58
+                    if bool(getattr(cfg, "GBSP_ABSMM_T058_LINEAR", False))
+                    else 0.63
+                )
+                if clean_static_target_source == "gbsp_abs_minmax_hard_68"
+                else 0.5
+            )
+            if not math.isfinite(hard_threshold) or abs(
+                hard_threshold - expected_hard_threshold
+            ) > 1e-12:
                 raise RuntimeError(
                     "DABE-v2-hard static ablation requires "
-                    "DABE_CLEAN_DABE_V2_HARD_THRESHOLD=0.5."
+                    "DABE_CLEAN_DABE_V2_HARD_THRESHOLD="
+                    f"{expected_hard_threshold:g} for source "
+                    f"{clean_static_target_source!r}."
                 )
             dabev2hard_clean_ecst_v5_named = bool(
                 dabev2hard_clean_ecst_v5_audit is not None
@@ -16747,7 +17515,10 @@ def main():
             logger.log(
                 "source = independent_dabe_v2_p_dabe_68_hard"
             )
-            logger.log("threshold = strict > 0.5")
+            logger.log(
+                "threshold = strict > "
+                f"{float(getattr(cfg, 'DABE_CLEAN_DABE_V2_HARD_THRESHOLD', 0.5)):g}"
+            )
             logger.log("target_shape = [B,1,68,68]")
             logger.log("target_min = 0")
             logger.log("target_max = 1")
@@ -16870,12 +17641,50 @@ def main():
                 )
             )
             logger.log(
-                "supervision_source = independent_dabe_v2_"
-                f"{getattr(cfg, 'DABE_CLEAN_DABE_V2_SOURCE_KEY', 'p_dabe_68')}_hard"
+                "supervision_source = "
+                + (
+                    "training_gt_hard_37_oracle_diagnostic"
+                    if use_gt_decoder_supervision(cfg)
+                    else (
+                        "training_gt_hard_68_cached_linear_oracle_diagnostic"
+                        if use_gt68_cached_linear_supervision(cfg)
+                        else "independent_dabe_v2_"
+                        f"{getattr(cfg, 'DABE_CLEAN_DABE_V2_SOURCE_KEY', 'p_dabe_68')}_hard"
+                    )
+                )
             )
-            logger.log("threshold = strict > 0.5")
-            logger.log("target_shape = [B,1,68,68]")
-            logger.log("static_loss = direct mean BCEWithLogits")
+            logger.log(
+                "threshold = strict > "
+                f"{float(getattr(cfg, 'DABE_CLEAN_DABE_V2_HARD_THRESHOLD', 0.5)):g}"
+            )
+            if use_dba_head(cfg):
+                logger.log("target_shape = [B,1,68,68]")
+                logger.log(
+                    "static_loss = DBA foreground mean BCEWithLogits + "
+                    "reverse-background mean BCEWithLogits + "
+                    "orthogonal loss"
+                )
+            elif use_hsd_decoder(cfg):
+                hsd_output_size = int(getattr(cfg, "HSD_OUTPUT_SIZE", 148))
+                hsd_coarse_size = int(getattr(cfg, "HSD_COARSE_SIZE", 37))
+                logger.log(
+                    "target_shape = base [B,1,37,37]; "
+                    f"coarse nearest-lift [B,1,{hsd_coarse_size},{hsd_coarse_size}]; "
+                    f"final nearest-lift [B,1,{hsd_output_size},{hsd_output_size}]"
+                )
+                logger.log(
+                    "static_loss = normalized weighted HSD BCE group | "
+                    f"mode={getattr(cfg, 'HSD_SUPERVISION_MODE', 'triple')}"
+                )
+            elif use_direct_r1_37_decoder(cfg):
+                logger.log("target_shape = direct [B,1,37,37]")
+                logger.log(
+                    "static_loss = decoder-isolation direct Hard-R1 group; "
+                    f"mode={getattr(cfg, 'SCALE_LIFT_SUPERVISION_MODE', getattr(cfg, 'BCRD_SUPERVISION_MODE', 'final_only'))}"
+                )
+            else:
+                logger.log("target_shape = [B,1,68,68]")
+                logger.log("static_loss = direct mean BCEWithLogits")
             logger.log("effective_schedule_epoch_1_45 = static/teacher 1.0/0.0")
             logger.log("teacher_loss_final/coarse/base = exact graph zero")
             logger.log("teacher_target_used_for_gradient = False")
@@ -16893,16 +17702,46 @@ def main():
             )
             logger.log("ECST = disabled")
             logger.log("legacy_ecst_regions_used = false")
-            logger.log("finetune_reset_epoch = 20 (unchanged)")
+            logger.log(
+                "finetune_reset_epoch = "
+                + (
+                    "disabled"
+                    if not reset_enabled
+                    else f"{reset_epoch}"
+                )
+            )
             logger.log(
                 "student_head = "
                 + (
-                    "dagp_safe_plus_ndr_v1"
-                    if r1hard_dagp_ndr_pure_student
+                    "dba_384_to_fg_bg_64"
+                    if use_dba_head(cfg)
                     else (
-                        "single_1x1_conv"
-                        if pure_student_static_only
-                        else "unchanged_DAGP_NDR"
+                        "hsd_v1_" + (
+                            "full" if bool(getattr(cfg, "USE_DETAIL", False))
+                            else "semantic"
+                        )
+                        if use_hsd_decoder(cfg)
+                        else (
+                            "last4_single_1x1_conv"
+                            if use_last4_linear_probe(cfg)
+                            else (
+                                "f12_scalelift"
+                                if use_f12_scalelift_decoder(cfg)
+                                else (
+                                    "bcrd_sem_v1"
+                                    if use_bcrd_sem_decoder(cfg)
+                                    else (
+                                        "dagp_safe_plus_ndr_v1"
+                                        if r1hard_dagp_ndr_pure_student
+                                        else (
+                                            "single_1x1_conv"
+                                            if pure_student_static_only
+                                            else "unchanged_DAGP_NDR"
+                                        )
+                                    )
+                                )
+                            )
+                        )
                     )
                 )
             )
@@ -17034,6 +17873,15 @@ def main():
         logger.log(f"SAVE_EVERY_EPOCH = {bool(getattr(cfg, 'SAVE_EVERY_EPOCH', False))}")
         logger.log(f"SAVE_INTERVAL = {int(getattr(cfg, 'SAVE_INTERVAL', 0))}")
         logger.log(f"max_samples = {sample_limit}")
+        logger.log(f"batch_size = {int(cfg.BATCH_SIZE)}")
+        if bool(getattr(cfg, "R1_BATCH_SPEED_PROBE", False)):
+            logger.log(
+                "[Batch Speed Probe] enabled=True | "
+                f"reference_batch={int(getattr(cfg, 'R1_REFERENCE_BATCH_SIZE', 16))} | "
+                f"effective_batch={int(cfg.BATCH_SIZE)} | "
+                "optimizer_updates_per_epoch_changed=True | "
+                "iteration_based_lr_scheduler_unchanged=True"
+            )
         logger.log(f"ema_weight = {cfg.EMA_WEIGHT}")
         if oed_enabled:
             logger.log("USE_OED_AUXILIARY = True")
@@ -17096,7 +17944,29 @@ def main():
                 f"{static_weight_protocol_fingerprint(cfg)}"
             )
             static_source = get_dabe_pu_static_source(cfg)
-            if static_source == "p_base_68":
+            if bool(getattr(cfg, "R1_FORMAL_ONLINE_V1", False)):
+                if use_gt_decoder_supervision(cfg):
+                    logger.log(
+                        "STATIC_TARGET_PROTOCOL = GT_37="
+                        "nearest(1[training_GT>0.5],37); direct decoder "
+                        "supervision; nearest-lift only for larger active outputs; "
+                        "oracle diagnostic; Teacher/EMA/routing/reset disabled"
+                    )
+                elif use_direct_r1_37_decoder(cfg):
+                    logger.log(
+                        "STATIC_TARGET_PROTOCOL = "
+                        "R1_37=1[residual_pass1_37>0.5]; direct decoder "
+                        "supervision; nearest-lift only for larger active outputs; static-only epochs "
+                        "1-45; Teacher/EMA/routing/reset disabled"
+                    )
+                else:
+                    logger.log(
+                        "STATIC_TARGET_PROTOCOL = "
+                        "1[bilinear(residual_pass1_37,68)>0.5]; "
+                        "static-only epochs 1-45; Teacher/EMA/routing/reset "
+                        "disabled"
+                    )
+            elif static_source == "p_base_68":
                 logger.log(
                     "STATIC_TARGET_SINGLE_VARIABLE = target_soft_68 -> "
                     "p_base_68; static weight/schedule/EMA/reset/DAGP/NDR "
@@ -17120,10 +17990,17 @@ def main():
                 f"{teacher_routing_protocol_fingerprint(cfg)}"
             )
             if teacher_routing_mode == "none":
-                logger.log(
-                    "NO_ECST_SINGLE_VARIABLE = ECST teacher pixel weighting "
-                    "disabled; target/static schedule/EMA/reset/DAGP/NDR unchanged"
-                )
+                if bool(getattr(cfg, "R1_FORMAL_ONLINE_V1", False)):
+                    logger.log(
+                        "STATIC_R1_PURE_STUDENT = Teacher/EMA/ECST routing "
+                        "disabled; continuous optimizer/scheduler; no "
+                        "epoch-boundary reset"
+                    )
+                else:
+                    logger.log(
+                        "NO_ECST_SINGLE_VARIABLE = ECST teacher pixel weighting "
+                        "disabled; target/static schedule/EMA/reset/DAGP/NDR unchanged"
+                    )
             elif teacher_routing_mode == "ectp":
                 logger.log(
                     "ECTP_TEACHER_TARGET_PROJECTION = binary EMA Teacher "
@@ -18167,8 +19044,23 @@ def main():
             f"complex_head_post_reset_scheduler = "
             f"{getattr(cfg, 'COMPLEX_HEAD_POST_RESET_SCHEDULER', 'original_iter_steplr')}"
         )
-        logger.log("DINO_in_training_loop = false")
-        logger.log("train_gt_in_train = false")
+        logger.log(
+            "DINO_in_training_loop = "
+            f"{str(use_online_dino_last4(cfg)).lower()}"
+        )
+        if use_online_dino_last4(cfg):
+            logger.log("DINO_trainable = false")
+            logger.log("DINO_backward = false")
+            logger.log("DINO_feature_source = online_attention_key_f9_f10_f11_f12")
+        logger.log(
+            "train_gt_in_train = "
+            + (
+                "true_oracle_diagnostic"
+                if use_gt68_cached_linear_supervision(cfg)
+                or use_gt_decoder_supervision(cfg)
+                else "false"
+            )
+        )
         logger.log(f"head_type = {getattr(cfg, 'HEAD_TYPE', 'simple')}")
         if use_dagp_head(cfg):
             logger.log(f"use_dagp_head = {bool(getattr(cfg, 'USE_DAGP_HEAD', True))}")
@@ -18505,35 +19397,74 @@ def main():
                         "DABE_CLEAN_DABE_V2_HARD_THRESHOLD = "
                         f"{float(getattr(cfg, 'DABE_CLEAN_DABE_V2_HARD_THRESHOLD')):.6f}"
                     )
-                    logger.log(
-                        "STATIC_TARGET_SINGLE_VARIABLE = "
-                        "Clean-DP_68 -> 1[independent "
-                        f"{getattr(cfg, 'DABE_CLEAN_DABE_V2_SOURCE_KEY', 'p_dabe_68')} "
-                        "> 0.5]; "
-                        + (
-                            "A1 Clean-ECST-v5 routing evidence/cache unchanged; "
-                            "schedule, Teacher, reset, DAGP and NDR unchanged"
-                            if dabev2hard_clean_ecst_v5_audit is not None
-                            else (
-                                "static-only for epochs 1-45; all Teacher losses "
-                                "exactly zero; reset, DAGP and NDR unchanged"
-                                if dabev2hard_static_only_audit is not None
+                    if bool(getattr(cfg, "R1_FORMAL_ONLINE_V1", False)):
+                        if use_gt_decoder_supervision(cfg):
+                            logger.log(
+                                "STATIC_TARGET_PROTOCOL = strict binary training "
+                                "GT_37 oracle diagnostic; direct decoder supervision "
+                                "(nearest lift only where required); Teacher/EMA/reset disabled"
+                            )
+                        elif use_direct_r1_37_decoder(cfg):
+                            logger.log(
+                                "STATIC_TARGET_PROTOCOL = strict binary "
+                                "R1_37=1[residual_pass1_37>0.5]; direct decoder "
+                                "supervision (nearest lift only where required); "
+                                "static-only epochs 1-45; Teacher/EMA/reset "
+                                "disabled"
+                            )
+                        else:
+                            logger.log(
+                                "STATIC_TARGET_PROTOCOL = "
+                                "1[bilinear(residual_pass1_37,68)>0.5]; "
+                                "static-only epochs 1-45; Teacher/EMA/reset "
+                                "disabled"
+                            )
+                    else:
+                        logger.log(
+                            "STATIC_TARGET_SINGLE_VARIABLE = "
+                            "Clean-DP_68 -> 1[independent "
+                            f"{getattr(cfg, 'DABE_CLEAN_DABE_V2_SOURCE_KEY', 'p_dabe_68')} "
+                            "> 0.5]; "
+                            + (
+                                "A1 Clean-ECST-v5 routing evidence/cache unchanged; "
+                                "schedule, Teacher, reset, DAGP and NDR unchanged"
+                                if dabev2hard_clean_ecst_v5_audit is not None
                                 else (
-                                    "ECST teacher routing disabled; schedule, Teacher, "
-                                    "reset, DAGP and NDR unchanged"
-                                    if dabev2hard_noecst_control_audit is not None
-                                    else "legacy ECST regions/routing, schedule, Teacher, "
-                                    "reset, DAGP and NDR unchanged"
+                                    "static-only for epochs 1-45; all Teacher losses "
+                                    "exactly zero; reset, DAGP and NDR unchanged"
+                                    if dabev2hard_static_only_audit is not None
+                                    else (
+                                        "ECST teacher routing disabled; schedule, Teacher, "
+                                        "reset, DAGP and NDR unchanged"
+                                        if dabev2hard_noecst_control_audit is not None
+                                        else "legacy ECST regions/routing, schedule, Teacher, "
+                                        "reset, DAGP and NDR unchanged"
+                                    )
                                 )
                             )
                         )
-                    )
             logger.log(
                 f"DABE_CLEAN_ROOT = {getattr(cfg, 'DABE_CLEAN_ROOT', '')}"
             )
-            logger.log(
-                "DABE_CLEAN_STATIC_LOSS = direct BCEWithLogits(reduction='mean')"
-            )
+            logger.log(f"R1_ONLY_CACHE_IO = {r1_only_cache_io}")
+            if (
+                bool(getattr(cfg, "R1_FORMAL_ONLINE_V1", False))
+                and use_direct_r1_37_decoder(cfg)
+            ):
+                logger.log(
+                    "DABE_CLEAN_STATIC_LOSS = "
+                    + (
+                        "strict training-GT_37 oracle decoder loss"
+                        if use_gt_decoder_supervision(cfg)
+                        else "direct strict-R1 decoder isolation loss "
+                        "(no 37->68 bilinear target)"
+                    )
+                )
+            else:
+                logger.log(
+                    "DABE_CLEAN_STATIC_LOSS = "
+                    "direct BCEWithLogits(reduction='mean')"
+                )
             logger.log("DABE_CLEAN_CACHE_STATIC_WEIGHT_MAP = False")
             logger.log(
                 "DABE_CLEAN_LEGACY_ROUTING_ONLY = "
@@ -18693,7 +19624,29 @@ def main():
                         else f"dabe_clean_{clean_mode}_68"
                     )
                 )
-                logger.log(f"pseudo final candidate = {clean_candidate}")
+                if use_gt68_cached_linear_supervision(cfg):
+                    logger.log(
+                        "pseudo final candidate = compatibility-only R1 cache; "
+                        "effective supervision = strict training GT_68"
+                    )
+                elif bool(getattr(cfg, "R1_FORMAL_ONLINE_V1", False)):
+                    if use_gt_decoder_supervision(cfg):
+                        logger.log(
+                            "pseudo final candidate = compatibility-only R1 cache; "
+                            "effective supervision = strict training GT_37"
+                        )
+                    elif use_direct_r1_37_decoder(cfg):
+                        logger.log(
+                            "pseudo final candidate = strict binary R1_37 "
+                            "consumed directly by decoder supervision"
+                        )
+                    else:
+                        logger.log(
+                            "pseudo final candidate = "
+                            "1[bilinear(residual_pass1_37,68)>0.5]"
+                        )
+                else:
+                    logger.log(f"pseudo final candidate = {clean_candidate}")
                 if (
                     not dabe_clean_offline_enabled
                     and uses_independent_dabe_v2_hard_source(
@@ -18701,12 +19654,37 @@ def main():
                     )
                 ):
                     if dabev2hard_static_only_audit is not None:
-                        logger.log(
-                            "p_init_formula = direct mean BCE("
-                            "1[independent "
-                            f"{getattr(cfg, 'DABE_CLEAN_DABE_V2_SOURCE_KEY', 'p_dabe_68')} "
-                            "> 0.5]); Teacher BCE disabled"
-                        )
+                        if (
+                            bool(getattr(cfg, "R1_FORMAL_ONLINE_V1", False))
+                            and use_gt_decoder_supervision(cfg)
+                        ):
+                            logger.log(
+                                "p_init_formula = oracle decoder BCE group; "
+                                "all active targets derived from strict training GT_37; "
+                                "R1/Teacher BCE disabled"
+                            )
+                        elif (
+                            bool(getattr(cfg, "R1_FORMAL_ONLINE_V1", False))
+                            and use_direct_r1_37_decoder(cfg)
+                        ):
+                            logger.log(
+                                "p_init_formula = decoder-isolation BCE group; "
+                                "all active targets derived directly from strict R1_37; "
+                                "Teacher BCE disabled"
+                            )
+                        elif bool(getattr(cfg, "R1_FORMAL_ONLINE_V1", False)):
+                            logger.log(
+                                "p_init_formula = direct mean BCE("
+                                "1[bilinear(residual_pass1_37,68)>0.5]); "
+                                "Teacher BCE disabled"
+                            )
+                        else:
+                            logger.log(
+                                "p_init_formula = direct mean BCE("
+                                "1[independent "
+                                f"{getattr(cfg, 'DABE_CLEAN_DABE_V2_SOURCE_KEY', 'p_dabe_68')} "
+                                "> 0.5]); Teacher BCE disabled"
+                            )
                     elif dabev2hard_clean_ecst_v5_audit is not None:
                         logger.log(
                             "p_init_formula = direct mean BCE("
@@ -18938,7 +19916,12 @@ def main():
             raise RuntimeError("USE_DABE_AWARE_LOSS=True requires GKD_MODE=off.")
 
         # 正式训练循环不加载 DINO，也不读训练集 GT。DESPL 实验只检查现有 cache，不自动生成。
-        if use_ml_feature:
+        if use_online_dino_last4(cfg):
+            logger.log(
+                "[Online DINO] feature cache preflight skipped | "
+                "source=original JPEG | extractor=frozen DINOv1-S/8 f9-f12"
+            )
+        elif use_ml_feature:
             for split in ("train", "val"):
                 if split == "val" and args.debug_loader_only:
                     continue
@@ -19028,70 +20011,90 @@ def main():
             )
             logger.log(f"[Cache] DABE-PU cache ready | {dabe_pu_reason}")
         elif use_dabe_clean and not teacher_only_no_offline_pseudo:
-            is_contrec_cache = str(
-                getattr(cfg, "DABE_CLEAN_VERSION", "")
-            ) == "v2_contrec"
-            is_offline_cache = dabe_clean_offline_enabled
-            dabe_clean_check = check_dabe_clean_cache(
-                cfg,
-                max_samples=sample_limit if sample_limit >= 0 else None,
-                return_stats=is_contrec_cache or is_offline_cache,
-            )
-            if is_contrec_cache or is_offline_cache:
-                _, dabe_clean_reason, contrec_stats = dabe_clean_check
+            if r1_only_cache_io:
+                _, r1_only_reason = check_r1_only_static_cache(
+                    cfg,
+                    max_samples=(
+                        sample_limit if sample_limit >= 0 else None
+                    ),
+                )
+                logger.log(
+                    f"[Cache] R1-only static cache ready | {r1_only_reason}"
+                )
+                logger.log(
+                    "[Cache] DABE-Clean independent cache skipped | "
+                    "reason=R1_ONLY_CACHE_IO"
+                )
             else:
-                _, dabe_clean_reason = dabe_clean_check
-                contrec_stats = {}
-                logger.log(
-                    f"[Cache] DABE-Clean independent cache ready | {dabe_clean_reason}"
+                is_contrec_cache = str(
+                    getattr(cfg, "DABE_CLEAN_VERSION", "")
+                ) == "v2_contrec"
+                is_offline_cache = dabe_clean_offline_enabled
+                dabe_clean_check = check_dabe_clean_cache(
+                    cfg,
+                    max_samples=(
+                        sample_limit if sample_limit >= 0 else None
+                    ),
+                    return_stats=is_contrec_cache or is_offline_cache,
                 )
-            if is_contrec_cache:
-                for name in (
-                    "p_rw",
-                    "foreground_evidence",
-                    "latent_rw",
-                    "background_evidence",
-                    "semantic_fg_tendency",
-                    "recoverability",
-                ):
-                    values = contrec_stats[name]
-                    label = (
-                        "mean/std/p50/p90/p95/max"
-                        if name == "recoverability"
-                        else "mean/std/p50/p90/p95"
-                    )
+                if is_contrec_cache or is_offline_cache:
+                    _, dabe_clean_reason, contrec_stats = dabe_clean_check
+                else:
+                    _, dabe_clean_reason = dabe_clean_check
+                    contrec_stats = {}
                     logger.log(
-                        f"[DABE-Clean ContRec] {name} {label}="
-                        f"{values['mean']:.8f}/"
-                        f"{values['std']:.8f}/{values['p50']:.8f}/"
-                        f"{values['p90']:.8f}/{values['p95']:.8f}"
-                        + (
-                            f"/{values['max']:.8f}"
-                            if name == "recoverability"
-                            else ""
-                        )
+                        "[Cache] DABE-Clean independent cache ready | "
+                        f"{dabe_clean_reason}"
                     )
-                recovery_stats = contrec_stats["recoverability"]
-                logger.log(
-                    "[DABE-Clean ContRec] recoverability_zero_ratio/"
-                    "gt_0.1/gt_0.3/gt_0.5="
-                    f"{recovery_stats['zero_ratio']:.8f}/"
-                    f"{recovery_stats['gt_0_1_ratio']:.8f}/"
-                    f"{recovery_stats['gt_0_3_ratio']:.8f}/"
-                    f"{recovery_stats['gt_0_5_ratio']:.8f}"
-                )
-            elif is_offline_cache:
-                offline_cache_stats = dict(contrec_stats["offline_evidence"])
-                target_stats = contrec_stats["target_offline"]
-                logger.log(
-                    "[Pure Offline Cache] source="
-                    f"{getattr(cfg, 'DABE_CLEAN_TRAINING_TARGET_SOURCE', 'target_offline_68')} | "
-                    "target mean/std/hard_area="
-                    f"{target_stats['mean']:.8f}/"
-                    f"{target_stats['std']:.8f}/"
-                    f"{target_stats['hard_area']:.8f} | "
-                    "training_batch_diagnostics_loaded=False"
-                )
+                if is_contrec_cache:
+                    for name in (
+                        "p_rw",
+                        "foreground_evidence",
+                        "latent_rw",
+                        "background_evidence",
+                        "semantic_fg_tendency",
+                        "recoverability",
+                    ):
+                        values = contrec_stats[name]
+                        label = (
+                            "mean/std/p50/p90/p95/max"
+                            if name == "recoverability"
+                            else "mean/std/p50/p90/p95"
+                        )
+                        logger.log(
+                            f"[DABE-Clean ContRec] {name} {label}="
+                            f"{values['mean']:.8f}/"
+                            f"{values['std']:.8f}/{values['p50']:.8f}/"
+                            f"{values['p90']:.8f}/{values['p95']:.8f}"
+                            + (
+                                f"/{values['max']:.8f}"
+                                if name == "recoverability"
+                                else ""
+                            )
+                        )
+                    recovery_stats = contrec_stats["recoverability"]
+                    logger.log(
+                        "[DABE-Clean ContRec] recoverability_zero_ratio/"
+                        "gt_0.1/gt_0.3/gt_0.5="
+                        f"{recovery_stats['zero_ratio']:.8f}/"
+                        f"{recovery_stats['gt_0_1_ratio']:.8f}/"
+                        f"{recovery_stats['gt_0_3_ratio']:.8f}/"
+                        f"{recovery_stats['gt_0_5_ratio']:.8f}"
+                    )
+                elif is_offline_cache:
+                    offline_cache_stats = dict(
+                        contrec_stats["offline_evidence"]
+                    )
+                    target_stats = contrec_stats["target_offline"]
+                    logger.log(
+                        "[Pure Offline Cache] source="
+                        f"{getattr(cfg, 'DABE_CLEAN_TRAINING_TARGET_SOURCE', 'target_offline_68')} | "
+                        "target mean/std/hard_area="
+                        f"{target_stats['mean']:.8f}/"
+                        f"{target_stats['std']:.8f}/"
+                        f"{target_stats['hard_area']:.8f} | "
+                        "training_batch_diagnostics_loaded=False"
+                    )
         elif teacher_only_no_offline_pseudo:
             logger.log(
                 "[Cache] offline pseudo labels skipped | "
@@ -19177,6 +20180,43 @@ def main():
 
         in_channels = train_dataset.in_channels
         student = build_seg_head(in_channels, cfg).to(device)
+        online_dino = None
+        if use_online_dino_last4(cfg):
+            online_dino = FrozenDINOv1Last4Extractor(cfg).to(device).eval()
+            logger.log(
+                "[Online DINO] initialized | trainable_params=0 | "
+                "backward=False | key_paths="
+                f"{online_dino.key_paths}"
+            )
+        if use_last4_feature_decoder(cfg):
+            trainable_params = sum(
+                parameter.numel()
+                for parameter in student.parameters()
+                if parameter.requires_grad
+            )
+            conv_macs = (
+                int(student.estimated_conv_macs_per_image())
+                if hasattr(student, "estimated_conv_macs_per_image")
+                else -1
+            )
+            logger.log(f"R1_decoder_trainable_params = {trainable_params}")
+            logger.log(f"R1_decoder_conv_MACs_per_image = {conv_macs}")
+            logger.log(
+                f"R1_decoder_conv_FLOPs_per_image = "
+                f"{2 * conv_macs if conv_macs >= 0 else -1}"
+            )
+        if use_dba_head(cfg):
+            trainable_params = sum(
+                parameter.numel()
+                for parameter in student.parameters()
+                if parameter.requires_grad
+            )
+            logger.log(
+                "R1_DBA = original_fg_bg_decoupling_plus_orthogonal | "
+                f"input_channels={in_channels} | embed_dim="
+                f"{int(getattr(cfg, 'DBA_EMBED_DIM', 64))} | "
+                f"trainable_params={trainable_params}"
+            )
         teacher = None
         if not pure_student_static_only:
             teacher = build_seg_head(in_channels, cfg).to(device)
@@ -19186,8 +20226,13 @@ def main():
                 p.requires_grad_(False)
         else:
             logger.log(
-                "[Hard-R1 PureStudent] teacher_instantiated=False | "
-                "teacher_forward=False | ema_update=False"
+                (
+                    "[GT68 Cached Linear PureStudent]"
+                    if use_gt68_cached_linear_supervision(cfg)
+                    else "[Hard-R1 PureStudent]"
+                )
+                + " teacher_instantiated=False | teacher_forward=False | "
+                "ema_update=False"
             )
         if use_cacd(cfg):
             student_keys = list(student.state_dict().keys())
@@ -20559,6 +21604,8 @@ def main():
         cacd_warning_streaks = {}
         hr_bfr_first_batch_logged = False
         ndr_first_batch_logged = False
+        hsd_first_batch_logged = False
+        r1_isolation_first_batch_logged = False
         ndr_v2_bg_lock_first_batch_logged = False
         tadr_first_batch_logged = False
         mvflip_first_batch_logged = False
@@ -21151,6 +22198,8 @@ def main():
             student_pred_area_sum = 0.0
             teacher_pred_area_sum = 0.0
             mixed_target_area_sum = 0.0
+            decoder_supervision_area_sum = 0.0
+            decoder_supervision_batches = 0
             dagp_safe_scale_sum = 0.0
             dagp_safe_alpha_sum = 0.0
             dagp_safe_gamma_sum = 0.0
@@ -21473,10 +22522,16 @@ def main():
                             egsa_sample_indices, device
                         )
                 pseudo = batch["pseudo"].to(device, non_blocking=True).float()
-                model_input = make_model_input(cfg, batch, device)
+                model_input = make_model_input(
+                    cfg,
+                    batch,
+                    device,
+                    online_dino=online_dino,
+                )
                 image_68 = make_image_68(cfg, batch, device)
                 sobel_68 = make_sobel_68(cfg, batch, device)
                 image_136 = make_image_136(cfg, batch, device)
+                image_148 = make_image_148(cfg, batch, device)
                 pseudo_68 = F.interpolate(pseudo, size=(cfg.LOSS_SIZE, cfg.LOSS_SIZE), mode="bilinear").float()
                 pu_target_soft = None
                 pu_p_base_soft = None
@@ -21533,7 +22588,11 @@ def main():
                         else (
                             "target_offline_68"
                             if dabe_clean_offline_enabled
-                            else "dabe_clean_target_68"
+                            else (
+                                "dabe_clean_dabe_v2_soft_68"
+                                if r1_only_cache_io
+                                else "dabe_clean_target_68"
+                            )
                         )
                     )
                     if teacher_only_no_offline_pseudo:
@@ -21729,11 +22788,33 @@ def main():
                         pu_bg_core = batch["pu_bg_core"].to(
                             device, non_blocking=True
                         ).float()
+                if use_gt68_cached_linear_supervision(cfg):
+                    # Reuse the established cached-feature/pure-Student
+                    # training scaffold, but make the oracle GT_68 tensor the
+                    # sole effective target.  No cached R1 tensor below this
+                    # point is allowed to contribute to the loss.
+                    gt_target_68 = gt68_cached_linear_target(
+                        cfg, batch, device
+                    )
+                    pseudo_68 = gt_target_68
+                    pu_target_soft = gt_target_68
+                    pu_static_source_target = gt_target_68
+                    pu_static_target = gt_target_68
+                    pu_static_weight_map = torch.ones_like(
+                        gt_target_68, requires_grad=False
+                    )
+                    pu_target_hard = gt_target_68
+                    dabe_pu_static_source = "training_gt_hard_68_oracle"
+                    batch_static_weight_mode = "gt68_internal_ones_diagnostic"
                 if use_dabe_clean and iter_idx == 0:
                     evidence_parts = []
                     if dabe_clean_offline_enabled:
                         evidence_parts.append(
                             "offline_evidence_maps_in_batch=False"
+                        )
+                    elif r1_only_cache_io:
+                        evidence_parts.append(
+                            "legacy_dabe_clean_payload_in_batch=False"
                         )
                     else:
                         for clean_key in (
@@ -21756,9 +22837,9 @@ def main():
                         "mode="
                         f"{FOUND_STATIC_SOURCE if found_static_train else (getattr(cfg, 'DABE_CLEAN_OFFLINE_MODE') if dabe_clean_offline_enabled else getattr(cfg, 'DABE_CLEAN_TARGET_MODE'))} | "
                         "target_source_key="
-                        f"{'dabe_clean_static_target_68' if uses_independent_dabe_v2_hard_source(dabe_clean_static_target_source) else clean_training_target_key} | "
-                        f"payload_version={'legacy_found_binary_v1' if found_static_train else getattr(cfg, 'DABE_CLEAN_EXPECTED_PAYLOAD_VERSION', '')} | "
-                        f"cache_root={found_static_root(cfg) if found_static_train else getattr(cfg, 'DABE_CLEAN_ROOT', '')} | "
+                        f"{'gt_hard_68' if use_gt68_cached_linear_supervision(cfg) else ('dabe_clean_static_target_68' if uses_independent_dabe_v2_hard_source(dabe_clean_static_target_source) else clean_training_target_key)} | "
+                        f"payload_version={'r1_only_static_source' if r1_only_cache_io else ('legacy_found_binary_v1' if found_static_train else getattr(cfg, 'DABE_CLEAN_EXPECTED_PAYLOAD_VERSION', ''))} | "
+                        f"cache_root={getattr(cfg, 'DABE_CLEAN_DABE_V2_ROOT', '') if r1_only_cache_io else (found_static_root(cfg) if found_static_train else getattr(cfg, 'DABE_CLEAN_ROOT', ''))} | "
                         f"target_shape={list(pu_static_target.shape)} | "
                         "target_min/mean/max="
                         f"{float(pu_static_target.min()):.6f}/"
@@ -21801,6 +22882,7 @@ def main():
                     image_68=image_68,
                     image_136=image_136,
                     sobel_68=sobel_68,
+                    image_148=image_148,
                     return_aux=use_dagp_safe_head(cfg) or use_csd_head(cfg) or use_csd_v1r_head(cfg) or use_cacd(cfg),
                     bg_reliable_68=csd_bg_reliable_68,
                     pa_compare_original=pa_compare_original,
@@ -21842,6 +22924,33 @@ def main():
                 ):
                     log_ndr_first_batch(logger, image_68, student_out, pseudo_68)
                     ndr_first_batch_logged = True
+                if (
+                    use_hsd_decoder(cfg)
+                    and not hsd_first_batch_logged
+                    and isinstance(student_out, dict)
+                ):
+                    log_hsd_first_batch(logger, student, student_out)
+                    hsd_first_batch_logged = True
+                if (
+                    use_direct_r1_37_decoder(cfg)
+                    and not use_hsd_decoder(cfg)
+                    and not r1_isolation_first_batch_logged
+                ):
+                    if use_last4_linear_probe(cfg):
+                        log_last4_linear_first_batch(
+                            logger, student, student_out
+                        )
+                    elif use_f12_scalelift_decoder(cfg):
+                        log_scalelift_first_batch(
+                            logger, student, student_out
+                        )
+                    elif use_bcrd_sem_decoder(cfg):
+                        log_bcrd_first_batch(logger, student, student_out)
+                    else:
+                        raise RuntimeError(
+                            "Unknown direct-R1 decoder for first-batch audit."
+                        )
+                    r1_isolation_first_batch_logged = True
                 if (
                     use_tadr_router(cfg)
                     and bool(getattr(cfg, "TADR_DEBUG_FIRST_BATCH", True))
@@ -21957,8 +23066,9 @@ def main():
                     if pure_student_static_only:
                         # Downstream static-only loss bookkeeping expects a
                         # finite target-shaped tensor.  This detached sentinel
-                        # is derived solely from Hard-R1; it is not a model
-                        # output and never contributes a Teacher loss.
+                        # is derived solely from the effective static target;
+                        # it is not a model output and never contributes a
+                        # Teacher loss.
                         teacher_out = torch.logit(
                             pu_static_target.detach().clamp(1e-6, 1.0 - 1e-6)
                         )
@@ -21970,6 +23080,7 @@ def main():
                             image_68=image_68,
                             image_136=image_136,
                             sobel_68=sobel_68,
+                            image_148=image_148,
                             return_aux=use_bitc_train or use_eaogp_train,
                             return_eaogp_aux=(
                                 use_eaogp_train and eaogp_scale_expected > 0.0
@@ -22091,7 +23202,9 @@ def main():
                     if pure_student_static_only:
                         teacher_full_target = pu_static_target.detach()
                         teacher_full_target_source = (
-                            "disabled_pure_student_hard_r1_sentinel"
+                            "disabled_pure_student_gt68_sentinel"
+                            if use_gt68_cached_linear_supervision(cfg)
+                            else "disabled_pure_student_hard_r1_sentinel"
                         )
                     elif use_dabe_pu_despl_sched and dabe_pu_despl_teacher_target_mode == "soft_prob":
                         teacher_full_target = teacher_prob.detach()
@@ -25806,7 +26919,79 @@ def main():
                     loss_anchor = student_logits.sum() * 0.0
                     loss_soft = student_logits.sum() * 0.0
                     loss = loss_base
-                if use_ndr_branch(cfg) or use_csd_head(cfg) or use_csd_v1r_head(cfg) or use_cacd(cfg):
+                if use_dba_head(cfg):
+                    dba_loss = build_dba_r1_group_loss(
+                        cfg,
+                        student_out,
+                        pu_static_target,
+                    )
+                    decoder_supervision_area_sum += float(
+                        pu_static_target.detach().mean().item()
+                    )
+                    decoder_supervision_batches += 1
+                    loss = dba_loss["loss"]
+                    loss_base = dba_loss["loss_foreground"]
+                    loss_final_bce = dba_loss["loss_foreground"]
+                    loss_ndr_coarse_aux = dba_loss["loss_background"]
+                    loss_aux_base = dba_loss["loss_orthogonal_weighted"]
+                    loss_pu_static_final = dba_loss["loss_foreground"]
+                    loss_pu_static_coarse = dba_loss["loss_background"]
+                    loss_pu_static_base = dba_loss[
+                        "loss_orthogonal_weighted"
+                    ]
+                    loss_pu_static_group = dba_loss["loss"]
+                    pu_static_loss_weight = 1.0
+                    pu_teacher_loss_weight = 0.0
+                elif use_hsd_decoder(cfg):
+                    decoder_target_37, _ = (
+                        decoder_supervision_target_37(cfg, batch, device)
+                    )
+                    decoder_supervision_area_sum += float(
+                        decoder_target_37.detach().mean().item()
+                    )
+                    decoder_supervision_batches += 1
+                    hsd_loss = build_hsd_r1_group_loss(
+                        cfg,
+                        epoch,
+                        student_out,
+                        decoder_target_37,
+                    )
+                    loss = hsd_loss["loss"]
+                    loss_base = hsd_loss["loss_final"]
+                    loss_final_bce = hsd_loss["loss_final"]
+                    loss_ndr_coarse_aux = hsd_loss["loss_coarse"]
+                    loss_aux_base = hsd_loss["loss_base"]
+                    loss_pu_static_final = hsd_loss["loss_final"]
+                    loss_pu_static_coarse = hsd_loss["loss_coarse"]
+                    loss_pu_static_base = hsd_loss["loss_base"]
+                    loss_pu_static_group = hsd_loss["loss"]
+                    pu_static_loss_weight = 1.0
+                    pu_teacher_loss_weight = 0.0
+                elif use_direct_r1_37_decoder(cfg):
+                    decoder_target_37, _ = (
+                        decoder_supervision_target_37(cfg, batch, device)
+                    )
+                    decoder_supervision_area_sum += float(
+                        decoder_target_37.detach().mean().item()
+                    )
+                    decoder_supervision_batches += 1
+                    isolation_loss = build_r1_decoder_isolation_loss(
+                        cfg,
+                        student_out,
+                        decoder_target_37,
+                    )
+                    loss = isolation_loss["loss"]
+                    loss_base = isolation_loss["loss_final"]
+                    loss_final_bce = isolation_loss["loss_final"]
+                    loss_ndr_coarse_aux = isolation_loss["loss_coarse"]
+                    loss_aux_base = isolation_loss["loss_base"]
+                    loss_pu_static_final = isolation_loss["loss_final"]
+                    loss_pu_static_coarse = isolation_loss["loss_coarse"]
+                    loss_pu_static_base = isolation_loss["loss_base"]
+                    loss_pu_static_group = isolation_loss["loss"]
+                    pu_static_loss_weight = 1.0
+                    pu_teacher_loss_weight = 0.0
+                elif use_ndr_branch(cfg) or use_csd_head(cfg) or use_csd_v1r_head(cfg) or use_cacd(cfg):
                     if not isinstance(student_out, dict) or "coarse_logits_68" not in student_out:
                         raise RuntimeError("Decoder aux path requires coarse_logits_68 in student output.")
                     decoder_coarse_aux_enabled = (
@@ -27428,13 +28613,23 @@ def main():
                             "the static final/coarse/base group loss."
                         )
                     if iter_idx == 0:
-                        threshold = float(
-                            getattr(cfg, "DABE_CLEAN_DABE_V2_HARD_THRESHOLD")
-                        )
-                        source_soft = batch[
-                            "dabe_clean_dabe_v2_soft_68"
-                        ].to(device, non_blocking=True).float().detach()
-                        expected_hard = (source_soft > threshold).float().detach()
+                        if use_gt68_cached_linear_supervision(cfg):
+                            expected_hard = gt68_cached_linear_target(
+                                cfg, batch, device
+                            )
+                        else:
+                            threshold = float(
+                                getattr(
+                                    cfg,
+                                    "DABE_CLEAN_DABE_V2_HARD_THRESHOLD",
+                                )
+                            )
+                            source_soft = batch[
+                                "dabe_clean_dabe_v2_soft_68"
+                            ].to(device, non_blocking=True).float().detach()
+                            expected_hard = (
+                                source_soft > threshold
+                            ).float().detach()
                         if (
                             pu_static_target.requires_grad
                             or not torch.equal(pu_static_target, expected_hard)
@@ -27981,7 +29176,10 @@ def main():
                     )
                     if use_dabe_clean:
                         dabe_pu_weight_mean_sum += 1.0
-                        if not dabe_clean_offline_enabled:
+                        if (
+                            not dabe_clean_offline_enabled
+                            and not r1_only_cache_io
+                        ):
                             fg_evidence = batch["dabe_clean_fg_evidence_37"].float()
                             bg_evidence = batch["dabe_clean_bg_evidence_37"].float()
                             dabe_pu_fg_core_mean_sum += (
@@ -28873,14 +30071,40 @@ def main():
                     f"{oed_epoch_row['oed_to_baseline_grad_ratio']:.8f}"
                 )
             stat_batches = max(num_batches, 1)
-            logger.log(
-                f"[PredArea] epoch={epoch:03d} | "
-                f"student_prob_mean={student_prob_mean_sum / stat_batches:.6f} | "
-                f"teacher_prob_mean={teacher_prob_mean_sum / stat_batches:.6f} | "
-                f"student_pred_area_mean={student_pred_area_sum / stat_batches:.6f} | "
-                f"teacher_pred_area_mean={teacher_pred_area_sum / stat_batches:.6f} | "
-                f"mixed_target_area_mean={mixed_target_area_sum / stat_batches:.6f}"
-            )
+            if pure_student_static_only:
+                logger.log(
+                    f"[PredArea PureStudent] epoch={epoch:03d} | "
+                    f"student_prob_mean={student_prob_mean_sum / stat_batches:.6f} | "
+                    f"student_pred_area_mean={student_pred_area_sum / stat_batches:.6f} | "
+                    f"static_target_area_mean={mixed_target_area_sum / stat_batches:.6f} | "
+                    "teacher_instantiated=False | teacher_forward=False"
+                )
+            else:
+                logger.log(
+                    f"[PredArea] epoch={epoch:03d} | "
+                    f"student_prob_mean={student_prob_mean_sum / stat_batches:.6f} | "
+                    f"teacher_prob_mean={teacher_prob_mean_sum / stat_batches:.6f} | "
+                    f"student_pred_area_mean={student_pred_area_sum / stat_batches:.6f} | "
+                    f"teacher_pred_area_mean={teacher_pred_area_sum / stat_batches:.6f} | "
+                    f"mixed_target_area_mean={mixed_target_area_sum / stat_batches:.6f}"
+                )
+            if decoder_supervision_batches > 0:
+                if use_dba_head(cfg):
+                    decoder_source = "r1_hard_68"
+                    decoder_shape = "68x68"
+                else:
+                    decoder_source = (
+                        "gt_hard_37"
+                        if use_gt_decoder_supervision(cfg)
+                        else "r1_hard_37"
+                    )
+                    decoder_shape = "37x37"
+                logger.log(
+                    f"[DecoderSupervision] epoch={epoch:03d} | "
+                    f"source={decoder_source} | shape={decoder_shape} | "
+                    "strict_binary=True | area_mean="
+                    f"{decoder_supervision_area_sum / decoder_supervision_batches:.6f}"
+                )
             if use_cvsa_train:
                 row = cvsa_epoch_row
                 logger.log(
@@ -32284,6 +33508,7 @@ def main():
                     dataset_name,
                     device,
                     max_samples=sample_limit,
+                    online_dino=online_dino,
                 )
                 val_results[dataset_name] = result
                 logger.log(
