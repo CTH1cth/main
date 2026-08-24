@@ -27,6 +27,12 @@ from common.cache_dabe_r1_design import (  # noqa: E402
 )
 from common.dabe_pseudo import _minmax  # noqa: E402
 from common.utils import feature_manifest_path, load_config, torch_load, write_json, write_jsonl  # noqa: E402
+from models.gbsp_core_variants import (  # noqa: E402
+    PCARankSelector,
+    decompose_pca,
+    pca_fit_from_decomposition,
+    score_all_patches,
+)
 from models.mbsp_reconstruction import MultiBackgroundSubspaceProjector  # noqa: E402
 
 
@@ -57,7 +63,14 @@ def _init_worker(torch_threads: int) -> None:
     torch.set_num_threads(_WORKER_THREADS)
 
 
-def _valid_existing(path: Path, dataset: str, stem: str) -> bool:
+def _valid_existing(
+    path: Path,
+    dataset: str,
+    stem: str,
+    *,
+    version: str,
+    fixed_pca_rank: int | None,
+) -> bool:
     if not path.is_file():
         return False
     try:
@@ -66,7 +79,7 @@ def _valid_existing(path: Path, dataset: str, stem: str) -> bool:
             return False
         if payload.get("dataset") != dataset or payload.get("stem") != stem:
             return False
-        if payload.get("gbsp_version") != VERSION:
+        if payload.get("gbsp_version") != version:
             return False
         if payload.get("generation_stage") not in {
             "cached_full_bc_single_pca_absolute_minmax_only",
@@ -77,8 +90,19 @@ def _valid_existing(path: Path, dataset: str, stem: str) -> bool:
             return False
         if int(payload.get("num_subspaces", -1)) != NUM_SUBSPACES:
             return False
-        if int(payload.get("pca_max_rank", -1)) != PCA_MAX_RANK:
+        expected_max_rank = PCA_MAX_RANK if fixed_pca_rank is None else fixed_pca_rank
+        if int(payload.get("pca_max_rank", -1)) != expected_max_rank:
             return False
+        if fixed_pca_rank is not None:
+            selected = payload.get("selected_ranks")
+            if (
+                not torch.is_tensor(selected)
+                or selected.numel() != 1
+                or int(selected.reshape(-1)[0]) != fixed_pca_rank
+                or payload.get("pca_rank_mode") != "fixed"
+                or int(payload.get("fixed_pca_rank", -1)) != fixed_pca_rank
+            ):
+                return False
         if abs(float(payload.get("pca_energy", -1.0)) - PCA_ENERGY) > 1e-12:
             return False
         for field in ("gbsp_abs_raw_37", "gbsp_abs_minmax_37"):
@@ -97,7 +121,16 @@ def _process_one(task: dict) -> dict:
     row = task["feature_row"]
     dataset, stem = str(row["dataset"]), str(row["stem"])
     output_path = Path(task["output_path"])
-    if _valid_existing(output_path, dataset, stem):
+    version = str(task["version"])
+    fixed_pca_rank = task.get("fixed_pca_rank")
+    diagnostic_threshold = float(task["diagnostic_threshold"])
+    if _valid_existing(
+        output_path,
+        dataset,
+        stem,
+        version=version,
+        fixed_pca_rank=fixed_pca_rank,
+    ):
         payload = torch_load(output_path, map_location="cpu")
         return {
             "dataset": dataset,
@@ -152,18 +185,47 @@ def _process_one(task: dict) -> dict:
         if empty_dictionary:
             background_indices = confidence.reshape(-1).argmax().reshape(1)
         background = normalized_feature.index_select(0, background_indices)
-        projector = MultiBackgroundSubspaceProjector(
-            num_subspaces=NUM_SUBSPACES,
-            min_cluster_size=16,
-            pca_energy=PCA_ENERGY,
-            pca_max_rank=PCA_MAX_RANK,
-            pca_min_rank=PCA_MIN_RANK,
-            seed=0,
-            kmeans_n_init=10,
-            kmeans_max_iter=100,
-        ).fit(background)
-        score = projector.score(normalized_feature)
-        absolute_raw = score.absolute_residual.reshape(1, GRID, GRID).float().contiguous()
+        if fixed_pca_rank is None:
+            projector = MultiBackgroundSubspaceProjector(
+                num_subspaces=NUM_SUBSPACES,
+                min_cluster_size=16,
+                pca_energy=PCA_ENERGY,
+                pca_max_rank=PCA_MAX_RANK,
+                pca_min_rank=PCA_MIN_RANK,
+                seed=0,
+                kmeans_n_init=10,
+                kmeans_max_iter=100,
+            ).fit(background)
+            score = projector.score(normalized_feature)
+            absolute_raw = score.absolute_residual.reshape(1, GRID, GRID)
+            selected_ranks = projector.selected_ranks
+            singular_values = list(projector.singular_values)
+            subspace_mean = projector.subspace_means[0]
+            cluster_sizes = projector.cluster_sizes
+            svd_seconds = float(projector.timing["svd_seconds"])
+            score_seconds = float(projector.timing["score_seconds"])
+        else:
+            svd_started = time.perf_counter()
+            decomposition = decompose_pca(background)
+            fit = pca_fit_from_decomposition(
+                decomposition,
+                "fixed",
+                PCARankSelector(PCA_ENERGY, PCA_MAX_RANK, PCA_MIN_RANK),
+                int(fixed_pca_rank),
+            )
+            svd_seconds = time.perf_counter() - svd_started
+            score_started = time.perf_counter()
+            absolute_raw = score_all_patches(normalized_feature, fit).reshape(
+                1, GRID, GRID
+            )
+            score_seconds = time.perf_counter() - score_started
+            selected_ranks = torch.tensor([fit.selected_rank], dtype=torch.long)
+            singular_values = [decomposition.singular_values]
+            subspace_mean = fit.mean
+            cluster_sizes = torch.tensor(
+                [int(background.shape[0])], dtype=torch.long
+            )
+        absolute_raw = absolute_raw.float().contiguous()
         absolute_minmax = _minmax(absolute_raw).float().contiguous()
         if not bool(torch.isfinite(absolute_raw).all()) or not bool(
             torch.isfinite(absolute_minmax).all()
@@ -177,7 +239,7 @@ def _process_one(task: dict) -> dict:
             mode="bilinear",
             align_corners=False,
         ).squeeze(0)
-        hard_area = float((response_68 > THRESHOLD).float().mean())
+        hard_area = float((response_68 > diagnostic_threshold).float().mean())
         elapsed = time.perf_counter() - started
         payload = {
             "dataset": dataset,
@@ -188,7 +250,7 @@ def _process_one(task: dict) -> dict:
             "backbone_key": "dinov1-s8",
             "dabe_version": "v2",
             "source_dabe_version": "v2",
-            "gbsp_version": VERSION,
+            "gbsp_version": version,
             "source_augs": ["identity"],
             "source_num_views": 1,
             "generation_stage": "cached_full_bc_single_pca_absolute_minmax_only",
@@ -202,23 +264,28 @@ def _process_one(task: dict) -> dict:
             "fallback_reason": "",
             "num_subspaces": NUM_SUBSPACES,
             "pca_energy": PCA_ENERGY,
-            "pca_max_rank": PCA_MAX_RANK,
+            "pca_max_rank": (
+                PCA_MAX_RANK if fixed_pca_rank is None else int(fixed_pca_rank)
+            ),
             "pca_min_rank": PCA_MIN_RANK,
-            "static_threshold": THRESHOLD,
+            "pca_rank_mode": "current" if fixed_pca_rank is None else "fixed",
+            "fixed_pca_rank": fixed_pca_rank,
+            "static_threshold": diagnostic_threshold,
             "gbsp_abs_raw_37": absolute_raw,
             "gbsp_abs_minmax_37": absolute_minmax,
             "background_indices": background_indices.contiguous(),
             "bc_map_37": confidence,
             "bg_anchor_37": anchor,
             "empty_dictionary_replaced_by_bc_argmax": empty_dictionary,
-            "cluster_sizes": projector.cluster_sizes,
-            "selected_ranks": projector.selected_ranks,
-            "singular_values": list(projector.singular_values),
-            "subspace_mean": projector.subspace_means[0],
+            "cluster_sizes": cluster_sizes,
+            "selected_ranks": selected_ranks,
+            "singular_values": singular_values,
+            "subspace_mean": subspace_mean,
             "hard_area_063": hard_area,
+            "hard_area_at_static_threshold": hard_area,
             "runtime": {
-                "svd_seconds": float(projector.timing["svd_seconds"]),
-                "score_seconds": float(projector.timing["score_seconds"]),
+                "svd_seconds": svd_seconds,
+                "score_seconds": score_seconds,
                 "total_seconds": elapsed,
                 "torch_threads": _WORKER_THREADS,
             },
@@ -233,7 +300,7 @@ def _process_one(task: dict) -> dict:
             "source_dabe_cache_path": str(dabe_path),
             "skipped": False,
             "num_background_atoms": int(background_indices.numel()),
-            "selected_rank": int(projector.selected_ranks[0]),
+            "selected_rank": int(selected_ranks[0]),
             "hard_area_063": hard_area,
             "fallback_used": False,
             "fallback_reason": "",
@@ -242,6 +309,14 @@ def _process_one(task: dict) -> dict:
         }
     except Exception as error:
         failure_traceback = traceback.format_exc()
+        if fixed_pca_rank is not None:
+            return {
+                "dataset": dataset,
+                "stem": stem,
+                "cache_path": str(output_path),
+                "error": repr(error),
+                "traceback": failure_traceback,
+            }
         try:
             dabe_path = Path(task["dabe_row"]["cache_path"]).resolve()
             dabe_payload = torch_load(dabe_path, map_location="cpu")
@@ -368,11 +443,25 @@ def build_gbsp_train_cache(
     workers: int = 2,
     torch_threads: int = 4,
     strict_failures: bool = False,
+    pca_rank: int | None = None,
+    cache_version: str | None = None,
+    diagnostic_threshold: float = THRESHOLD,
 ) -> dict:
     if max_samples == 0 or max_samples < -1:
         raise ValueError("max_samples must be -1 or positive")
     if workers <= 0 or torch_threads <= 0:
         raise ValueError("workers and torch_threads must be positive")
+    if pca_rank is not None and pca_rank <= 0:
+        raise ValueError("pca_rank must be positive")
+    if not 0.0 <= diagnostic_threshold <= 1.0:
+        raise ValueError("diagnostic_threshold must be in [0,1]")
+    version = (
+        str(cache_version).strip()
+        if cache_version is not None
+        else (VERSION if pca_rank is None else f"gbsp_pca_absmm_r{pca_rank}_v1")
+    )
+    if not version:
+        raise ValueError("cache_version must not be empty")
     config_path = Path(config_path).resolve()
     output_root = Path(out_root).resolve()
     cfg = load_config(config_path)
@@ -411,6 +500,9 @@ def build_gbsp_train_cache(
             "output_path": str(
                 output_root / "train" / str(row["dataset"]) / f"{row['stem']}.pt"
             ),
+            "version": version,
+            "fixed_pca_rank": pca_rank,
+            "diagnostic_threshold": diagnostic_threshold,
         }
         for row in selected
     ]
@@ -447,7 +539,7 @@ def build_gbsp_train_cache(
                 "source_dabe_cache_path": result["source_dabe_cache_path"],
                 "backbone_key": "dinov1-s8",
                 "source_dabe_version": "v2",
-                "gbsp_version": VERSION,
+                "gbsp_version": version,
                 "source_augs": ["identity"],
                 "source_num_views": 1,
                 "shape": [1, GRID, GRID],
@@ -457,7 +549,7 @@ def build_gbsp_train_cache(
         )
     write_jsonl(output_root / "manifest_train.jsonl", manifest_rows)
     summary = {
-        "gbsp_version": VERSION,
+        "gbsp_version": version,
         "num_requested": len(tasks),
         "num_valid": len(valid),
         "num_failed": len(failures),
@@ -478,8 +570,10 @@ def build_gbsp_train_cache(
         "output_root": str(output_root),
         "num_subspaces": NUM_SUBSPACES,
         "pca_energy": PCA_ENERGY,
-        "pca_max_rank": PCA_MAX_RANK,
-        "static_threshold": THRESHOLD,
+        "pca_max_rank": PCA_MAX_RANK if pca_rank is None else pca_rank,
+        "pca_rank_mode": "current" if pca_rank is None else "fixed",
+        "fixed_pca_rank": pca_rank,
+        "static_threshold": diagnostic_threshold,
         "gt_used_for_generation": False,
         "dino_forward_used": False,
         "training_used": False,
@@ -504,6 +598,14 @@ def parse_args():
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--torch_threads", type=int, default=4)
     parser.add_argument("--strict_failures", action="store_true")
+    parser.add_argument(
+        "--pca_rank",
+        type=int,
+        default=None,
+        help="Use one fixed PCA rank; omit to preserve legacy EV90 capped at R8.",
+    )
+    parser.add_argument("--cache_version", default=None)
+    parser.add_argument("--diagnostic_threshold", type=float, default=THRESHOLD)
     return parser.parse_args()
 
 
@@ -516,4 +618,7 @@ if __name__ == "__main__":
         workers=args.workers,
         torch_threads=args.torch_threads,
         strict_failures=args.strict_failures,
+        pca_rank=args.pca_rank,
+        cache_version=args.cache_version,
+        diagnostic_threshold=args.diagnostic_threshold,
     )

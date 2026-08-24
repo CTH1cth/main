@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 
 import numpy as np
@@ -98,6 +99,49 @@ DABE_PU_REQUIRED_68_FIELDS = [
     "extent_candidate_68",
     "unknown_68",
 ]
+
+
+def resolve_dabe_clean_dabe_v2_hard_threshold(cfg, dataset_name):
+    """Resolve the static hard-target threshold for one training dataset."""
+
+    default = float(
+        getattr(cfg, "DABE_CLEAN_DABE_V2_HARD_THRESHOLD", 0.5)
+    )
+    configured = getattr(
+        cfg,
+        "DABE_CLEAN_DABE_V2_HARD_THRESHOLDS_BY_DATASET",
+        None,
+    )
+    if configured is None:
+        threshold = default
+    else:
+        if not isinstance(configured, dict):
+            raise TypeError(
+                "DABE_CLEAN_DABE_V2_HARD_THRESHOLDS_BY_DATASET must be a dict."
+            )
+        thresholds = {str(name): value for name, value in configured.items()}
+        dataset_name = str(dataset_name)
+        if dataset_name in thresholds:
+            threshold = float(thresholds[dataset_name])
+        elif bool(
+            getattr(
+                cfg,
+                "DABE_CLEAN_DABE_V2_REQUIRE_DATASET_THRESHOLD",
+                False,
+            )
+        ):
+            raise RuntimeError(
+                "Missing required dataset-specific hard threshold for "
+                f"{dataset_name!r}."
+            )
+        else:
+            threshold = default
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError(
+            f"Invalid DABE-v2 hard threshold for {dataset_name!r}: "
+            f"{threshold!r}."
+        )
+    return threshold
 
 DABE_PU_REQUIRED_37_FIELDS = [
     "fg_core_pu_37",
@@ -824,7 +868,17 @@ def _load_dabe_clean_dabe_v2_static(row, expected_dataset, expected_stem, cfg):
         source_key = str(
             getattr(cfg, "DABE_CLEAN_DABE_V2_SOURCE_KEY", "")
         ).strip()
-        expected_source_key = "hc_mask" if is_cf_brc_hc else "gbsp_abs_minmax_37"
+        expected_source_key = (
+            "hc_mask"
+            if is_cf_brc_hc
+            else str(
+                getattr(
+                    cfg,
+                    "DABE_CLEAN_GBSP_SOURCE_KEY",
+                    "gbsp_abs_minmax_37",
+                )
+            ).strip()
+        )
         if source_key != expected_source_key:
             raise RuntimeError(
                 f"GBSP static source key must be {expected_source_key}, got "
@@ -846,7 +900,94 @@ def _load_dabe_clean_dabe_v2_static(row, expected_dataset, expected_stem, cfg):
                 f"{payload.get(version_field)} != {expected_gbsp_version} | "
                 f"{row['cache_path']}"
             )
-        if (
+        expected_rank_mode = str(
+            getattr(cfg, "DABE_CLEAN_GBSP_PCA_RANK_MODE", "")
+        ).strip().lower()
+        if expected_rank_mode:
+            actual_rank_mode = str(payload.get("pca_rank_mode", "")).strip().lower()
+            if actual_rank_mode != expected_rank_mode:
+                raise RuntimeError(
+                    "GBSP PCA rank-mode mismatch: "
+                    f"{actual_rank_mode!r} != {expected_rank_mode!r} | "
+                    f"{row['cache_path']}"
+                )
+            if expected_rank_mode == "fixed":
+                expected_rank = int(
+                    getattr(cfg, "DABE_CLEAN_GBSP_FIXED_PCA_RANK", -1)
+                )
+                selected = payload.get("selected_ranks")
+                actual_fixed_rank = int(payload.get("fixed_pca_rank", -1))
+                actual_max_rank = int(payload.get("pca_max_rank", -1))
+                selected_rank = (
+                    int(selected.detach().cpu().reshape(-1)[0])
+                    if torch.is_tensor(selected) and selected.numel() == 1
+                    else -1
+                )
+                if (
+                    expected_rank <= 0
+                    or actual_fixed_rank != expected_rank
+                    or actual_max_rank != expected_rank
+                    or selected_rank != expected_rank
+                    or bool(payload.get("fallback_used", False))
+                ):
+                    raise RuntimeError(
+                        "GBSP fixed-PCA rank contract mismatch: "
+                        f"expected={expected_rank}, fixed={actual_fixed_rank}, "
+                        f"max={actual_max_rank}, selected={selected_rank}, "
+                        f"fallback={payload.get('fallback_used')} | "
+                        f"{row['cache_path']}"
+                    )
+        graph_candidate_direct = bool(
+            getattr(cfg, "DABE_CLEAN_GBSP_GRAPH_CANDIDATE_DIRECT", False)
+        )
+        direct_from_features = bool(
+            getattr(cfg, "DABE_CLEAN_GBSP_DIRECT_FROM_FEATURES", False)
+        )
+        if graph_candidate_direct:
+            if payload.get("generation_stage") != (
+                "recomputed_full_bc_dijkstra_candidate_sweep_fixed_r32"
+            ):
+                raise RuntimeError(
+                    "Graph-candidate GBSP generation-stage mismatch: "
+                    f"{payload.get('generation_stage')!r} | {row['cache_path']}"
+                )
+            if (
+                not bool(payload.get("graph_path_used"))
+                or bool(payload.get("boundary_only_used", True))
+                or bool(payload.get("dino_forward_used", True))
+            ):
+                raise RuntimeError(
+                    "Graph-candidate GBSP mechanism contract mismatch: "
+                    f"{row['cache_path']}"
+                )
+            source_feature_path = Path(
+                str(payload.get("source_feature_cache_path", ""))
+            )
+            if not source_feature_path.is_file():
+                raise RuntimeError(
+                    "Graph-candidate GBSP source feature is missing: "
+                    f"{source_feature_path} | {row['cache_path']}"
+                )
+            source_dabe_version = str(
+                payload.get("source_dabe_version", "")
+            ).strip().lower()
+            if source_dabe_version not in {
+                expected_version,
+                f"{expected_version}-graph-parameters-only",
+            }:
+                raise RuntimeError(
+                    "Graph-candidate GBSP parameter-version mismatch: "
+                    f"{source_dabe_version!r} | {row['cache_path']}"
+                )
+        elif direct_from_features:
+            if str(payload.get("source", "")).strip().lower() != (
+                "dino_feature_cache_direct"
+            ):
+                raise RuntimeError(
+                    "Direct GBSP cache source mismatch: "
+                    f"{payload.get('source')!r} | {row['cache_path']}"
+                )
+        elif (
             str(payload.get("source_dabe_version", "")).strip().lower()
             != expected_version
         ):
@@ -865,11 +1006,14 @@ def _load_dabe_clean_dabe_v2_static(row, expected_dataset, expected_stem, cfg):
         ]
         actual_augs = [
             str(item).strip().lower()
-            for item in payload.get("source_augs", [])
+            for item in payload.get(
+                "source_augs", ["identity"] if graph_candidate_direct else []
+            )
         ]
-        if actual_augs != expected_augs or int(
-            payload.get("source_num_views", -1)
-        ) != len(expected_augs):
+        actual_num_views = int(
+            payload.get("source_num_views", 1 if graph_candidate_direct else -1)
+        )
+        if actual_augs != expected_augs or actual_num_views != len(expected_augs):
             raise RuntimeError(
                 "GBSP source augmentation/view mismatch: "
                 f"augs={actual_augs}, views={payload.get('source_num_views')} | "
@@ -979,17 +1123,34 @@ def _load_dabe_clean_dabe_v2_static(row, expected_dataset, expected_stem, cfg):
     soft = soft.detach().cpu().float()
     expected_shape = (1, int(cfg.LOSS_SIZE), int(cfg.LOSS_SIZE))
     soft_37 = None
-    if source_key in {
+    grid_source_keys = {
         "residual_pass1_37",
         "v1_cvbr_second_ring_37",
         "p1_rpr_secondring_37",
         "gbsp_abs_minmax_37",
         "hc_mask",
-    }:
-        if tuple(soft.shape) != (1, 37, 37):
+    }
+    if static_source == "gbsp_abs_minmax_hard_68":
+        grid_source_keys.add(
+            str(
+                getattr(
+                    cfg,
+                    "DABE_CLEAN_GBSP_SOURCE_KEY",
+                    "gbsp_abs_minmax_37",
+                )
+            ).strip()
+        )
+    if source_key in grid_source_keys:
+        source_grid = (
+            int(getattr(cfg, "DABE_CLEAN_GBSP_SOURCE_GRID", 37))
+            if static_source == "gbsp_abs_minmax_hard_68"
+            else 37
+        )
+        if tuple(soft.shape) != (1, source_grid, source_grid):
             raise RuntimeError(
                 f"Static {source_key} shape mismatch: "
-                f"{list(soft.shape)} != [1, 37, 37] | {row['cache_path']}"
+                f"{list(soft.shape)} != [1, {source_grid}, {source_grid}] | "
+                f"{row['cache_path']}"
             )
         _validate_unit_range(soft, source_key, row["cache_path"])
         if soft.requires_grad or not bool(torch.isfinite(soft).all().item()):
@@ -997,7 +1158,8 @@ def _load_dabe_clean_dabe_v2_static(row, expected_dataset, expected_stem, cfg):
                 f"Static {source_key} must be finite and detached: "
                 f"{row['cache_path']}"
             )
-        soft_37 = soft.detach().clone()
+        if source_grid == 37:
+            soft_37 = soft.detach().clone()
         soft = F.interpolate(
             soft.unsqueeze(0),
             size=expected_shape[-2:],
@@ -1014,8 +1176,9 @@ def _load_dabe_clean_dabe_v2_static(row, expected_dataset, expected_stem, cfg):
         raise RuntimeError(
             f"DABE-v2 {source_key} must be finite and detached: {row['cache_path']}"
         )
-    threshold = float(
-        getattr(cfg, "DABE_CLEAN_DABE_V2_HARD_THRESHOLD", 0.5)
+    threshold = resolve_dabe_clean_dabe_v2_hard_threshold(
+        cfg,
+        expected_dataset,
     )
     hard = (soft > threshold).float().detach()
     out = {
@@ -1023,6 +1186,7 @@ def _load_dabe_clean_dabe_v2_static(row, expected_dataset, expected_stem, cfg):
         "dabe_v2_hard_68": hard,
         "dabe_v2_source_key": source_key,
         "dabe_v2_version": expected_version,
+        "dabe_v2_hard_threshold": threshold,
     }
     if soft_37 is not None:
         out.update(
@@ -2859,7 +3023,7 @@ class CachedTrainDataset(Dataset):
                 self.pseudo_final_candidate = (
                     "1[independent DABE-v2 "
                     f"{dabe_v2_source_key} > "
-                    f"{float(getattr(cfg, 'DABE_CLEAN_DABE_V2_HARD_THRESHOLD', 0.5)):g}]"
+                    f"{float(dabe_v2_static['dabe_v2_hard_threshold']):g}]"
                     + (
                         " (pure Student, no Teacher)"
                         if self.dabe_clean_static_target_source
@@ -3584,7 +3748,12 @@ class CachedTrainDataset(Dataset):
                                 "independent_dabe_v2_"
                                 f"{dabe_clean_dabe_v2_static['dabe_v2_source_key']}"
                                 "_gt_"
-                                f"{float(getattr(self.cfg, 'DABE_CLEAN_DABE_V2_HARD_THRESHOLD', 0.5)):g}"
+                                f"{float(dabe_clean_dabe_v2_static['dabe_v2_hard_threshold']):g}"
+                            ),
+                            "dabe_clean_dabe_v2_hard_threshold": float(
+                                dabe_clean_dabe_v2_static[
+                                    "dabe_v2_hard_threshold"
+                                ]
                             ),
                         }
                     )

@@ -1,0 +1,21 @@
+experiment: gbsp_real_teaser_v1
+core_root: workdir/gbsp_core_optimization/full_rank
+
+# K, rank and the mask threshold are read from these frozen production configs.
+official_gbsp_config: main/configs/dinov1_s8_gbsp_core_ablation.py
+official_similarity_config: main/configs/gbsp_similarity_variation_analysis.py
+official_mask_config: main/configs/dinov1_s8_dabe_clean_v1_dp_gbsp_absmm_t058_hard_linear_staticonly_purestudent_long45_lrfloor_2e5.py
+
+dataset_for_main_figure: CAMO
+datasets_for_diagnostic:
+  - CAMO
+  - COD10K
+  - NC4K
+
+patch_fg_core_threshold: 0.8
+patch_bg_core_threshold: 0.2
+patch_binary_threshold: 0.5
+hist_bins: 50
+random_seed: 2026
+use_official_normalization: true
+frozen_example_ids: null

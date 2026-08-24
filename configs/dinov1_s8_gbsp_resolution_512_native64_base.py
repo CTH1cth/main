@@ -1,0 +1,36 @@
+"""Shared frozen protocol for the DINO-S/8 512/native-64 GBSP audit."""
+
+from configs.dinov1_s8 import *  # noqa: F401,F403
+
+
+GBSP_RESOLUTION_VERSION = "gbsp_resolution_native_v1"
+FEATURE_CACHE_KEY = "dinov1-s8-512-native64"
+DINO = dict(DINO)
+DINO["feature_input_size"] = 512
+
+FEATURE_INPUT_SIZE = 512
+GRID_SIZE = 64
+SUPERVISION_GRID = 64
+LOSS_SIZE = 64
+USE_LEGACY_68_INTERPOLATION = False
+
+# Frozen Full-BC graph parameters inherited from the 296 baseline.
+DABE_GRID = 64
+DABE_LOSS_SIZE = 64
+DABE_SIGMA_F = 0.10
+DABE_SIGMA_C = 0.05
+DABE_SIGMA_E = 0.30
+DABE_TAU_BC = 0.30
+DABE_BG_ANCHOR_TOP_PERCENT = 30.0
+DABE_BG_ANCHOR_MIN_RATIO = 0.05
+DABE_BG_ANCHOR_FALLBACK_TOP_PERCENT = 40.0
+
+GBSP_BG_RATIO = 0.30
+GBSP_PCA_ENERGY = 0.90
+GBSP_PCA_MAX_RANK = 8
+GBSP_PCA_MIN_RANK = 1
+GBSP_THRESHOLD = 0.58
+GBSP_THRESHOLD_SELECTION = "frozen_296_baseline_threshold"
+GBSP_NATIVE_TARGET_SIZE = 64
+GBSP_GT_USED_FOR_GENERATION = False
+

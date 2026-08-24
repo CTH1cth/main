@@ -10,6 +10,8 @@ from common.ecst_minimal import validate_ecst_minimal_config
 from common.ectp import validate_ectp_config
 from common.eaogp import validate_eaogp_config
 from common.r1hard_linear_pure_student import (
+    is_gbsp_absmm_t058_dagp_only_pure_student_config,
+    is_gbsp_absmm_t058_ndr_only_pure_student_config,
     is_r1hard_dagp_ndr_pure_student_config,
     is_r1hard_linear_pure_student_config,
 )
@@ -224,6 +226,12 @@ def validate_teacher_routing_config(cfg):
                 is_r1hard_linear_pure_student_config(cfg)
             )
             r1hard_dagp_ndr = is_r1hard_dagp_ndr_pure_student_config(cfg)
+            r1hard_dagp_only = (
+                is_gbsp_absmm_t058_dagp_only_pure_student_config(cfg)
+            )
+            r1hard_ndr_only = (
+                is_gbsp_absmm_t058_ndr_only_pure_student_config(cfg)
+            )
             r1hard_hsd = bool(getattr(cfg, "R1_HSD_V1", False))
             r1hard_last4 = bool(
                 getattr(cfg, "R1_LAST4_EXPERIMENT", False)
@@ -231,6 +239,7 @@ def validate_teacher_routing_config(cfg):
             r1hard_dba = bool(
                 getattr(cfg, "DABEV2HARD_R1_DBA", False)
             )
+            r1hard_lcic = bool(getattr(cfg, "GBSP_LCIC_V1", False))
             r1_decoder_isolation = bool(
                 getattr(cfg, "R1_DECODER_ISOLATION_V1", False)
             )
@@ -240,7 +249,10 @@ def validate_teacher_routing_config(cfg):
                     "and R1_LAST4_EXPERIMENT."
                 )
             r1hard_non_dagp_pure_student = (
-                r1hard_pure_student and not r1hard_dagp_ndr
+                r1hard_pure_student
+                and not r1hard_dagp_ndr
+                and not r1hard_dagp_only
+                and not r1hard_ndr_only
             )
             expected_clean = {
                 "STATIC_WEIGHT_MODE": "ones",
@@ -259,21 +271,33 @@ def validate_teacher_routing_config(cfg):
                     "DABE-Clean no-ECST protocol mismatch: "
                     f"{mismatched_clean}; expected={expected_clean}"
                 )
-            required_clean = (
-                (
+            if r1hard_non_dagp_pure_student:
+                required_clean = (
                     "USE_DABE_CLEAN",
                     "USE_DABE_CLEAN_DESPL_SCHEDULE",
                     "USE_DABE_PU_STATIC_LOSS",
                 )
-                if r1hard_non_dagp_pure_student
-                else (
+            elif r1hard_dagp_only:
+                required_clean = (
+                    "USE_DABE_CLEAN",
+                    "USE_DABE_CLEAN_DESPL_SCHEDULE",
+                    "USE_DAGP_SAFE_HEAD",
+                )
+            elif r1hard_ndr_only:
+                required_clean = (
+                    "USE_DABE_CLEAN",
+                    "USE_DABE_CLEAN_DESPL_SCHEDULE",
+                    "USE_NDR_BRANCH",
+                    "USE_NDR_COARSE_AUX",
+                )
+            else:
+                required_clean = (
                     "USE_DABE_CLEAN",
                     "USE_DABE_CLEAN_DESPL_SCHEDULE",
                     "USE_DAGP_SAFE_HEAD",
                     "USE_NDR_BRANCH",
                     "USE_NDR_COARSE_AUX",
                 )
-            )
             missing_clean = [
                 name
                 for name in required_clean
@@ -302,19 +326,38 @@ def validate_teacher_routing_config(cfg):
                             f"{expected_decoder!r}."
                         )
                 else:
-                    expected_head = (
-                        "dba"
-                        if r1hard_dba
-                        else (
-                            "hsd_v1"
-                            if r1hard_hsd
+                    if r1hard_lcic:
+                        lcic_head_by_variant = {
+                            "a_linear": "lcic_linear",
+                            "b_consensus": "lcic",
+                            "c_innovation": "lcic",
+                                "d_full": "lcic",
+                                "e_dwlite": "lcic_dwlite",
+                                "f_conv3x3": "lcic_conv3x3",
+                            }
+                        lcic_variant = str(
+                            getattr(cfg, "LCIC_VARIANT", "")
+                        ).strip().lower()
+                        expected_head = lcic_head_by_variant.get(lcic_variant)
+                        if expected_head is None:
+                            raise RuntimeError(
+                                "Unsupported GBSP-LCIC variant in decoder "
+                                f"contract: {lcic_variant!r}."
+                            )
+                    else:
+                        expected_head = (
+                            "dba"
+                            if r1hard_dba
                             else (
-                                "last4_linear_probe"
-                                if r1hard_last4
-                                else "simple"
+                                "hsd_v1"
+                                if r1hard_hsd
+                                else (
+                                    "last4_linear_probe"
+                                    if r1hard_last4
+                                    else "simple"
+                                )
                             )
                         )
-                    )
                     expected_decoder = (
                         "hsd_v1"
                         if r1hard_hsd
@@ -349,6 +392,62 @@ def validate_teacher_routing_config(cfg):
                     raise RuntimeError(
                         "Hard-R1 pure-Student non-DAGP decoder forbids flags: "
                         f"{forbidden_linear}"
+                    )
+            elif r1hard_dagp_only:
+                actual_head = str(getattr(cfg, "HEAD_TYPE", "")).lower()
+                if actual_head != "dagp_safe":
+                    raise RuntimeError(
+                        "Hard-R1 pure-Student DAGP-only decoder contract "
+                        "requires HEAD_TYPE='dagp_safe', got "
+                        f"{actual_head!r}."
+                    )
+                forbidden_ndr = [
+                    name
+                    for name in (
+                        "USE_NDR_BRANCH",
+                        "USE_NDR_V2",
+                        "USE_NDR_COARSE_AUX",
+                    )
+                    if bool(getattr(cfg, name, False))
+                ]
+                if forbidden_ndr:
+                    raise RuntimeError(
+                        "Hard-R1 pure-Student DAGP-only decoder forbids "
+                        f"NDR flags: {forbidden_ndr}"
+                    )
+                if abs(float(getattr(cfg, "LAMBDA_NDR_COARSE_AUX", 0.0))) > 1e-12:
+                    raise RuntimeError(
+                        "Hard-R1 pure-Student DAGP-only decoder requires "
+                        "LAMBDA_NDR_COARSE_AUX=0.0."
+                    )
+            elif r1hard_ndr_only:
+                actual_head = str(getattr(cfg, "HEAD_TYPE", "")).lower()
+                if actual_head != "ndr_only":
+                    raise RuntimeError(
+                        "Hard-R1 pure-Student NDR-only decoder contract "
+                        "requires HEAD_TYPE='ndr_only', got "
+                        f"{actual_head!r}."
+                    )
+                forbidden_dagp = [
+                    name
+                    for name in ("USE_DAGP_HEAD", "USE_DAGP_SAFE_HEAD")
+                    if bool(getattr(cfg, name, False))
+                ]
+                if forbidden_dagp:
+                    raise RuntimeError(
+                        "Hard-R1 pure-Student NDR-only decoder forbids "
+                        f"DAGP flags: {forbidden_dagp}"
+                    )
+                for name in ("DAGP_SAFE_ALPHA_MAX", "DAGP_SAFE_GAMMA_MAX"):
+                    if abs(float(getattr(cfg, name, float("nan")))) > 1e-12:
+                        raise RuntimeError(
+                            "Hard-R1 pure-Student NDR-only decoder requires "
+                            f"{name}=0.0."
+                        )
+                if bool(getattr(cfg, "USE_NDR_V2", False)):
+                    raise RuntimeError(
+                        "Hard-R1 pure-Student NDR-only decoder uses NDR-v1; "
+                        "USE_NDR_V2 must be False."
                     )
             if dabev2hard_static_only:
                 if bool(getattr(cfg, "USE_TEACHER_BINARY_FULL_LOSS", False)) or bool(

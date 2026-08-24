@@ -1,0 +1,57 @@
+experiment: gbsp_teaser_sample_mining_v1
+
+# Frozen sources.  The r32 cache is used only as a compact carrier of the
+# already-built Full-BC candidate indices; rank-8 is always fitted afresh.
+feature_manifest: datasets/cache/features_cache/dinov1-s8/manifest_train.jsonl
+candidate_manifest: datasets/cache/gbsp_pca_absmm_r32_pseudo_cache/dinov1-s8/manifest_train.jsonl
+
+affinity:
+  method: knn8_cos
+  function: models.gbsp_similarity_baselines.compute_similarity_baselines
+  k: 8
+  normalization: per_image_minmax_all_1369_queries
+  threshold: 0.58
+  comparison: strict_greater_than
+
+gbsp:
+  method: fullbc_global_pca_r8_absolute_residual
+  rank: 8
+  normalization: per_image_minmax_all_1369_queries
+  threshold: 0.58
+  comparison: strict_greater_than
+
+patch_protocol:
+  input_size: 296
+  grid: 37
+  patch_size: 8
+  primary_foreground_occupancy: 0.5
+  core_foreground_occupancy: 0.8
+  core_background_occupancy: 0.2
+
+selection:
+  min_fg_area_ratio: 0.03
+  max_fg_area_ratio: 0.45
+  min_core_fg_patches: 12
+  min_core_bg_patches: 50
+  stage_a_top: 300
+  stage_b_top: 100
+  stage_d_top: 20
+  finalists: 5
+
+pca:
+  implementation: sklearn.decomposition.PCA
+  n_components: 2
+  svd_solver: randomized
+  n_oversamples: 24
+  iterated_power: 7
+  seed: 20260821
+  # Frozen to the protocol that produced the historical -0.191 -> 0.781 case.
+  grouping: core_0.2_0.8
+
+historical_anchor:
+  dataset: TE-COD10K
+  stem: COD10K-CAM-2-Terrestrial-23-Cat-1365
+  raw_silhouette: -0.191385
+  residual_silhouette: 0.780556
+  source_csv: workdir/28-gbsp_teaser_max_similarity/raw_overlap_residual_separation_scan/stage3_pca_refined.csv
+

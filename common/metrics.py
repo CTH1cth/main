@@ -67,6 +67,7 @@ class CODMetrics:
         return {
             "ACC": self.acc.get_results()["acc"],
             "mIOU": self.miou.get_results()["miou"],
+            "E_ADP": em["adp"],
             "E_MAX": em["curve"].max(),
             "E_MEAN": em["curve"].mean(),
             "F_MAX": fm["curve"].max(),

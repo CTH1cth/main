@@ -34,5 +34,14 @@ USE_DAGP_SAFE_HEAD = False
 USE_NDR_BRANCH = False
 USE_BASE_AUX_LOSS = False
 
-# There is no Teacher module/forward/EMA on this experiment path.
+# There is no Teacher module/forward/EMA on this experiment path.  Pure-Student
+# training is one continuous optimization phase, so the historical Teacher
+# handover reset is permanently disabled as well.
+PURE_STUDENT_RESET_PERMANENTLY_DISABLED = True
+FINETUNE_RESET_EPOCH = 0
+FINETUNE_RESET_REBUILD_OPTIMIZER = False
+FINETUNE_RESET_REBUILD_SCHEDULER = False
+FINETUNE_RESET_GLOBAL_STEP = False
+FINETUNE_RESET_FORCE_LR_FLOOR = False
 FINETUNE_RESET_TEACHER = False
+LR_FLOOR_APPLY_AFTER_FINETUNE_RESET = False

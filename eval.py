@@ -1,10 +1,13 @@
 import argparse
+import math
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from scipy.ndimage import label as connected_component_label
 from torch.utils.data import DataLoader
 
 from common.dataset import CachedEvalDataset
@@ -25,6 +28,26 @@ from model import build_seg_head
 from models.online_dino_last4 import FrozenDINOv1Last4Extractor
 
 
+PROBABILITY_VALLEY_BINS = 256
+PROBABILITY_VALLEY_SMOOTH_SIGMA = 2.0
+PROBABILITY_VALLEY_SEARCH_RANGE = (0.40, 0.65)
+PROBABILITY_VALLEY_CLIP_RANGE = (0.45, 0.60)
+PROBABILITY_VALLEY_SHRINK = 0.50
+PROBABILITY_VALLEY_MIN_PEAK_SEPARATION = 0.15
+PROBABILITY_VALLEY_MAX_DEPTH_RATIO = 0.80
+PROBABILITY_VALLEY_MIN_FOREGROUND_MASS = 0.002
+FLOAT_OTSU_BINS = 256
+LOGIT_TRIANGLE_BINS = 256
+LOGIT_TRIANGLE_PROBABILITY_EPS = 1e-4
+LOGIT_GMM_BINS = 512
+LOGIT_GMM_PROBABILITY_EPS = 1e-4
+LOGIT_GMM_MAX_ITERATIONS = 64
+LOGIT_GMM_TOLERANCE = 1e-6
+LOGIT_GMM_REG_COVAR = 1e-3
+LOGIT_GMM_MIN_COMPONENT_WEIGHT = 0.002
+LOGIT_GMM_MIN_STANDARDIZED_SEPARATION = 0.50
+
+
 def infer_in_channels(student_state):
     # 从 checkpoint 的 head 权重反推 feature channel 数，兼容 simple/DAGP/context_residual。
     if "adapters.f9.0.weight" in student_state:
@@ -37,6 +60,10 @@ def infer_in_channels(student_state):
         weight = student_state["csd_residual.csd_feat_proj.0.weight"]
     elif "sem_proj.0.weight" in student_state:
         weight = student_state["sem_proj.0.weight"]
+    elif "anchor.weight" in student_state:
+        weight = student_state["anchor.weight"]
+    elif "reduce.weight" in student_state:
+        weight = student_state["reduce.weight"]
     elif "feature_projection.weight" in student_state:
         weight = student_state["feature_projection.weight"]
     elif "base_head.weight" in student_state:
@@ -98,6 +125,84 @@ def use_raw_feature_head(cfg):
         "csd_v1",
         "dagp_safe_csd_v1r",
         "cacd_v1_base",
+        "lcic_linear",
+        "lcic",
+        "lcic_dwlite",
+        "lcic_conv3x3",
+    }
+
+
+def apply_lcic_inference_scales(
+    cfg,
+    student,
+    consensus_scale=1.0,
+    innovation_scale=1.0,
+):
+    """Apply one-run LCIC branch gains to the loaded in-memory checkpoint."""
+
+    consensus_scale = float(consensus_scale)
+    innovation_scale = float(innovation_scale)
+    for name, value in (
+        ("consensus_scale", consensus_scale),
+        ("innovation_scale", innovation_scale),
+    ):
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(
+                f"LCIC {name} must be finite and non-negative, got {value}."
+            )
+    lcic_enabled = bool(getattr(cfg, "GBSP_LCIC_V1", False))
+    if not lcic_enabled:
+        if consensus_scale != 1.0 or innovation_scale != 1.0:
+            raise RuntimeError(
+                "LCIC inference scales can only be used with an LCIC config."
+            )
+        return None
+    lcic_variant = str(getattr(cfg, "LCIC_VARIANT", "")).lower()
+    if lcic_variant != "d_full":
+        if consensus_scale != 1.0 or innovation_scale != 1.0:
+            raise RuntimeError(
+                "Manual LCIC inference scales require "
+                "LCIC_VARIANT='d_full'; feature-space decoders such as "
+                f"{lcic_variant!r} have no consensus/innovation logit branches."
+            )
+        # GBSP_LCIC_V1 is also the legacy routing flag for the feature-space
+        # DW-Lite control.  Default 1x/1x scales are a no-op for that decoder.
+        return None
+    target = student.module if hasattr(student, "module") else student
+    if bool(getattr(target, "adaptive_gate_enabled", False)):
+        if consensus_scale != 1.0 or innovation_scale != 1.0:
+            raise RuntimeError(
+                "LCIC adaptive-gate checkpoints forbid manual inference scales."
+            )
+        return None
+    if getattr(target, "alpha", None) is None or getattr(
+        target, "beta", None
+    ) is None:
+        raise RuntimeError("LCIC-D checkpoint is missing alpha or beta.")
+    original_alpha = float(target.alpha.detach().item())
+    original_beta = float(target.beta.detach().item())
+    intrinsic_consensus_gain = float(
+        getattr(target, "consensus_gain", 1.0)
+    )
+    intrinsic_innovation_gain = float(
+        getattr(target, "innovation_gain", 1.0)
+    )
+    with torch.no_grad():
+        target.alpha.mul_(consensus_scale)
+        target.beta.mul_(innovation_scale)
+    return {
+        "consensus_scale": consensus_scale,
+        "innovation_scale": innovation_scale,
+        "original_alpha": original_alpha,
+        "original_beta": original_beta,
+        "intrinsic_consensus_gain": intrinsic_consensus_gain,
+        "intrinsic_innovation_gain": intrinsic_innovation_gain,
+        "effective_alpha": (
+            intrinsic_consensus_gain * float(target.alpha.detach().item())
+        ),
+        "effective_beta": (
+            intrinsic_innovation_gain * float(target.beta.detach().item())
+        ),
     }
 
 
@@ -254,6 +359,573 @@ def save_pred_png(path, pred):
     Image.fromarray(array).save(path)
 
 
+def save_probability_png(path, probability):
+    """Save a continuous probability map as an 8-bit grayscale PNG."""
+
+    ensure_dir(Path(path).parent)
+    array = probability.detach().float().cpu().squeeze().numpy()
+    array = np.rint(np.clip(array, 0.0, 1.0) * 255.0).astype(np.uint8)
+    Image.fromarray(array).save(path)
+
+
+def parse_dataset_threshold_overrides(items, allowed_datasets):
+    """Parse repeated DATASET=THRESHOLD CLI overrides."""
+
+    allowed = {str(name) for name in allowed_datasets}
+    overrides = {}
+    for item in items or ():
+        if "=" not in str(item):
+            raise ValueError(
+                "--dataset_threshold must use DATASET=THRESHOLD syntax, "
+                f"got {item!r}."
+            )
+        dataset_name, raw_threshold = str(item).split("=", 1)
+        dataset_name = dataset_name.strip()
+        if dataset_name not in allowed:
+            raise ValueError(
+                f"Unknown dataset in --dataset_threshold: {dataset_name!r}."
+            )
+        if dataset_name in overrides:
+            raise ValueError(
+                f"Duplicate --dataset_threshold for {dataset_name}."
+            )
+        try:
+            threshold = float(raw_threshold)
+        except ValueError as error:
+            raise ValueError(
+                f"Invalid threshold for {dataset_name}: {raw_threshold!r}."
+            ) from error
+        if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+            raise ValueError(
+                f"Invalid evaluation threshold for {dataset_name}: {threshold}."
+            )
+        overrides[dataset_name] = threshold
+    return overrides
+
+
+def _smooth_histogram(histogram, sigma):
+    radius = max(1, int(round(3.0 * float(sigma))))
+    offsets = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (offsets / float(sigma)) ** 2)
+    kernel /= kernel.sum()
+    return np.convolve(histogram.astype(np.float64), kernel, mode="same")
+
+
+def probability_valley_threshold(probability, fallback_threshold=0.50):
+    """Select a conservative per-image threshold from a probability valley."""
+
+    fallback = float(fallback_threshold)
+    values = torch.as_tensor(probability).detach().float().cpu().numpy().reshape(-1)
+    values = values[np.isfinite(values)]
+    diagnostics = {
+        "fallback": True,
+        "reason": "insufficient_values",
+        "raw_threshold": fallback,
+        "threshold": fallback,
+    }
+    if values.size < 16:
+        return fallback, diagnostics
+    values = np.clip(values, 0.0, 1.0)
+    background_mass = float(np.mean(values <= 0.50))
+    foreground_mass = float(np.mean(values > 0.50))
+    if (
+        background_mass < PROBABILITY_VALLEY_MIN_FOREGROUND_MASS
+        or foreground_mass < PROBABILITY_VALLEY_MIN_FOREGROUND_MASS
+    ):
+        diagnostics["reason"] = "missing_probability_class"
+        return fallback, diagnostics
+
+    histogram, edges = np.histogram(
+        values,
+        bins=PROBABILITY_VALLEY_BINS,
+        range=(0.0, 1.0),
+    )
+    smoothed = _smooth_histogram(
+        histogram, PROBABILITY_VALLEY_SMOOTH_SIGMA
+    )
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    left_indices = np.flatnonzero(centers < 0.50)
+    right_indices = np.flatnonzero(centers >= 0.50)
+    if left_indices.size == 0 or right_indices.size == 0:
+        diagnostics["reason"] = "missing_histogram_side"
+        return fallback, diagnostics
+
+    left_peak = int(left_indices[np.argmax(smoothed[left_indices])])
+    right_peak = int(right_indices[np.argmax(smoothed[right_indices])])
+    peak_separation = float(centers[right_peak] - centers[left_peak])
+    if peak_separation < PROBABILITY_VALLEY_MIN_PEAK_SEPARATION:
+        diagnostics["reason"] = "peaks_too_close"
+        return fallback, diagnostics
+
+    search_low, search_high = PROBABILITY_VALLEY_SEARCH_RANGE
+    valley_indices = np.flatnonzero(
+        (centers > centers[left_peak])
+        & (centers < centers[right_peak])
+        & (centers >= search_low)
+        & (centers <= search_high)
+    )
+    if valley_indices.size == 0:
+        diagnostics["reason"] = "no_valley_in_search_range"
+        return fallback, diagnostics
+
+    valley_density = smoothed[valley_indices]
+    minimum_density = float(valley_density.min())
+    tolerance = max(1e-12, 0.02 * minimum_density)
+    minimum_candidates = valley_indices[
+        valley_density <= minimum_density + tolerance
+    ]
+    peak_midpoint = 0.5 * (centers[left_peak] + centers[right_peak])
+    valley_index = int(
+        minimum_candidates[
+            np.argmin(np.abs(centers[minimum_candidates] - peak_midpoint))
+        ]
+    )
+    smaller_peak = float(min(smoothed[left_peak], smoothed[right_peak]))
+    depth_ratio = (
+        float(smoothed[valley_index]) / smaller_peak
+        if smaller_peak > 0.0
+        else float("inf")
+    )
+    if depth_ratio > PROBABILITY_VALLEY_MAX_DEPTH_RATIO:
+        diagnostics["reason"] = "valley_not_deep_enough"
+        return fallback, diagnostics
+
+    raw_threshold = float(centers[valley_index])
+    threshold = fallback + PROBABILITY_VALLEY_SHRINK * (
+        raw_threshold - fallback
+    )
+    clip_low, clip_high = PROBABILITY_VALLEY_CLIP_RANGE
+    threshold = float(np.clip(threshold, clip_low, clip_high))
+    diagnostics.update(
+        {
+            "fallback": False,
+            "reason": "ok",
+            "raw_threshold": raw_threshold,
+            "threshold": threshold,
+            "left_peak": float(centers[left_peak]),
+            "right_peak": float(centers[right_peak]),
+            "depth_ratio": depth_ratio,
+        }
+    )
+    return threshold, diagnostics
+
+
+def float_otsu_threshold(probability, fallback_threshold=0.50):
+    """Compute per-image Otsu directly from float probabilities.
+
+    Unlike the EReCu inference implementation, this path never multiplies by
+    255, rounds, or casts the prediction to uint8. Float values are accumulated
+    into a 256-bin histogram over the observed per-image probability range.
+    """
+
+    fallback = float(fallback_threshold)
+    values = torch.as_tensor(probability).detach().float().cpu().numpy().reshape(-1)
+    values = values[np.isfinite(values)]
+    diagnostics = {
+        "fallback": True,
+        "reason": "insufficient_values",
+        "raw_threshold": fallback,
+        "threshold": fallback,
+    }
+    if values.size < 2:
+        return fallback, diagnostics
+
+    values = np.clip(values.astype(np.float64, copy=False), 0.0, 1.0)
+    value_min = float(values.min())
+    value_max = float(values.max())
+    diagnostics.update({"value_min": value_min, "value_max": value_max})
+    if value_max <= value_min:
+        diagnostics["reason"] = "constant_probability_map"
+        return fallback, diagnostics
+
+    histogram, edges = np.histogram(
+        values,
+        bins=FLOAT_OTSU_BINS,
+        range=(value_min, value_max),
+    )
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    counts = histogram.astype(np.float64)
+    left_weight = np.cumsum(counts)
+    right_weight = np.cumsum(counts[::-1])[::-1]
+    left_sum = np.cumsum(counts * centers)
+    right_sum = np.cumsum((counts * centers)[::-1])[::-1]
+
+    valid = (left_weight[:-1] > 0.0) & (right_weight[1:] > 0.0)
+    if not np.any(valid):
+        diagnostics["reason"] = "missing_otsu_partition"
+        return fallback, diagnostics
+
+    scores = np.full(FLOAT_OTSU_BINS - 1, -np.inf, dtype=np.float64)
+    left_mean = left_sum[:-1][valid] / left_weight[:-1][valid]
+    right_mean = right_sum[1:][valid] / right_weight[1:][valid]
+    scores[valid] = (
+        left_weight[:-1][valid]
+        * right_weight[1:][valid]
+        * (left_mean - right_mean) ** 2
+    )
+    threshold = float(centers[int(np.argmax(scores))])
+    diagnostics.update(
+        {
+            "fallback": False,
+            "reason": "ok",
+            "raw_threshold": threshold,
+            "threshold": threshold,
+        }
+    )
+    return threshold, diagnostics
+
+
+def binary_hysteresis_mask(probability, low_threshold, high_threshold):
+    """Keep low-threshold components that contain a high-threshold seed."""
+
+    low = float(low_threshold)
+    high = float(high_threshold)
+    if not 0.0 <= low <= high <= 1.0:
+        raise ValueError(
+            f"Invalid hysteresis thresholds: low={low}, high={high}."
+        )
+    tensor = torch.as_tensor(probability).detach().float()
+    if tensor.numel() == 0:
+        raise ValueError("Hysteresis probability map must not be empty.")
+    original_shape = tensor.shape
+    spatial = tensor.squeeze().cpu().numpy()
+    if spatial.ndim != 2:
+        raise ValueError(
+            "Hysteresis expects one 2D probability map, got "
+            f"shape={list(original_shape)}."
+        )
+
+    candidate = spatial > low
+    seed = spatial > high
+    structure = np.ones((3, 3), dtype=np.uint8)
+    labels, component_count = connected_component_label(
+        candidate, structure=structure
+    )
+    seed_labels = np.unique(labels[seed])
+    seed_labels = seed_labels[seed_labels != 0]
+    if seed_labels.size:
+        output = np.isin(labels, seed_labels)
+    else:
+        output = np.zeros_like(candidate, dtype=bool)
+    mask = torch.as_tensor(output, dtype=torch.float32, device=tensor.device).reshape(
+        original_shape
+    )
+    diagnostics = {
+        "low_threshold": low,
+        "high_threshold": high,
+        "candidate_area": float(candidate.mean()),
+        "seed_area": float(seed.mean()),
+        "output_area": float(output.mean()),
+        "component_count": int(component_count),
+        "kept_component_count": int(seed_labels.size),
+        "missing_seed": bool(seed_labels.size == 0),
+    }
+    return mask, diagnostics
+
+
+def otsu_anchor_hysteresis_mask(probability, anchor_threshold=0.50):
+    """Combine per-image float Otsu with a stable anchor via hysteresis."""
+
+    anchor = float(anchor_threshold)
+    otsu, otsu_diagnostics = float_otsu_threshold(
+        probability, fallback_threshold=anchor
+    )
+    low, high = min(otsu, anchor), max(otsu, anchor)
+    mask, hysteresis_diagnostics = binary_hysteresis_mask(
+        probability, low_threshold=low, high_threshold=high
+    )
+    fallback = bool(otsu_diagnostics["fallback"])
+    reason = str(otsu_diagnostics["reason"])
+    if hysteresis_diagnostics["missing_seed"]:
+        mask = (torch.as_tensor(probability).detach().float() > anchor).float()
+        fallback = True
+        reason = "missing_hysteresis_seed"
+    diagnostics = {
+        **hysteresis_diagnostics,
+        "fallback": fallback,
+        "reason": reason,
+        "raw_threshold": float(otsu),
+        "threshold": float(otsu),
+        "otsu_threshold": float(otsu),
+        "anchor_threshold": anchor,
+    }
+    return mask, diagnostics
+
+
+def logit_triangle_threshold(probability, fallback_threshold=0.50):
+    """Compute a per-image Triangle threshold on float logits without GT."""
+
+    fallback = float(fallback_threshold)
+    values = torch.as_tensor(probability).detach().float().cpu().numpy().reshape(-1)
+    values = values[np.isfinite(values)]
+    diagnostics = {
+        "fallback": True,
+        "reason": "insufficient_values",
+        "raw_threshold": fallback,
+        "threshold": fallback,
+    }
+    if values.size < 2:
+        return fallback, diagnostics
+
+    probability_eps = float(LOGIT_TRIANGLE_PROBABILITY_EPS)
+    values = np.clip(
+        values.astype(np.float64, copy=False),
+        probability_eps,
+        1.0 - probability_eps,
+    )
+    logits = np.log(values) - np.log1p(-values)
+    logit_min = float(logits.min())
+    logit_max = float(logits.max())
+    diagnostics.update({"logit_min": logit_min, "logit_max": logit_max})
+    if (
+        not math.isfinite(logit_min)
+        or not math.isfinite(logit_max)
+        or logit_max <= logit_min
+    ):
+        diagnostics["reason"] = "constant_probability_map"
+        return fallback, diagnostics
+
+    histogram, edges = np.histogram(
+        logits,
+        bins=LOGIT_TRIANGLE_BINS,
+        range=(logit_min, logit_max),
+    )
+    nonzero_indices = np.flatnonzero(histogram)
+    if nonzero_indices.size < 2:
+        diagnostics["reason"] = "insufficient_histogram_support"
+        return fallback, diagnostics
+
+    peak_index = int(np.argmax(histogram))
+    low_index = int(nonzero_indices[0])
+    high_index = int(nonzero_indices[-1])
+    original_peak_index = peak_index
+    flipped = peak_index - low_index < high_index - peak_index
+    working_histogram = histogram
+    if flipped:
+        working_histogram = histogram[::-1]
+        low_index = LOGIT_TRIANGLE_BINS - high_index - 1
+        peak_index = LOGIT_TRIANGLE_BINS - peak_index - 1
+
+    peak_width = int(peak_index - low_index)
+    if peak_width <= 0:
+        diagnostics["reason"] = "missing_triangle_tail"
+        return fallback, diagnostics
+    peak_height = float(working_histogram[peak_index])
+    normalizer = math.hypot(peak_height, float(peak_width))
+    if normalizer <= 0.0:
+        diagnostics["reason"] = "degenerate_triangle"
+        return fallback, diagnostics
+
+    offsets = np.arange(peak_width, dtype=np.float64)
+    tail_heights = working_histogram[
+        low_index : low_index + peak_width
+    ].astype(np.float64)
+    distances = (
+        (peak_height / normalizer) * offsets
+        - (float(peak_width) / normalizer) * tail_heights
+    )
+    threshold_index = int(np.argmax(distances)) + low_index
+    if flipped:
+        threshold_index = LOGIT_TRIANGLE_BINS - threshold_index - 1
+
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    threshold_logit = float(centers[threshold_index])
+    threshold = float(1.0 / (1.0 + math.exp(-threshold_logit)))
+    diagnostics.update(
+        {
+            "fallback": False,
+            "reason": "ok",
+            "raw_threshold": threshold,
+            "threshold": threshold,
+            "threshold_logit": threshold_logit,
+            "peak_logit": float(centers[original_peak_index]),
+            "tail_direction": "right" if flipped else "left",
+        }
+    )
+    return threshold, diagnostics
+
+
+def logit_gmm_threshold(probability, fallback_threshold=0.50):
+    """Fit a deterministic two-component GMM to one logit probability map."""
+
+    fallback = float(fallback_threshold)
+    values = torch.as_tensor(probability).detach().float().cpu().numpy().reshape(-1)
+    values = values[np.isfinite(values)]
+    diagnostics = {
+        "fallback": True,
+        "reason": "insufficient_values",
+        "raw_threshold": fallback,
+        "threshold": fallback,
+    }
+    if values.size < 16:
+        return fallback, diagnostics
+
+    probability_eps = float(LOGIT_GMM_PROBABILITY_EPS)
+    values = np.clip(values.astype(np.float64, copy=False), probability_eps, 1.0 - probability_eps)
+    logits = np.log(values) - np.log1p(-values)
+    logit_min = float(logits.min())
+    logit_max = float(logits.max())
+    if not math.isfinite(logit_min) or not math.isfinite(logit_max) or logit_max <= logit_min:
+        diagnostics["reason"] = "constant_probability_map"
+        return fallback, diagnostics
+
+    histogram, edges = np.histogram(
+        logits,
+        bins=LOGIT_GMM_BINS,
+        range=(logit_min, logit_max),
+    )
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    counts = histogram.astype(np.float64)
+    total_count = float(counts.sum())
+    initial_background = centers < 0.0
+    initial_foreground = ~initial_background
+    initial_masses = np.asarray(
+        [counts[initial_background].sum(), counts[initial_foreground].sum()],
+        dtype=np.float64,
+    )
+    if np.any(initial_masses < LOGIT_GMM_MIN_COMPONENT_WEIGHT * total_count):
+        diagnostics["reason"] = "missing_initial_probability_class"
+        return fallback, diagnostics
+
+    means = np.asarray(
+        [
+            np.sum(counts[initial_background] * centers[initial_background]) / initial_masses[0],
+            np.sum(counts[initial_foreground] * centers[initial_foreground]) / initial_masses[1],
+        ],
+        dtype=np.float64,
+    )
+    variances = np.asarray(
+        [
+            np.sum(counts[initial_background] * (centers[initial_background] - means[0]) ** 2)
+            / initial_masses[0],
+            np.sum(counts[initial_foreground] * (centers[initial_foreground] - means[1]) ** 2)
+            / initial_masses[1],
+        ],
+        dtype=np.float64,
+    )
+    variances = np.maximum(variances, LOGIT_GMM_REG_COVAR)
+    weights = initial_masses / total_count
+    previous_average_log_likelihood = None
+    converged = False
+    iterations = 0
+
+    for iteration in range(LOGIT_GMM_MAX_ITERATIONS):
+        log_density = (
+            np.log(np.maximum(weights[:, None], np.finfo(np.float64).tiny))
+            - 0.5 * np.log(2.0 * np.pi * variances[:, None])
+            - 0.5 * (centers[None, :] - means[:, None]) ** 2 / variances[:, None]
+        )
+        max_log_density = np.max(log_density, axis=0)
+        exp_density = np.exp(log_density - max_log_density[None, :])
+        density_sum = np.maximum(exp_density.sum(axis=0), np.finfo(np.float64).tiny)
+        responsibilities = exp_density / density_sum[None, :]
+        weighted_responsibilities = responsibilities * counts[None, :]
+        component_counts = weighted_responsibilities.sum(axis=1)
+        if np.any(component_counts <= 0.0):
+            diagnostics["reason"] = "empty_gmm_component"
+            return fallback, diagnostics
+
+        weights = component_counts / total_count
+        means = (weighted_responsibilities * centers[None, :]).sum(axis=1) / component_counts
+        variances = (
+            weighted_responsibilities * (centers[None, :] - means[:, None]) ** 2
+        ).sum(axis=1) / component_counts
+        variances = np.maximum(variances, LOGIT_GMM_REG_COVAR)
+        order = np.argsort(means)
+        weights, means, variances = weights[order], means[order], variances[order]
+
+        average_log_likelihood = float(
+            np.sum(counts * (max_log_density + np.log(density_sum))) / total_count
+        )
+        iterations = iteration + 1
+        if (
+            previous_average_log_likelihood is not None
+            and abs(average_log_likelihood - previous_average_log_likelihood)
+            <= LOGIT_GMM_TOLERANCE
+        ):
+            converged = True
+            break
+        previous_average_log_likelihood = average_log_likelihood
+
+    if np.any(weights < LOGIT_GMM_MIN_COMPONENT_WEIGHT):
+        diagnostics["reason"] = "small_gmm_component"
+        return fallback, diagnostics
+    standardized_separation = float(
+        (means[1] - means[0]) / math.sqrt(variances[0] + variances[1])
+    )
+    if standardized_separation < LOGIT_GMM_MIN_STANDARDIZED_SEPARATION:
+        diagnostics["reason"] = "gmm_components_not_separated"
+        return fallback, diagnostics
+
+    candidates = np.linspace(means[0], means[1], 4097, dtype=np.float64)
+    log_background = (
+        math.log(weights[0])
+        - 0.5 * math.log(2.0 * math.pi * variances[0])
+        - 0.5 * (candidates - means[0]) ** 2 / variances[0]
+    )
+    log_foreground = (
+        math.log(weights[1])
+        - 0.5 * math.log(2.0 * math.pi * variances[1])
+        - 0.5 * (candidates - means[1]) ** 2 / variances[1]
+    )
+    threshold_logit = float(candidates[int(np.argmin(np.abs(log_foreground - log_background)))])
+    threshold = float(1.0 / (1.0 + math.exp(-threshold_logit)))
+    diagnostics.update(
+        {
+            "fallback": False,
+            "reason": "ok",
+            "raw_threshold": threshold,
+            "threshold": threshold,
+            "background_weight": float(weights[0]),
+            "foreground_weight": float(weights[1]),
+            "background_logit_mean": float(means[0]),
+            "foreground_logit_mean": float(means[1]),
+            "background_logit_std": float(math.sqrt(variances[0])),
+            "foreground_logit_std": float(math.sqrt(variances[1])),
+            "standardized_separation": standardized_separation,
+            "iterations": iterations,
+            "converged": converged,
+        }
+    )
+    return threshold, diagnostics
+
+
+def resolve_eval_binary_threshold(
+    cfg,
+    dataset_name,
+    threshold_overrides=None,
+    default_threshold=None,
+):
+    """Return one dataset threshold, with optional one-run CLI overrides."""
+
+    default = float(
+        cfg.THRESHOLD if default_threshold is None else default_threshold
+    )
+    if not math.isfinite(default) or not 0.0 <= default <= 1.0:
+        raise ValueError(f"Invalid default evaluation threshold: {default}.")
+    raw_mapping = threshold_overrides or {}
+    if not isinstance(raw_mapping, Mapping):
+        raise TypeError("threshold_overrides must be a mapping.")
+    threshold = float(raw_mapping.get(str(dataset_name), default))
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError(
+            f"Invalid evaluation threshold for {dataset_name}: {threshold}."
+        )
+    return threshold
+
+
+def finalize_eval_metric_results(metrics, binary_reference_metrics=None):
+    """Finalize main metrics and preserve hard-mask-only ACC/mIoU semantics."""
+
+    result = metrics.get_result()
+    binary_reference_result = None
+    if binary_reference_metrics is not None:
+        binary_reference_result = binary_reference_metrics.get_result()
+        result["ACC"] = binary_reference_result["ACC"]
+        result["mIOU"] = binary_reference_result["mIOU"]
+    return result, binary_reference_result
+
+
 @torch.no_grad()
 def eval_dataset(
     cfg,
@@ -264,6 +936,10 @@ def eval_dataset(
     logger,
     max_samples=-1,
     online_dino=None,
+    threshold_overrides=None,
+    default_threshold=None,
+    adaptive_threshold="none",
+    metric_input="binary",
 ):
     dataset = CachedEvalDataset(
         cfg,
@@ -280,7 +956,11 @@ def eval_dataset(
         pin_memory=torch.cuda.is_available(),
         **dataloader_worker_kwargs(cfg),
     )
+    metric_input = str(metric_input).strip().lower()
+    if metric_input not in {"binary", "probability"}:
+        raise ValueError(f"Unknown metric input mode: {metric_input!r}.")
     metrics = CODMetrics()
+    binary_reference_metrics = CODMetrics() if metric_input == "probability" else None
     pred_dir = Path(out_dir) / "pred" / dataset_name
     student.eval()
     hr_bfr_eval_batches = 0
@@ -291,6 +971,28 @@ def eval_dataset(
     hr_bfr_band_ratio_max = 0.0
     cssd_single_view_logged = False
     cacd_logged = False
+    binary_threshold = resolve_eval_binary_threshold(
+        cfg,
+        dataset_name,
+        threshold_overrides,
+        default_threshold=default_threshold,
+    )
+    adaptive_threshold = str(adaptive_threshold).strip().lower()
+    logger.log(
+        f"[EvalThreshold] Dataset: {dataset_name} | "
+        f"mode={adaptive_threshold} | fallback_threshold={binary_threshold:.6f}"
+    )
+    threshold_values = []
+    raw_threshold_values = []
+    threshold_fallbacks = 0
+    logit_gmm_diagnostics = []
+    otsu_hysteresis_diagnostics = []
+    prediction_area_sum = 0.0
+    probability_mean_sum = 0.0
+    soft_hard_gap_sum = 0.0
+    ambiguous_ratio_01_09_sum = 0.0
+    ambiguous_ratio_04_06_sum = 0.0
+    evaluated_images = 0
 
     for batch in loader:
         if bool(getattr(cfg, "USE_AP_STCR", False)) or str(
@@ -394,12 +1096,108 @@ def eval_dataset(
         else:
             logits = extract_logits(student(model_input))
         logits = F.interpolate(logits, size=gt.shape[-2:], mode="bilinear")
-        pred = (logits.sigmoid() > float(cfg.THRESHOLD)).float()
-        save_pred_png(pred_dir / f"{stem}.png", pred)
-        metrics.step(gt, pred)
+        probability = logits.sigmoid()
+        image_threshold = binary_threshold
+        adaptive_prediction = None
+        if adaptive_threshold in {
+            "probability_valley",
+            "otsu_float",
+            "triangle_logit",
+            "logit_gmm",
+        }:
+            threshold_functions = {
+                "probability_valley": probability_valley_threshold,
+                "otsu_float": float_otsu_threshold,
+                "triangle_logit": logit_triangle_threshold,
+                "logit_gmm": logit_gmm_threshold,
+            }
+            threshold_fn = threshold_functions[adaptive_threshold]
+            image_threshold, threshold_diagnostics = threshold_fn(
+                probability, fallback_threshold=binary_threshold
+            )
+            raw_threshold_values.append(
+                float(threshold_diagnostics["raw_threshold"])
+            )
+            threshold_fallbacks += int(threshold_diagnostics["fallback"])
+            if adaptive_threshold == "logit_gmm" and not threshold_diagnostics["fallback"]:
+                logit_gmm_diagnostics.append(threshold_diagnostics)
+        elif adaptive_threshold == "otsu_hysteresis":
+            adaptive_prediction, threshold_diagnostics = otsu_anchor_hysteresis_mask(
+                probability, anchor_threshold=binary_threshold
+            )
+            image_threshold = float(threshold_diagnostics["otsu_threshold"])
+            raw_threshold_values.append(image_threshold)
+            threshold_fallbacks += int(threshold_diagnostics["fallback"])
+            otsu_hysteresis_diagnostics.append(threshold_diagnostics)
+        threshold_values.append(float(image_threshold))
+        pred = (
+            adaptive_prediction
+            if adaptive_prediction is not None
+            else (probability > image_threshold).float()
+        )
+        prediction_area_sum += float(pred.mean().item())
+        probability_mean_sum += float(probability.mean().item())
+        soft_hard_gap_sum += float(torch.abs(probability - pred).mean().item())
+        ambiguous_ratio_01_09_sum += float(
+            ((probability > 0.10) & (probability < 0.90)).float().mean().item()
+        )
+        ambiguous_ratio_04_06_sum += float(
+            ((probability > 0.40) & (probability < 0.60)).float().mean().item()
+        )
+        evaluated_images += 1
+        if metric_input == "probability":
+            save_probability_png(pred_dir / f"{stem}.png", probability)
+            metrics.step(gt, probability)
+            binary_reference_metrics.step(gt, pred)
+        else:
+            save_pred_png(pred_dir / f"{stem}.png", pred)
+            metrics.step(gt, pred)
 
-    result = metrics.get_result()
+    result, binary_reference_result = finalize_eval_metric_results(
+        metrics, binary_reference_metrics
+    )
     logger.log(f"[Eval] Dataset: {dataset_name}")
+    if threshold_values:
+        threshold_array = np.asarray(threshold_values, dtype=np.float64)
+        threshold_label = (
+            "adaptive" if adaptive_threshold != "none" else f"{binary_threshold:g}"
+        )
+        logger.log(
+            f"[EvalThresholdSummary] Dataset: {dataset_name} | "
+            f"mode={adaptive_threshold} | mean={threshold_array.mean():.6f} | "
+            f"std={threshold_array.std():.6f} | min={threshold_array.min():.6f} | "
+            f"max={threshold_array.max():.6f} | "
+            f"fallback_ratio={threshold_fallbacks / max(evaluated_images, 1):.6f} | "
+            f"probability_mean={probability_mean_sum / max(evaluated_images, 1):.6f} | "
+            f"prediction_area={prediction_area_sum / max(evaluated_images, 1):.6f} | "
+            f"soft_hard_gap={soft_hard_gap_sum / max(evaluated_images, 1):.6f} | "
+            f"ambiguous_ratio_01_09={ambiguous_ratio_01_09_sum / max(evaluated_images, 1):.6f} | "
+            f"ambiguous_ratio_04_06={ambiguous_ratio_04_06_sum / max(evaluated_images, 1):.6f}"
+        )
+        if logit_gmm_diagnostics:
+            logger.log(
+                f"[EvalLogitGMMSummary] Dataset: {dataset_name} | "
+                f"background_weight={np.mean([item['background_weight'] for item in logit_gmm_diagnostics]):.6f} | "
+                f"foreground_weight={np.mean([item['foreground_weight'] for item in logit_gmm_diagnostics]):.6f} | "
+                f"background_logit_mean={np.mean([item['background_logit_mean'] for item in logit_gmm_diagnostics]):.6f} | "
+                f"foreground_logit_mean={np.mean([item['foreground_logit_mean'] for item in logit_gmm_diagnostics]):.6f} | "
+                f"standardized_separation={np.mean([item['standardized_separation'] for item in logit_gmm_diagnostics]):.6f} | "
+                f"converged_ratio={np.mean([float(item['converged']) for item in logit_gmm_diagnostics]):.6f} | "
+                f"mean_iterations={np.mean([item['iterations'] for item in logit_gmm_diagnostics]):.3f}"
+            )
+        if otsu_hysteresis_diagnostics:
+            logger.log(
+                f"[EvalOtsuHysteresisSummary] Dataset: {dataset_name} | "
+                f"low_threshold={np.mean([item['low_threshold'] for item in otsu_hysteresis_diagnostics]):.6f} | "
+                f"high_threshold={np.mean([item['high_threshold'] for item in otsu_hysteresis_diagnostics]):.6f} | "
+                f"candidate_area={np.mean([item['candidate_area'] for item in otsu_hysteresis_diagnostics]):.6f} | "
+                f"seed_area={np.mean([item['seed_area'] for item in otsu_hysteresis_diagnostics]):.6f} | "
+                f"output_area={np.mean([item['output_area'] for item in otsu_hysteresis_diagnostics]):.6f} | "
+                f"component_count={np.mean([item['component_count'] for item in otsu_hysteresis_diagnostics]):.3f} | "
+                f"kept_component_count={np.mean([item['kept_component_count'] for item in otsu_hysteresis_diagnostics]):.3f}"
+            )
+    else:
+        threshold_label = f"{binary_threshold:g}"
     if use_hr_bfr(cfg):
         denom = max(hr_bfr_eval_batches, 1)
         logger.log(
@@ -413,10 +1211,24 @@ def eval_dataset(
     logger.log(format_metric_table(result))
     logger.log(
         f"F_MAX={float(result['F_MAX']):.6f} | "
+        f"E_ADP={float(result['E_ADP']):.6f} | "
         f"E_MAX={float(result['E_MAX']):.6f} | "
-        f"ACC@0.5={float(result['ACC']):.6f} | "
-        f"mIoU@0.5={float(result['mIOU']):.6f}"
+        f"ACC@{threshold_label}={float(result['ACC']):.6f} | "
+        f"mIoU@{threshold_label}={float(result['mIOU']):.6f}"
     )
+    if binary_reference_result is not None:
+        logger.log(
+            f"[EvalBinaryReference] Dataset: {dataset_name} | "
+            f"threshold={threshold_label} | main_metric_input=binary_prediction"
+        )
+        logger.log(format_metric_table(binary_reference_result))
+        logger.log(
+            f"F_MAX={float(binary_reference_result['F_MAX']):.6f} | "
+            f"E_ADP={float(binary_reference_result['E_ADP']):.6f} | "
+            f"E_MAX={float(binary_reference_result['E_MAX']):.6f} | "
+            f"ACC@{threshold_label}={float(binary_reference_result['ACC']):.6f} | "
+            f"mIoU@{threshold_label}={float(binary_reference_result['mIOU']):.6f}"
+        )
     return result
 
 def main():
@@ -426,6 +1238,56 @@ def main():
     parser.add_argument("--eval_tag", type=str, default=None)
     parser.add_argument("--eval_name", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--max_samples", type=int, default=-1)
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="One-run global output threshold override.",
+    )
+    parser.add_argument(
+        "--adaptive_threshold",
+        choices=(
+            "none",
+            "probability_valley",
+            "otsu_float",
+            "triangle_logit",
+            "logit_gmm",
+            "otsu_hysteresis",
+        ),
+        default="none",
+        help="One-run per-image adaptive output threshold mode.",
+    )
+    parser.add_argument(
+        "--metric_input",
+        choices=("binary", "probability"),
+        default="binary",
+        help="Input used by S/Fw/Fm/E/MAE; ACC/mIoU always use a binary mask.",
+    )
+    parser.add_argument(
+        "--lcic_consensus_scale",
+        type=float,
+        default=1.0,
+        help="One-run multiplier for the learned LCIC consensus contribution.",
+    )
+    parser.add_argument(
+        "--lcic_innovation_scale",
+        type=float,
+        default=1.0,
+        help="One-run multiplier for the learned LCIC innovation contribution.",
+    )
+    parser.add_argument(
+        "--dataset_threshold",
+        action="append",
+        default=[],
+        metavar="DATASET=THRESHOLD",
+        help="One-run output threshold override; may be repeated.",
+    )
+    parser.add_argument(
+        "--work_dir",
+        type=str,
+        default=None,
+        help="Explicit evaluation output directory.",
+    )
     args = parser.parse_args()
     if args.eval_tag is not None and args.eval_name is not None:
         raise ValueError("--eval_tag and deprecated --eval_name cannot be used together.")
@@ -433,6 +1295,20 @@ def main():
         raise ValueError("--max_samples must be -1 or a positive integer.")
 
     cfg = load_config(args.config)
+    default_threshold = float(
+        cfg.THRESHOLD if args.threshold is None else args.threshold
+    )
+    if not math.isfinite(default_threshold) or not 0.0 <= default_threshold <= 1.0:
+        raise ValueError(
+            f"Invalid --threshold value: {default_threshold}."
+        )
+    threshold_overrides = parse_dataset_threshold_overrides(
+        args.dataset_threshold, cfg.TEST_DATASETS
+    )
+    if args.adaptive_threshold != "none" and threshold_overrides:
+        raise ValueError(
+            "--adaptive_threshold cannot be combined with --dataset_threshold."
+        )
     if use_cacd(cfg):
         if str(getattr(cfg, "HEAD_TYPE", "")).lower() != "cacd_v1_base" or not bool(
             getattr(cfg, "USE_CACD", False)
@@ -458,7 +1334,11 @@ def main():
     eval_tag_path = Path(eval_tag)
     if eval_tag_path.is_absolute() or len(eval_tag_path.parts) != 1 or eval_tag in {"", ".", ".."}:
         raise ValueError(f"--eval_tag must be a single directory name, got {eval_tag!r}.")
-    out_dir = Path(cfg.WORK_ROOT) / cfg.EXP_NAME / eval_tag
+    out_dir = (
+        Path(args.work_dir)
+        if args.work_dir
+        else Path(cfg.WORK_ROOT) / cfg.EXP_NAME / eval_tag
+    )
     ensure_dir(out_dir)
     write_yaml(out_dir / "config.yaml", config_to_dict(cfg))
 
@@ -477,6 +1357,12 @@ def main():
         student.set_epoch(int(getattr(cfg, "MAX_EPOCH", 25)))
     else:
         student.load_state_dict(student_state)
+    lcic_scale_report = apply_lcic_inference_scales(
+        cfg,
+        student,
+        consensus_scale=args.lcic_consensus_scale,
+        innovation_scale=args.lcic_innovation_scale,
+    )
     online_dino = None
     if use_online_dino_last4(cfg):
         online_dino = FrozenDINOv1Last4Extractor(cfg).to(device).eval()
@@ -488,13 +1374,146 @@ def main():
         logger.log("model_for_eval = student")
         logger.log("look_twice = false")
         logger.log("teacher_or_apm_at_inference = false")
-        logger.log("evaluation_protocol = original_binary")
+        logger.log(
+            "evaluation_protocol = "
+            + (
+                "continuous_probability_cod_metrics"
+                if args.metric_input == "probability"
+                else "original_binary"
+            )
+        )
         logger.log("model_output_resize = bilinear_to_gt_size")
         logger.log("prediction_activation = sigmoid")
         logger.log("threshold_operator = >")
-        logger.log(f"binary_threshold = {float(cfg.THRESHOLD):.6f}")
-        logger.log("pred_save_format = binary_0_255")
-        logger.log("main_metric_input = binary_prediction")
+        logger.log(f"binary_threshold_config_default = {float(cfg.THRESHOLD):.6f}")
+        logger.log(f"binary_threshold_run_default = {default_threshold:.6f}")
+        logger.log(f"adaptive_threshold_mode = {args.adaptive_threshold}")
+        if lcic_scale_report is not None:
+            logger.log(
+                "[Eval LCICScale] "
+                f"consensus_scale="
+                f"{lcic_scale_report['consensus_scale']:.6f} | "
+                f"innovation_scale="
+                f"{lcic_scale_report['innovation_scale']:.6f} | "
+                f"intrinsic_consensus_gain="
+                f"{lcic_scale_report['intrinsic_consensus_gain']:.6f} | "
+                f"intrinsic_innovation_gain="
+                f"{lcic_scale_report['intrinsic_innovation_gain']:.6f} | "
+                f"alpha_original="
+                f"{lcic_scale_report['original_alpha']:.9f} | "
+                f"alpha_effective="
+                f"{lcic_scale_report['effective_alpha']:.9f} | "
+                f"beta_original="
+                f"{lcic_scale_report['original_beta']:.9f} | "
+                f"beta_effective="
+                f"{lcic_scale_report['effective_beta']:.9f} | "
+                "application=pre_sigmoid_internal_logit_branch | "
+                "checkpoint_file_modified=False"
+            )
+        if args.adaptive_threshold == "probability_valley":
+            logger.log(
+                "probability_valley_protocol = "
+                f"bins:{PROBABILITY_VALLEY_BINS},"
+                f"smooth_sigma:{PROBABILITY_VALLEY_SMOOTH_SIGMA:g},"
+                f"search:[{PROBABILITY_VALLEY_SEARCH_RANGE[0]:g},"
+                f"{PROBABILITY_VALLEY_SEARCH_RANGE[1]:g}],"
+                f"shrink:{PROBABILITY_VALLEY_SHRINK:g},"
+                f"clip:[{PROBABILITY_VALLEY_CLIP_RANGE[0]:g},"
+                f"{PROBABILITY_VALLEY_CLIP_RANGE[1]:g}],"
+                f"fallback:{default_threshold:g}"
+            )
+        elif args.adaptive_threshold == "otsu_float":
+            logger.log(
+                "float_otsu_protocol = "
+                "source:sigmoid_float32,"
+                f"bins:{FLOAT_OTSU_BINS},"
+                "histogram_range:per_image_min_max,"
+                "uint8_quantization:false,"
+                "gt_used:false,"
+                f"fallback:{default_threshold:g}"
+            )
+        elif args.adaptive_threshold == "triangle_logit":
+            logger.log(
+                "logit_triangle_protocol = "
+                "source:sigmoid_float32_then_logit,"
+                f"bins:{LOGIT_TRIANGLE_BINS},"
+                f"probability_eps:{LOGIT_TRIANGLE_PROBABILITY_EPS:g},"
+                "histogram_range:per_image_logit_min_max,"
+                "tail:auto_longer_side,"
+                "operator:strict_greater_than,"
+                "uint8_quantization:false,"
+                "gt_used:false,"
+                f"fallback:{default_threshold:g}"
+            )
+        elif args.adaptive_threshold == "logit_gmm":
+            logger.log(
+                "logit_gmm_protocol = "
+                f"bins:{LOGIT_GMM_BINS},"
+                f"probability_eps:{LOGIT_GMM_PROBABILITY_EPS:g},"
+                f"max_iterations:{LOGIT_GMM_MAX_ITERATIONS},"
+                f"tolerance:{LOGIT_GMM_TOLERANCE:g},"
+                f"reg_covar:{LOGIT_GMM_REG_COVAR:g},"
+                f"min_component_weight:{LOGIT_GMM_MIN_COMPONENT_WEIGHT:g},"
+                f"min_standardized_separation:{LOGIT_GMM_MIN_STANDARDIZED_SEPARATION:g},"
+                "decision:equal_weighted_posterior_density,"
+                "uint8_quantization:false,"
+                "gt_used:false,"
+                f"fallback:{default_threshold:g}"
+            )
+        elif args.adaptive_threshold == "otsu_hysteresis":
+            logger.log(
+                "otsu_hysteresis_protocol = "
+                "otsu_source:sigmoid_float32,"
+                f"anchor:{default_threshold:g},"
+                "low:min(otsu,anchor),"
+                "high:max(otsu,anchor),"
+                "connectivity:8,"
+                "operator:strict_greater_than,"
+                "uint8_quantization:false,"
+                "gt_used:false,"
+                f"fallback:{default_threshold:g}"
+            )
+        eval_thresholds = {
+            str(dataset_name): resolve_eval_binary_threshold(
+                cfg,
+                dataset_name,
+                threshold_overrides,
+                default_threshold=default_threshold,
+            )
+            for dataset_name in cfg.TEST_DATASETS
+        }
+        logger.log(
+            "dataset_threshold_overrides = "
+            + (
+                ", ".join(
+                    f"{name}:{threshold:.6f}"
+                    for name, threshold in threshold_overrides.items()
+                )
+                if threshold_overrides
+                else "none"
+            )
+        )
+        logger.log(
+            "binary_thresholds_by_dataset = "
+            + ", ".join(
+                f"{name}:{threshold:.6f}"
+                for name, threshold in eval_thresholds.items()
+            )
+        )
+        logger.log(
+            "pred_save_format = "
+            + (
+                "probability_uint8_0_255"
+                if args.metric_input == "probability"
+                else "binary_0_255"
+            )
+        )
+        logger.log(f"main_metric_input = {args.metric_input}")
+        if args.metric_input == "probability":
+            logger.log("metric_probability_source = sigmoid_float32")
+            logger.log("metric_probability_preprocess = per_image_minmax_in_CODMetrics")
+            logger.log("binary_reference_metrics = enabled")
+            logger.log("acc_miou_input = thresholded_binary_prediction")
         logger.log(f"prediction_dir = {out_dir / 'pred'}")
         logger.log(f"max_samples = {int(args.max_samples)}")
         if online_dino is not None:
@@ -621,6 +1640,10 @@ def main():
                 logger,
                 max_samples=args.max_samples,
                 online_dino=online_dino,
+                threshold_overrides=threshold_overrides,
+                default_threshold=default_threshold,
+                adaptive_threshold=args.adaptive_threshold,
+                metric_input=args.metric_input,
             )
 
 

@@ -32,6 +32,13 @@ if __package__ in {None, ""}:
 
 from common.eval_dabe_rank_calibration import FastCODContext  # noqa: E402
 from common.utils import read_jsonl, torch_load  # noqa: E402
+from models.gbsp_core_variants import (  # noqa: E402
+    PCARankSelector,
+    decompose_pca,
+    minmax_score,
+    pca_fit_from_decomposition,
+    score_all_patches,
+)
 
 
 MAIN_ROOT = Path(__file__).resolve().parents[1]
@@ -50,7 +57,9 @@ EXPECTED_COUNTS = {
     "TR-COD10K": 3040,
 }
 EXPECTED_TOTAL = sum(EXPECTED_COUNTS.values())
-METRICS = ("S_m", "E_mean", "MAE", "F_beta_w", "F_beta_mean")
+COD_METRICS = ("S_m", "E_mean", "MAE", "F_beta_w", "F_beta_mean")
+AREA_METRICS = ("PredArea", "GTArea", "AreaBias", "AreaAbsError")
+METRICS = COD_METRICS + AREA_METRICS
 
 
 def _resolve(path: str | Path) -> Path:
@@ -72,18 +81,31 @@ def _balanced_subset(rows: list[dict], max_samples: int) -> list[dict]:
     grouped: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
         grouped[str(row["dataset"])].append(row)
-    selected, cursor = [], 0
-    while len(selected) < max_samples:
+    quotas = {dataset: 0 for dataset in DATASETS}
+    remaining = int(max_samples)
+    while remaining > 0:
         progressed = False
         for dataset in DATASETS:
-            if cursor < len(grouped[dataset]):
-                selected.append(grouped[dataset][cursor])
+            if quotas[dataset] < len(grouped[dataset]):
+                quotas[dataset] += 1
+                remaining -= 1
                 progressed = True
-                if len(selected) == max_samples:
+                if remaining == 0:
                     break
         if not progressed:
             break
-        cursor += 1
+    selected = []
+    for dataset in DATASETS:
+        count = quotas[dataset]
+        if count <= 0:
+            continue
+        indices = np.linspace(
+            0,
+            len(grouped[dataset]) - 1,
+            num=count,
+            dtype=np.int64,
+        )
+        selected.extend(grouped[dataset][int(index)] for index in indices)
     return selected
 
 
@@ -115,6 +137,7 @@ def _attach_training_gt(
                 **row,
                 "image_path": str(image_path),
                 "gt_path": str(gt_path),
+                "feature_cache_path": str(Path(feature_row["cache_path"]).resolve()),
             }
         )
     return attached
@@ -127,7 +150,7 @@ def _load_gt68(path: str | Path) -> torch.Tensor:
     return F.interpolate(gt.unsqueeze(0), size=(68, 68), mode="nearest").squeeze(0)
 
 
-def _load_gbsp68(row: dict) -> torch.Tensor:
+def _load_gbsp68(row: dict, pca_rank: int | None) -> torch.Tensor:
     path = Path(row["cache_path"])
     payload = torch_load(path, map_location="cpu")
     if not isinstance(payload, dict):
@@ -140,7 +163,58 @@ def _load_gbsp68(row: dict) -> torch.Tensor:
         raise RuntimeError(f"unexpected GBSP cache version: {path}")
     if int(payload.get("num_subspaces", -1)) != 1:
         raise RuntimeError(f"GBSP cache is not the M=1 experiment: {path}")
-    value = payload.get("gbsp_abs_minmax_37")
+    if pca_rank is None:
+        value = payload.get("gbsp_abs_minmax_37")
+    else:
+        feature_path = Path(row["feature_cache_path"])
+        feature_payload = torch_load(feature_path, map_location="cpu")
+        if not isinstance(feature_payload, dict):
+            raise TypeError(f"feature payload must be a dict: {feature_path}")
+        identity = (str(row["dataset"]), str(row["stem"]))
+        if (
+            str(feature_payload.get("dataset")),
+            str(feature_payload.get("stem")),
+        ) != identity:
+            raise RuntimeError(f"feature payload identity mismatch: {feature_path}")
+        feature = feature_payload.get("tensor")
+        if not torch.is_tensor(feature) or tuple(feature.shape) != (384, 37, 37):
+            raise ValueError(f"feature tensor must be [384,37,37]: {feature_path}")
+        flat = (
+            feature.detach()
+            .cpu()
+            .float()
+            .permute(1, 2, 0)
+            .reshape(37 * 37, 384)
+        )
+        if not bool(torch.isfinite(flat).all()) or bool(
+            (torch.linalg.vector_norm(flat, dim=1) <= 0.0).any()
+        ):
+            raise ValueError(f"feature tensor is invalid: {feature_path}")
+        normalized = F.normalize(flat, p=2, dim=1)
+        background_indices = payload.get("background_indices")
+        if not torch.is_tensor(background_indices):
+            raise TypeError(f"background_indices missing: {path}")
+        background_indices = background_indices.detach().cpu().long().reshape(-1)
+        if (
+            int(background_indices.numel()) <= int(pca_rank)
+            or int(torch.unique(background_indices).numel())
+            != int(background_indices.numel())
+            or int(background_indices.min()) < 0
+            or int(background_indices.max()) >= 37 * 37
+        ):
+            raise ValueError(f"background_indices are invalid for r{pca_rank}: {path}")
+        decomposition = decompose_pca(
+            normalized.index_select(0, background_indices)
+        )
+        fit = pca_fit_from_decomposition(
+            decomposition,
+            "fixed",
+            PCARankSelector(0.90, 8, 1),
+            int(pca_rank),
+        )
+        value = minmax_score(
+            score_all_patches(normalized, fit).reshape(1, 37, 37)
+        )
     if not torch.is_tensor(value) or tuple(value.shape) != (1, 37, 37):
         raise ValueError(f"gbsp_abs_minmax_37 must be Tensor[1,37,37]: {path}")
     value = value.detach().cpu().float().contiguous()
@@ -166,12 +240,14 @@ def _scan_one(task: dict) -> dict:
     row = task["row"]
     try:
         gt68 = _load_gt68(row["gt_path"])
-        score68 = _load_gbsp68(row)
+        score68 = _load_gbsp68(row, task.get("pca_rank"))
         thresholds = np.asarray(task["thresholds"], dtype=np.float64)
         context = FastCODContext(gt68)
+        masks = [
+            (score68 > float(threshold)).float() for threshold in thresholds
+        ]
         candidates = [
-            (f"t{index}", "hard", (score68 > float(threshold)).float())
-            for index, threshold in enumerate(thresholds)
+            (f"t{index}", "hard", mask) for index, mask in enumerate(masks)
         ]
         evaluated = context.evaluate_many(candidates, 0.5)
         arrays = {
@@ -179,8 +255,20 @@ def _scan_one(task: dict) -> dict:
                 [float(evaluated[(f"t{index}", "hard")][metric]) for index in range(len(thresholds))],
                 dtype=np.float64,
             )
-            for metric in METRICS
+            for metric in COD_METRICS
         }
+        gt_area = float(gt68.mean())
+        pred_area = np.asarray(
+            [float(mask.mean()) for mask in masks], dtype=np.float64
+        )
+        arrays.update(
+            {
+                "PredArea": pred_area,
+                "GTArea": np.full_like(pred_area, gt_area),
+                "AreaBias": pred_area - gt_area,
+                "AreaAbsError": np.abs(pred_area - gt_area),
+            }
+        )
         return {
             "dataset": str(row["dataset"]),
             "stem": str(row["stem"]),
@@ -276,6 +364,31 @@ def _aggregate(
                     "J_S_E_1mMAE": (s_value + e_value + 1.0 - mae_value) / 3.0,
                 }
             )
+    if all(dataset in dataset_arrays for dataset in DATASETS):
+        total_expected = float(sum(EXPECTED_COUNTS.values()))
+        arrays = {
+            metric: sum(
+                (float(EXPECTED_COUNTS[dataset]) / total_expected)
+                * dataset_arrays[dataset][metric]
+                for dataset in DATASETS
+            )
+            for metric in METRICS
+        }
+        for index, threshold in enumerate(thresholds):
+            s_value = float(arrays["S_m"][index])
+            e_value = float(arrays["E_mean"][index])
+            mae_value = float(arrays["MAE"][index])
+            rows.append(
+                {
+                    "scope": "train_expected_ratio_reweighted",
+                    "dataset": "TR-CAMO|TR-COD10K",
+                    "num_samples": len(results),
+                    "threshold": float(threshold),
+                    **{metric: float(arrays[metric][index]) for metric in METRICS},
+                    "J_S_E_1mMAE": (s_value + e_value + 1.0 - mae_value)
+                    / 3.0,
+                }
+            )
     return rows
 
 
@@ -285,9 +398,14 @@ def _run_pass(
     workers: int,
     torch_threads: int,
     failures_path: Path,
+    pca_rank: int | None,
 ) -> tuple[list[dict], list[dict], float]:
     tasks = [
-        {"row": row, "thresholds": [float(value) for value in thresholds]}
+        {
+            "row": row,
+            "thresholds": [float(value) for value in thresholds],
+            "pca_rank": pca_rank,
+        }
         for row in selected_rows
     ]
     started = time.perf_counter()
@@ -311,6 +429,13 @@ def _run_pass(
 
 
 def _selection_rows(rows: list[dict]) -> list[dict]:
+    expected_ratio = [
+        row
+        for row in rows
+        if row["scope"] == "train_expected_ratio_reweighted"
+    ]
+    if expected_ratio:
+        return expected_ratio
     return [row for row in rows if row["scope"] == "train_sample_weighted"]
 
 
@@ -344,23 +469,24 @@ def _report(
     best_s = _best(fine_selection, "S_m")
     best_e = _best(fine_selection, "E_mean")
     best_mae = _best(fine_selection, "MAE", maximize=False)
+    best_area = _best(fine_selection, "AreaAbsError", maximize=False)
     at_selected = [
         row
         for row in fine_rows
         if abs(float(row["threshold"]) - float(selected["threshold"])) < 1e-12
     ]
     lines = [
-        "# GBSP Hard68 训练集 4040 张伪标签阈值扫描",
+        f"# GBSP {metadata['rank_label']} Hard68 训练集伪标签阈值扫描",
         "",
         "> Oracle 诊断：阈值选择读取了训练 GT，不可作为无 GT 调参的正式结果。",
         "",
         "## 协议",
         "",
-        "- 样本：TR-CAMO 1000 + TR-COD10K 3040，共 4040 张。",
-        "- 响应：训练缓存 `gbsp_abs_minmax_37`。",
+        f"- 样本：{metadata['num_requested']} 张（TR-CAMO + TR-COD10K 平衡抽样或全量）。",
+        f"- 响应：{metadata['score_source']}。",
         "- 标签：37→68 双线性后执行 `strict > threshold`。",
         "- GT：原始二值 GT 最近邻缩放至 68×68。",
-        "- 主选择：4040 张逐图等权，与训练样本分布一致。",
+        f"- 主选择：{metadata['selection_dataset_weighting']}。",
         "- 附加报告：TR-CAMO、TR-COD10K 分项及两数据集等权宏平均。",
         "- 综合分：`J=(S+E+1-MAE)/3`。",
         "",
@@ -370,6 +496,8 @@ def _report(
         f"- S 最优：{float(best_s['threshold']):.3f}，S={float(best_s['S_m']):.6f}。",
         f"- E 最优：{float(best_e['threshold']):.3f}，E={float(best_e['E_mean']):.6f}。",
         f"- MAE 最优：{float(best_mae['threshold']):.3f}，MAE={float(best_mae['MAE']):.6f}。",
+        f"- 前景面积最贴近 GT：{float(best_area['threshold']):.3f}，"
+        f"mean|PredArea-GTArea|={float(best_area['AreaAbsError']):.6f}。",
         f"- J 高分平台（距最大值≤{metadata['plateau_tolerance']:.6f}）："
         + (
             f"{min(float(row['threshold']) for row in plateau):.3f}～"
@@ -380,14 +508,16 @@ def _report(
         "",
         "## 综合最优阈值下的完整指标",
         "",
-        "| scope | dataset | S | Fβw | Fm | E | MAE | J |",
-        "|---|---|---:|---:|---:|---:|---:|---:|",
+        "| scope | dataset | S | Fβw | Fm | E | MAE | PredArea | GTArea | area bias | J |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in at_selected:
         lines.append(
             f"| {row['scope']} | {row['dataset']} | {float(row['S_m']):.6f} | "
             f"{float(row['F_beta_w']):.6f} | {float(row['F_beta_mean']):.6f} | "
             f"{float(row['E_mean']):.6f} | {float(row['MAE']):.6f} | "
+            f"{float(row['PredArea']):.6f} | {float(row['GTArea']):.6f} | "
+            f"{float(row['AreaBias']):+.6f} | "
             f"{float(row.get('J_S_E_1mMAE', float('nan'))):.6f} |"
         )
     lines.extend(
@@ -411,7 +541,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", default=str(DEFAULT_MANIFEST))
     parser.add_argument("--feature_manifest", default=str(DEFAULT_FEATURE_MANIFEST))
-    parser.add_argument("--out_dir", default=str(DEFAULT_OUT))
+    parser.add_argument("--out_dir", default=None)
+    parser.add_argument(
+        "--pca_rank",
+        type=int,
+        choices=(8, 16, 32),
+        default=None,
+        help=(
+            "Recompute a fixed PCA rank from cached DINO features; the default "
+            "reuses the existing current-rank GBSP response."
+        ),
+    )
     parser.add_argument("--max_samples", type=int, default=-1)
     parser.add_argument("--coarse_step", type=float, default=0.01)
     parser.add_argument("--fine_step", type=float, default=0.001)
@@ -431,7 +571,15 @@ def main() -> None:
 
     manifest_path = _resolve(args.manifest)
     feature_manifest_path = _resolve(args.feature_manifest)
-    output_dir = _resolve(args.out_dir)
+    output_dir = _resolve(
+        args.out_dir
+        or (
+            DEFAULT_OUT
+            if args.pca_rank is None
+            else REPO_ROOT
+            / f"workdir/gbsp_r{int(args.pca_rank)}_hard68_train4040_threshold_scan"
+        )
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_rows = read_jsonl(manifest_path)
     counts = Counter(str(row["dataset"]) for row in manifest_rows)
@@ -449,6 +597,7 @@ def main() -> None:
         )
     paired_rows = _attach_training_gt(manifest_rows, feature_rows)
     selected_rows = _balanced_subset(paired_rows, int(args.max_samples))
+    selected_counts = Counter(str(row["dataset"]) for row in selected_rows)
     coarse_thresholds = np.arange(
         0.0, 1.0 + float(args.coarse_step) / 2.0, float(args.coarse_step)
     ).round(10)
@@ -458,6 +607,7 @@ def main() -> None:
         args.workers,
         args.torch_threads,
         output_dir / "coarse_failures.json",
+        args.pca_rank,
     )
     if not coarse_valid:
         raise RuntimeError("coarse scan produced no valid samples")
@@ -475,6 +625,7 @@ def main() -> None:
         args.workers,
         args.torch_threads,
         output_dir / "fine_failures.json",
+        args.pca_rank,
     )
     if not fine_valid:
         raise RuntimeError("fine scan produced no valid samples")
@@ -499,12 +650,16 @@ def main() -> None:
         "F_beta_mean",
         "E_mean",
         "MAE",
+        "PredArea",
+        "GTArea",
+        "AreaBias",
+        "AreaAbsError",
         "J_S_E_1mMAE",
     ]
     _write_csv(output_dir / "coarse_scan.csv", coarse_rows, fields)
     _write_csv(output_dir / "fine_scan.csv", fine_rows, fields)
     metadata = {
-        "schema": "gbsp_hard68_threshold_scan_v1",
+        "schema": "gbsp_hard68_threshold_scan_v2",
         "manifest": str(manifest_path),
         "feature_manifest": str(feature_manifest_path),
         "output_dir": str(output_dir),
@@ -520,9 +675,29 @@ def main() -> None:
         "fine_radius": float(args.fine_radius),
         "plateau_tolerance": float(args.plateau_tolerance),
         "selection_datasets": list(DATASETS),
-        "selection_dataset_weighting": "sample_weighted_1000_plus_3040",
+        "selection_dataset_weighting": (
+            "先分数据集估计，再按正式训练比例 "
+            f"TR-CAMO {EXPECTED_COUNTS['TR-CAMO']} : "
+            f"TR-COD10K {EXPECTED_COUNTS['TR-COD10K']} 重加权"
+        ),
+        "selected_dataset_counts": {
+            dataset: int(selected_counts.get(dataset, 0)) for dataset in DATASETS
+        },
+        "subset_selection": (
+            "full_manifest"
+            if len(selected_rows) == EXPECTED_TOTAL
+            else "balanced_evenly_spaced_within_each_dataset_manifest"
+        ),
         "selection_score": "(S_m + E_mean + 1 - MAE) / 3",
-        "score_source": "GBSP train cache gbsp_abs_minmax_37",
+        "score_source": (
+            "GBSP train cache gbsp_abs_minmax_37"
+            if args.pca_rank is None
+            else f"fixed-r{int(args.pca_rank)} recomputed from cached DINO features and Full-BC indices"
+        ),
+        "rank_label": (
+            "current-rank" if args.pca_rank is None else f"R{int(args.pca_rank)}"
+        ),
+        "fixed_pca_rank": args.pca_rank,
         "pseudo_label_pipeline": "bilinear_37_to_68_then_strict_threshold",
         "gt_pipeline": "binary_original_to_68_nearest",
         "selected_threshold": float(selected["threshold"]),

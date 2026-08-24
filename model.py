@@ -7,6 +7,7 @@ from torch import nn
 from models.cacd import CACDV1BaseHead
 from models.bcrd import BCRDSemV1Head
 from models.hsd import F12ScaleLiftHead, HSDV1Head, Last4LinearProbe
+from models.lcic import Conv3x3LiteHead, DWLiteHead, LCICHead
 
 
 class SimpleConvSegHead(nn.Module):
@@ -1992,7 +1993,6 @@ class DAGPSafeHead(nn.Module):
             output["coarse_logits"] = output["logits"]
             output["coarse_prob"] = output["prob"]
         return output
-
     @staticmethod
     def _attach_pa_aux(output, pa_state):
         if pa_state is None:
@@ -2681,6 +2681,37 @@ class DAGPSafeHead(nn.Module):
         return logits
 
 
+class NDROnlyHead(DAGPSafeHead):
+    """Native 1x1 coarse prediction plus NDR-v1, with DAGP bypassed.
+
+    Reusing the mature NDR implementation keeps its RGB/Sobel/coarse-prob
+    behavior exact. Zero graph strengths make ``DAGPSafeHead.forward`` take
+    its explicit no-graph branch before affinity/Top-K construction. Graph
+    projection modules are removed, leaving only the base and NDR trainable.
+    """
+
+    def __init__(self, *args, **kwargs):
+        kwargs.update(
+            {
+                "alpha_max": 0.0,
+                "gamma_max": 0.0,
+                "use_prob_gate": False,
+                "use_uncertainty_output_gate": False,
+                "use_ndr_branch": True,
+                "use_ndr_v2": False,
+                "use_proto_contrast": False,
+                "pa_dagp": None,
+                "use_esa_ber": False,
+                "return_graph_aux_for_ber": False,
+            }
+        )
+        super().__init__(*args, **kwargs)
+        del self.proj
+        del self.value
+        del self.graph_pred
+        self.dagp_disabled = True
+
+
 def _group_count(channels):
     for groups in (32, 16, 8, 4, 2, 1):
         if channels % groups == 0:
@@ -3228,6 +3259,38 @@ def build_seg_head(in_channels, cfg):
         return CACDV1BaseHead(in_channels=in_channels, cfg=cfg)
     if head_type == "simple":
         return SimpleConvSegHead(in_channels)
+    if head_type == "lcic_linear":
+        # Reuse the untouched baseline implementation; only input geometry is
+        # selected by the train/eval entry points (native 37-grid, then resize).
+        return SimpleConvSegHead(in_channels)
+    if head_type == "lcic":
+        return LCICHead(
+            in_channels=in_channels,
+            use_consensus=bool(getattr(cfg, "LCIC_USE_CONSENSUS", True)),
+            use_innovation=bool(getattr(cfg, "LCIC_USE_INNOVATION", True)),
+            affinity_eps=float(getattr(cfg, "LCIC_AFFINITY_EPS", 1e-6)),
+            consensus_gain=float(getattr(cfg, "LCIC_CONSENSUS_GAIN", 1.0)),
+            innovation_gain=float(getattr(cfg, "LCIC_INNOVATION_GAIN", 1.0)),
+            adaptive_gate=bool(
+                getattr(cfg, "LCIC_ADAPTIVE_GATE_VARIANT", False)
+            ),
+            adaptive_gate_hidden=int(
+                getattr(cfg, "LCIC_ADAPTIVE_GATE_HIDDEN", 8)
+            ),
+            adaptive_gate_eps=float(
+                getattr(cfg, "LCIC_ADAPTIVE_GATE_EPS", 1e-6)
+            ),
+        )
+    if head_type == "lcic_dwlite":
+        return DWLiteHead(
+            in_channels=in_channels,
+            hidden_channels=int(getattr(cfg, "LCIC_DWLITE_CHANNELS", 16)),
+        )
+    if head_type == "lcic_conv3x3":
+        return Conv3x3LiteHead(
+            in_channels=in_channels,
+            hidden_channels=int(getattr(cfg, "LCIC_CONV3X3_CHANNELS", 16)),
+        )
     if head_type == "dba":
         return DBASegHead(
             in_channels=in_channels,
@@ -3248,6 +3311,36 @@ def build_seg_head(in_channels, cfg):
             affinity_detach=bool(getattr(cfg, "DAGP_AFFINITY_DETACH", True)),
             use_ffn=bool(getattr(cfg, "DAGP_USE_FFN", False)),
             use_dwconv=bool(getattr(cfg, "DAGP_USE_DWCONV", False)),
+        )
+    if head_type == "ndr_only":
+        return NDROnlyHead(
+            in_channels=in_channels,
+            ndr_loss_size=int(getattr(cfg, "LOSS_SIZE", 68)),
+            ndr_input_rgb=bool(getattr(cfg, "NDR_INPUT_RGB", True)),
+            ndr_input_sobel=bool(getattr(cfg, "NDR_INPUT_SOBEL", True)),
+            ndr_input_coarse_prob=bool(
+                getattr(cfg, "NDR_INPUT_COARSE_PROB", True)
+            ),
+            ndr_in_channels=int(getattr(cfg, "NDR_IN_CHANNELS", 5)),
+            ndr_hidden=int(getattr(cfg, "NDR_HIDDEN", 32)),
+            ndr_num_layers=int(getattr(cfg, "NDR_NUM_LAYERS", 3)),
+            ndr_use_gn=bool(getattr(cfg, "NDR_USE_GN", True)),
+            ndr_gn_groups=int(getattr(cfg, "NDR_GN_GROUPS", 4)),
+            ndr_act=str(getattr(cfg, "NDR_ACT", "gelu")),
+            ndr_zero_init_out=bool(getattr(cfg, "NDR_ZERO_INIT_OUT", True)),
+            ndr_residual_clip=float(getattr(cfg, "NDR_RESIDUAL_CLIP", 2.0)),
+            ndr_beta_max=float(getattr(cfg, "NDR_BETA_MAX", 0.10)),
+            ndr_warmup_epoch=int(getattr(cfg, "NDR_WARMUP_EPOCH", 6)),
+            ndr_ramp_start_epoch=int(getattr(cfg, "NDR_RAMP_START_EPOCH", 7)),
+            ndr_ramp_end_epoch=int(getattr(cfg, "NDR_RAMP_END_EPOCH", 15)),
+            ndr_use_uncertainty_gate=bool(
+                getattr(cfg, "NDR_USE_UNCERTAINTY_GATE", True)
+            ),
+            ndr_use_edge_gate=bool(getattr(cfg, "NDR_USE_EDGE_GATE", True)),
+            ndr_gate_mode=str(
+                getattr(cfg, "NDR_GATE_MODE", "uncertainty_edge_boost")
+            ),
+            ndr_version=str(getattr(cfg, "NDR_VERSION", "v1")),
         )
     if head_type == "dagp_safe":
         return DAGPSafeHead(

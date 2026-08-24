@@ -1,0 +1,13 @@
+experiment: gbsp_teaser_max_valid_background_v1
+core_root: workdir/gbsp_core_optimization/full_rank
+source_pairwise_root: workdir/27-gbsp_teaser_real/camo250
+official_gbsp_config: main/configs/dinov1_s8_gbsp_core_ablation.py
+
+dataset: CAMO
+patch_binary_threshold: 0.5
+patch_fg_core_threshold: 0.8
+patch_bg_core_threshold: 0.2
+similarity_bins: 80
+residual_bins: 50
+similarity_descriptive_thresholds: [0.5, 0.6, 0.7, 0.8, 0.9]
+random_seed: 2026

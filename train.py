@@ -52,6 +52,8 @@ from common.dabev2hard_static_only import (
     validate_dabev2hard_static_only_config,
 )
 from common.r1hard_linear_pure_student import (
+    is_gbsp_absmm_t058_dagp_only_pure_student_config,
+    is_gbsp_absmm_t058_ndr_only_pure_student_config,
     is_r1hard_dagp_ndr_pure_student_config,
     is_r1hard_linear_pure_student_config,
 )
@@ -1595,6 +1597,12 @@ def build_cvsa_segmentation_group(
 
 
 def is_finetune_reset_enabled(cfg):
+    # Static pure-Student experiments have no Teacher handover.  Keep this
+    # runtime gate even though their config audit also requires epoch=0, so a
+    # future derived config cannot accidentally re-enable optimizer/scheduler
+    # reset by overriding one legacy field.
+    if is_r1hard_linear_pure_student_config(cfg):
+        return False
     return get_reset_epoch(cfg) > 0
 
 
@@ -2072,10 +2080,147 @@ def uses_independent_dabe_v2_hard_source(source):
     }
 
 
+def format_dabe_clean_hard_thresholds(cfg):
+    configured = getattr(
+        cfg,
+        "DABE_CLEAN_DABE_V2_HARD_THRESHOLDS_BY_DATASET",
+        None,
+    )
+    if configured is None:
+        return (
+            "strict > "
+            f"{float(getattr(cfg, 'DABE_CLEAN_DABE_V2_HARD_THRESHOLD', 0.5)):g}"
+        )
+    return " / ".join(
+        f"{name}: strict > {float(threshold):g}"
+        for name, threshold in configured.items()
+    )
+
+
+def build_lcic_dataset_loss_weight(cfg, dataset_names, reference_tensor):
+    """Build normalized per-sample weights for the declared LCIC ablation."""
+
+    if not bool(getattr(cfg, "LCIC_DATASET_LOSS_WEIGHT_VARIANT", False)):
+        return None
+    if not bool(getattr(cfg, "GBSP_LCIC_V1", False)):
+        raise RuntimeError(
+            "LCIC dataset loss weights require GBSP_LCIC_V1=True."
+        )
+    configured = {
+        "TR-CAMO": float(getattr(cfg, "TR_CAMO_LOSS_WEIGHT", 1.0)),
+        "TR-COD10K": float(getattr(cfg, "TR_COD10K_LOSS_WEIGHT", 1.0)),
+    }
+    invalid = {
+        name: value
+        for name, value in configured.items()
+        if not math.isfinite(value) or value <= 0.0
+    }
+    if invalid:
+        raise ValueError(
+            f"LCIC dataset loss weights must be finite and positive: {invalid}."
+        )
+    names = [str(name) for name in dataset_names]
+    if len(names) != int(reference_tensor.shape[0]):
+        raise RuntimeError(
+            "LCIC dataset-name/sample count mismatch: "
+            f"{len(names)} != {int(reference_tensor.shape[0])}."
+        )
+    unknown = sorted(set(names).difference(configured))
+    if unknown:
+        raise RuntimeError(
+            f"LCIC dataset loss weights are undefined for: {unknown}."
+        )
+    return reference_tensor.new_tensor([configured[name] for name in names])
+
+
+_LEAN_PURE_STUDENT_LOG_PREFIXES = (
+    "train_start_time =",
+    "EXP_NAME =",
+    "device =",
+    "optimizer =",
+    "lr =",
+    "lr0 =",
+    "scheduler =",
+    "scheduler_step =",
+    "lr_policy =",
+    "use_lr_floor =",
+    "lr_floor =",
+    "lr_linear_stage1_epochs =",
+    "lr_linear_stage2_epochs =",
+    "lr_floor_mode =",
+    "max_epoch =",
+    "stop_after_epoch =",
+    "SAVE_EVERY_EPOCH =",
+    "SAVE_INTERVAL =",
+    "max_samples =",
+    "batch_size =",
+    "num_workers =",
+    "LCIC_initialization_equivalence_max_abs_error =",
+    "best MAE so far =",
+    "best epoch =",
+    "[Protocol]",
+    "[Supervision]",
+    "[FeatureInput]",
+    "[LossWeight]",
+    "[Data]",
+    "[Cache] feature:",
+    "[Cache] active",
+    "[LCIC Init]",
+    "[DWLite Init]",
+    "[Conv3x3 Init]",
+    "[LCIC StructuralOnly]",
+    "[Train]",
+    "[TrainArea]",
+    "[LCIC]",
+    "[DWLite]",
+    "[Conv3x3]",
+    "[Validation]",
+    "[LR Floor]",
+    "[Resume]",
+    "[StopAfterEpoch]",
+    "[Checkpoint]",
+    "[Debug Loader]",
+    "+",
+    "|",
+)
+
+
+def should_emit_lean_pure_student_log(text):
+    """Return whether a line belongs in a compact pure-Student train log.
+
+    The old training pipeline still computes several compatibility diagnostics.
+    They remain available to legacy experiments, but are intentionally hidden
+    from compact pure-Student logs because no Teacher/DABE routing is active.
+    """
+
+    message = str(text).lstrip()
+    if not message:
+        return False
+    first_line = message.splitlines()[0]
+    if "WARNING" in first_line or "ERROR" in first_line:
+        return True
+    return first_line.startswith(_LEAN_PURE_STUDENT_LOG_PREFIXES)
+
+
+class LeanPureStudentLogger:
+    """Filter a normal Logger without changing legacy experiment output."""
+
+    def __init__(self, logger):
+        self._logger = logger
+
+    def log(self, text=""):
+        if should_emit_lean_pure_student_log(text):
+            self._logger.log(text)
+
+    def __getattr__(self, name):
+        return getattr(self._logger, name)
+
+
 def build_dabe_clean_static_target(
     cfg,
     clean_target_68,
     selected_source_68,
+    hard_threshold=None,
 ):
     """Select only the Clean-path static BCE target.
 
@@ -2113,9 +2258,29 @@ def build_dabe_clean_static_target(
             )
         return clean_target
 
-    threshold = float(
-        getattr(cfg, "DABE_CLEAN_DABE_V2_HARD_THRESHOLD", 0.5)
-    )
+    if hard_threshold is None:
+        threshold = float(
+            getattr(cfg, "DABE_CLEAN_DABE_V2_HARD_THRESHOLD", 0.5)
+        )
+    else:
+        threshold = hard_threshold.detach().to(
+            device=selected_source.device,
+            dtype=selected_source.dtype,
+        )
+        if threshold.ndim == 1:
+            threshold = threshold.view(-1, 1, 1, 1)
+        if (
+            threshold.ndim != selected_source.ndim
+            or threshold.shape[0] != selected_source.shape[0]
+        ):
+            raise RuntimeError(
+                "Per-sample DABE-v2 hard threshold shape mismatch: "
+                f"{list(threshold.shape)} for source {list(selected_source.shape)}."
+            )
+        if not bool(torch.isfinite(threshold).all().item()) or bool(
+            ((threshold < 0.0) | (threshold > 1.0)).any().item()
+        ):
+            raise RuntimeError("Per-sample DABE-v2 hard thresholds must be in [0,1].")
     hard_target = (selected_source > threshold).float().detach()
     return hard_target
 
@@ -4065,6 +4230,8 @@ def apply_complex_head_lr_policy(optimizer, epoch, cfg):
 
 
 def should_step_iter_scheduler(epoch, cfg):
+    if use_step_then_floor_lr(cfg):
+        return int(epoch) <= get_step_then_floor_epochs(cfg)
     return not (
         use_linear_floor_two_stage_lr(cfg)
         or (
@@ -4090,6 +4257,34 @@ def get_base_lr(cfg):
 
 def use_linear_floor_two_stage_lr(cfg):
     return str(getattr(cfg, "LR_POLICY", "")).lower() == "linear_floor_two_stage"
+
+
+def use_step_then_floor_lr(cfg):
+    return str(getattr(cfg, "LR_POLICY", "")).lower() == "step_then_floor"
+
+
+def get_step_then_floor_epochs(cfg):
+    epochs = int(getattr(cfg, "LR_STEP_THEN_FLOOR_EPOCHS", 2))
+    if epochs < 1 or epochs >= int(cfg.MAX_EPOCH):
+        raise RuntimeError(
+            "LR_STEP_THEN_FLOOR_EPOCHS must be in [1, MAX_EPOCH), got "
+            f"{epochs}."
+        )
+    return epochs
+
+
+def apply_step_then_floor_lr(optimizer, epoch, cfg):
+    if not use_step_then_floor_lr(cfg):
+        return None
+    if int(epoch) <= get_step_then_floor_epochs(cfg):
+        return current_lr(optimizer)
+    lr_floor = float(getattr(cfg, "LR_FLOOR", 0.0))
+    if not math.isfinite(lr_floor) or lr_floor <= 0.0:
+        raise RuntimeError(
+            f"step_then_floor requires a positive finite LR_FLOOR, got {lr_floor}."
+        )
+    set_optimizer_lr(optimizer, lr_floor)
+    return lr_floor
 
 
 def compute_linear_floor_two_stage_lr(epoch, iter_idx, num_iters_per_epoch, cfg):
@@ -4120,10 +4315,61 @@ def compute_linear_floor_two_stage_lr(epoch, iter_idx, num_iters_per_epoch, cfg)
     return max(lr_floor, float(lr))
 
 
+def get_step_lr_params(cfg):
+    step_size = int(getattr(cfg, "LR_STEP_SIZE", 25))
+    gamma = float(getattr(cfg, "LR_STEP_GAMMA", 0.95))
+    if step_size <= 0:
+        raise RuntimeError(f"LR_STEP_SIZE must be positive, got {step_size}.")
+    if not 0.0 < gamma <= 1.0:
+        raise RuntimeError(
+            f"LR_STEP_GAMMA must be in (0, 1], got {gamma}."
+        )
+    return step_size, gamma
+
+
 def build_optimizer_scheduler(cfg, student, lr=None, cvsa_router=None):
     # 与 UCOD-DPL 对齐：AdamW + 每 iteration StepLR。
     actual_lr = float(cfg.DINO["lr"] if lr is None else lr)
-    parameter_groups = [{"params": student.parameters(), "lr": actual_lr}]
+    step_size, gamma = get_step_lr_params(cfg)
+    if bool(getattr(cfg, "LCIC_ADAPTIVE_GATE_VARIANT", False)):
+        named_parameters = [
+            (name, parameter)
+            for name, parameter in student.named_parameters()
+            if parameter.requires_grad
+        ]
+        gate_parameters = [
+            parameter
+            for name, parameter in named_parameters
+            if name.startswith("adaptive_gate.")
+            or ".adaptive_gate." in name
+        ]
+        base_parameters = [
+            parameter
+            for name, parameter in named_parameters
+            if not (
+                name.startswith("adaptive_gate.")
+                or ".adaptive_gate." in name
+            )
+        ]
+        if not gate_parameters or not base_parameters:
+            raise RuntimeError(
+                "LCIC adaptive-gate optimizer requires non-empty base and gate groups."
+            )
+        parameter_groups = [
+            {
+                "params": base_parameters,
+                "lr": actual_lr,
+                "group_name": "decoder_base",
+            },
+            {
+                "params": gate_parameters,
+                "lr": actual_lr,
+                "weight_decay": 0.0,
+                "group_name": "lcic_adaptive_gate",
+            },
+        ]
+    else:
+        parameter_groups = [{"params": student.parameters(), "lr": actual_lr}]
     if cvsa_router is not None:
         parameter_groups.append(
             {"params": cvsa_router.parameters(), "lr": actual_lr}
@@ -4131,8 +4377,8 @@ def build_optimizer_scheduler(cfg, student, lr=None, cvsa_router=None):
     optimizer = torch.optim.AdamW(parameter_groups, lr=actual_lr)
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer,
-        step_size=25,
-        gamma=0.95,
+        step_size=step_size,
+        gamma=gamma,
     )
     return optimizer, scheduler
 
@@ -4171,6 +4417,10 @@ def apply_finetune_reset(
     lr_floor_activated_logged,
     cvsa_router=None,
 ):
+    if is_r1hard_linear_pure_student_config(cfg):
+        raise RuntimeError(
+            "Finetune reset is permanently disabled for pure-Student training."
+        )
     rebuild_optimizer = bool(getattr(cfg, "FINETUNE_RESET_REBUILD_OPTIMIZER", True))
     rebuild_scheduler = bool(getattr(cfg, "FINETUNE_RESET_REBUILD_SCHEDULER", True))
     reset_global_step = bool(getattr(cfg, "FINETUNE_RESET_GLOBAL_STEP", True))
@@ -4183,10 +4433,11 @@ def apply_finetune_reset(
             cvsa_router=cvsa_router,
         )
     elif rebuild_scheduler:
+        step_size, gamma = get_step_lr_params(cfg)
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer,
-            step_size=25,
-            gamma=0.95,
+            step_size=step_size,
+            gamma=gamma,
         )
     if reset_global_step:
         global_step = 0
@@ -4212,16 +4463,27 @@ def apply_finetune_reset(
             )
             lr_floor_activated_logged = True
     force_lr_floor = bool(getattr(cfg, "FINETUNE_RESET_FORCE_LR_FLOOR", False))
-    logger.log(
-        f"[FinetuneReset] epoch={int(epoch):03d} | "
-        f"timing={finetune_reset_timing(cfg)} | "
-        f"rebuild_optimizer={rebuild_optimizer} | "
-        f"rebuild_scheduler={rebuild_scheduler} | "
-        f"reset_global_step={reset_global_step} | "
-        f"reset_teacher={reset_teacher} | "
-        f"force_lr_floor={force_lr_floor} | "
-        f"lr_after_reset={current_lr(optimizer):.8f}"
-    )
+    if is_r1hard_linear_pure_student_config(cfg) and use_lcic_experiment(cfg):
+        logger.log(
+            f"[FinetuneReset] epoch={int(epoch):03d} | "
+            f"timing={finetune_reset_timing(cfg)} | "
+            f"rebuild_optimizer={rebuild_optimizer} | "
+            f"rebuild_scheduler={rebuild_scheduler} | "
+            f"reset_global_step={reset_global_step} | "
+            f"force_lr_floor={force_lr_floor} | "
+            f"lr_after_reset={current_lr(optimizer):.8f}"
+        )
+    else:
+        logger.log(
+            f"[FinetuneReset] epoch={int(epoch):03d} | "
+            f"timing={finetune_reset_timing(cfg)} | "
+            f"rebuild_optimizer={rebuild_optimizer} | "
+            f"rebuild_scheduler={rebuild_scheduler} | "
+            f"reset_global_step={reset_global_step} | "
+            f"reset_teacher={reset_teacher} | "
+            f"force_lr_floor={force_lr_floor} | "
+            f"lr_after_reset={current_lr(optimizer):.8f}"
+        )
     return optimizer, scheduler, global_step, lr_floor_activated_logged
 
 
@@ -4261,6 +4523,10 @@ def use_dagp_safe_head(cfg):
     return str(getattr(cfg, "HEAD_TYPE", "simple")).lower() in {"dagp_safe", "dagp_safe_csd_v1r"}
 
 
+def use_ndr_only_head(cfg):
+    return str(getattr(cfg, "HEAD_TYPE", "simple")).lower() == "ndr_only"
+
+
 def use_csd_head(cfg):
     return str(getattr(cfg, "HEAD_TYPE", "simple")).lower() == "csd_v1"
 
@@ -4292,6 +4558,130 @@ def use_dba_head(cfg):
         str(getattr(cfg, "HEAD_TYPE", "simple")).strip().lower() == "dba"
         and bool(getattr(cfg, "DABEV2HARD_R1_DBA", False))
     )
+
+
+def use_lcic_experiment(cfg):
+    return bool(getattr(cfg, "GBSP_LCIC_V1", False))
+
+
+def _unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def apply_lcic_structural_only_freeze(cfg, model):
+    """Freeze the restored linear anchor while keeping LCIC corrections active."""
+
+    if not bool(getattr(cfg, "LCIC_STRUCTURAL_ONLY_E3", False)):
+        return None
+    if not use_lcic_experiment(cfg) or str(
+        getattr(cfg, "LCIC_VARIANT", "")
+    ).lower() != "d_full":
+        raise RuntimeError(
+            "LCIC structural-only training requires LCIC_VARIANT='d_full'."
+        )
+
+    target = _unwrap_model(model)
+    parameters = dict(target.named_parameters())
+    frozen_names = {"anchor.weight", "anchor.bias"}
+    active_names = {"alpha", "beta", "innovation_head.weight"}
+    expected_names = frozen_names | active_names
+    if set(parameters) != expected_names:
+        raise RuntimeError(
+            "LCIC structural-only parameter contract mismatch: "
+            f"actual={sorted(parameters)}, expected={sorted(expected_names)}."
+        )
+
+    for name, parameter in parameters.items():
+        parameter.requires_grad_(name in active_names)
+        parameter.grad = None
+    frozen_params = sum(parameters[name].numel() for name in frozen_names)
+    active_params = sum(parameters[name].numel() for name in active_names)
+    if frozen_params != 385 or active_params != 386:
+        raise RuntimeError(
+            "LCIC structural-only parameter count mismatch: "
+            f"frozen={frozen_params}, active={active_params}."
+        )
+    return {
+        "frozen_names": tuple(sorted(frozen_names)),
+        "active_names": tuple(sorted(active_names)),
+        "frozen_params": frozen_params,
+        "active_params": active_params,
+    }
+
+
+def validate_lcic_structural_only_resume_checkpoint(cfg, checkpoint):
+    """Reject any checkpoint other than the declared seed-2027 epoch-3 fork."""
+
+    if not bool(getattr(cfg, "LCIC_STRUCTURAL_ONLY_E3", False)):
+        return None
+    required_epoch = int(
+        getattr(cfg, "LCIC_STRUCTURAL_ONLY_REQUIRED_RESUME_EPOCH", -1)
+    )
+    saved_epoch = int(checkpoint.get("epoch", -1))
+    if saved_epoch != required_epoch:
+        raise RuntimeError(
+            "LCIC structural-only fork requires resume epoch "
+            f"{required_epoch}, got {saved_epoch}."
+        )
+    source_config = checkpoint.get("config", {})
+    source_exp = (
+        str(source_config.get("EXP_NAME", ""))
+        if isinstance(source_config, dict)
+        else ""
+    )
+    required_source_exp = str(
+        getattr(cfg, "LCIC_STRUCTURAL_ONLY_REQUIRED_SOURCE_EXP", "")
+    )
+    if source_exp != required_source_exp:
+        raise RuntimeError(
+            "LCIC structural-only fork source mismatch: "
+            f"{source_exp!r} != {required_source_exp!r}."
+        )
+    if int(getattr(cfg, "STOP_AFTER_EPOCH", 0)) != required_epoch + 1:
+        raise RuntimeError(
+            "LCIC structural-only fork must stop after exactly one resumed epoch."
+        )
+    return {
+        "saved_epoch": saved_epoch,
+        "source_exp": source_exp,
+        "stop_after_epoch": required_epoch + 1,
+    }
+
+
+def reset_lcic_epoch_diagnostics(model):
+    target = _unwrap_model(model)
+    if hasattr(target, "reset_epoch_diagnostics"):
+        target.reset_epoch_diagnostics()
+
+
+def get_lcic_epoch_diagnostics(model):
+    target = _unwrap_model(model)
+    if hasattr(target, "epoch_diagnostics"):
+        return target.epoch_diagnostics()
+    return {
+        "batches": 0,
+        "adaptive_gate_enabled": False,
+        "gate_samples": 0,
+        "alpha": 0.0,
+        "beta": 0.0,
+        "consensus_gain": 1.0,
+        "innovation_gain": 1.0,
+        "effective_alpha": 0.0,
+        "effective_beta": 0.0,
+        "anchor_abs_mean": 0.0,
+        "consensus_delta_abs_mean": 0.0,
+        "innovation_logit_abs_mean": 0.0,
+        "weighted_consensus_abs_mean": 0.0,
+        "weighted_innovation_abs_mean": 0.0,
+        "consensus_gate_mean": 0.0,
+        "consensus_gate_std": 0.0,
+        "consensus_gate_min": 0.0,
+        "consensus_gate_max": 0.0,
+        "innovation_gate_mean": 0.0,
+        "innovation_gate_std": 0.0,
+        "innovation_gate_min": 0.0,
+        "innovation_gate_max": 0.0,
+    }
 
 
 def use_last4_linear_probe(cfg):
@@ -4379,9 +4769,14 @@ def use_raw_feature_head(cfg):
     return str(getattr(cfg, "HEAD_TYPE", "simple")).lower() in {
         "dagp",
         "dagp_safe",
+        "ndr_only",
         "csd_v1",
         "dagp_safe_csd_v1r",
         "cacd_v1_base",
+        "lcic_linear",
+        "lcic",
+        "lcic_dwlite",
+        "lcic_conv3x3",
     }
 
 
@@ -4496,6 +4891,8 @@ def forward_seg_head(
             pa_compare_original=pa_compare_original,
             return_eaogp_aux=return_eaogp_aux,
         )
+    if use_ndr_only_head(cfg):
+        return model(model_input, image_68=image_68, return_aux=return_aux)
     return model(model_input)
 
 
@@ -4563,6 +4960,20 @@ def make_model_input(cfg, batch, device, online_dino=None):
 
 
 def make_single_feature_model_input(cfg, feature):
+    if bool(getattr(cfg, "SIMPLE_FEATURE_L2_NORMALIZE", False)):
+        scale = float(getattr(cfg, "SIMPLE_FEATURE_L2_SCALE", 1.0))
+        eps = float(getattr(cfg, "SIMPLE_FEATURE_L2_EPS", 1e-12))
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise RuntimeError(
+                "SIMPLE_FEATURE_L2_SCALE must be finite and positive, got "
+                f"{scale}."
+            )
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise RuntimeError(
+                "SIMPLE_FEATURE_L2_EPS must be finite and positive, got "
+                f"{eps}."
+            )
+        feature = F.normalize(feature, p=2, dim=1, eps=eps) * scale
     if use_raw_feature_head(cfg):
         return feature
     return F.interpolate(feature, size=(cfg.LOSS_SIZE, cfg.LOSS_SIZE), mode="bilinear")
@@ -5215,17 +5626,373 @@ def weighted_bce_with_logits(logits, target, weight_map, eps=1e-6):
     return loss.sum() / (weight_map.sum() + float(eps))
 
 
-def dabe_static_bce_with_logits(logits, target, weight_map, cfg, eps=1e-6):
-    """Keep legacy PU weighting intact while making Clean BCE truly unweighted."""
+def use_gbsp_confidence_bce(cfg):
+    return bool(getattr(cfg, "GBSP_CONFIDENCE_BCE_VARIANT", False))
+
+
+def use_gbsp_ssboc_loss(cfg):
+    return bool(getattr(cfg, "GBSP_SSBOC_VARIANT", False))
+
+
+def gbsp_bias_orthogonal_correlation(
+    logits,
+    continuous_score,
+    eps=1e-6,
+    *,
+    return_valid=False,
+):
+    """Per-image Pearson correlation after removing the logit bias mode."""
+
+    if tuple(logits.shape) != tuple(continuous_score.shape):
+        raise RuntimeError(
+            "SSBOC logit/continuous-score shape mismatch: "
+            f"{list(logits.shape)} != {list(continuous_score.shape)}."
+        )
+    if logits.ndim < 2:
+        raise RuntimeError(
+            f"SSBOC tensors must include batch/spatial dims, got {list(logits.shape)}."
+        )
+    score = continuous_score.detach().to(
+        device=logits.device,
+        dtype=logits.dtype,
+    )
+    if not bool(torch.isfinite(score).all().item()) or not bool(
+        ((score >= 0.0) & (score <= 1.0)).all().item()
+    ):
+        raise RuntimeError(
+            "SSBOC continuous GBSP score must be detached, finite, and in [0,1]."
+        )
+    logit_flat = logits.flatten(1)
+    score_flat = score.flatten(1)
+    logit_centered = logit_flat - logit_flat.mean(dim=1, keepdim=True)
+    score_centered = score_flat - score_flat.mean(dim=1, keepdim=True)
+    numerator = (logit_centered * score_centered).sum(dim=1)
+    logit_energy = logit_centered.square().sum(dim=1)
+    score_energy = score_centered.square().sum(dim=1)
+    valid = ((logit_energy > float(eps)) & (score_energy > float(eps))).detach()
+    denominator = torch.sqrt(
+        logit_energy.clamp_min(float(eps))
+        * score_energy.clamp_min(float(eps))
+    )
+    raw_correlation = (numerator / denominator).clamp(-1.0, 1.0)
+    correlation = torch.where(valid, raw_correlation, torch.zeros_like(raw_correlation))
+    if not bool(torch.isfinite(correlation).all().item()):
+        raise RuntimeError("SSBOC correlation contains NaN/Inf.")
+    if return_valid:
+        return correlation, valid
+    return correlation
+
+
+def gbsp_ssboc_static_loss(
+    logits,
+    hard_target,
+    continuous_score,
+    weight_map,
+    cfg,
+    eps=1e-6,
+    sample_weight=None,
+):
+    """Parameter-free self-scaled bias-orthogonal correlation supervision."""
+
+    if not use_gbsp_ssboc_loss(cfg):
+        raise RuntimeError("SSBOC loss requires GBSP_SSBOC_VARIANT=True.")
+    if use_gbsp_confidence_bce(cfg):
+        raise RuntimeError("SSBOC and confidence-weighted BCE are mutually exclusive.")
+    if sample_weight is not None:
+        raise RuntimeError(
+            "SSBOC control must retain uniform per-image dataset weighting."
+        )
+    if tuple(logits.shape) != tuple(hard_target.shape) or tuple(
+        hard_target.shape
+    ) != tuple(continuous_score.shape):
+        raise RuntimeError(
+            "SSBOC logits/target/score shapes must match exactly: "
+            f"{list(logits.shape)}/{list(hard_target.shape)}/"
+            f"{list(continuous_score.shape)}."
+        )
+    if hard_target.requires_grad or continuous_score.requires_grad:
+        raise RuntimeError("SSBOC target and continuous score must be detached.")
+    if not bool(torch.isfinite(hard_target).all().item()) or not torch.equal(
+        hard_target,
+        hard_target.bool().to(dtype=hard_target.dtype),
+    ):
+        raise RuntimeError("SSBOC hard target must be finite and binary.")
+    score = continuous_score.detach().to(
+        device=logits.device,
+        dtype=logits.dtype,
+    )
+    expected_target = (score > 0.50).to(dtype=hard_target.dtype)
+    if not torch.equal(hard_target, expected_target):
+        raise RuntimeError(
+            "SSBOC hard target must exactly equal 1[continuous GBSP score > 0.50]."
+        )
+    if weight_map is None or weight_map.requires_grad or not torch.equal(
+        weight_map,
+        torch.ones_like(weight_map),
+    ):
+        raise RuntimeError(
+            "SSBOC control must retain the baseline all-one static BCE map."
+        )
+    if not bool(getattr(cfg, "LCIC_SOFT_DICE_VARIANT", False)):
+        raise RuntimeError("SSBOC control requires the matched Soft-Dice term.")
+    dice_weight = float(getattr(cfg, "LCIC_SOFT_DICE_WEIGHT", 0.0))
+    if not math.isfinite(dice_weight) or dice_weight <= 0.0:
+        raise RuntimeError(
+            f"SSBOC Soft-Dice weight must be finite and positive, got {dice_weight}."
+        )
+
+    bce_per_image = F.binary_cross_entropy_with_logits(
+        logits,
+        hard_target,
+        reduction="none",
+    ).flatten(1).mean(dim=1)
+    probability = torch.sigmoid(logits)
+    reduce_dims = tuple(range(1, logits.ndim))
+    intersection = (probability * hard_target).sum(dim=reduce_dims)
+    denominator = (probability + hard_target).sum(dim=reduce_dims)
+    dice_per_image = 1.0 - (
+        (2.0 * intersection + float(eps))
+        / (denominator + float(eps))
+    )
+    base_per_image = bce_per_image + dice_weight * dice_per_image
+    correlation, correlation_valid = gbsp_bias_orthogonal_correlation(
+        logits,
+        score,
+        eps=eps,
+        return_valid=True,
+    )
+    correlation_penalty = torch.where(
+        correlation_valid,
+        1.0 - correlation,
+        torch.zeros_like(correlation),
+    )
+    auxiliary_per_image = base_per_image.detach() * correlation_penalty
+    total_per_image = base_per_image + auxiliary_per_image
+    total_loss = total_per_image.mean()
+    if not bool(torch.isfinite(total_loss).item()):
+        raise RuntimeError("SSBOC total loss contains NaN/Inf.")
+    stats = {
+        "correlation_mean": float(correlation.detach().mean().item()),
+        "correlation_min": float(correlation.detach().min().item()),
+        "correlation_max": float(correlation.detach().max().item()),
+        "valid_ratio": float(correlation_valid.float().mean().item()),
+        "base_loss": float(base_per_image.detach().mean().item()),
+        "correlation_penalty": float(
+            correlation_penalty.detach().mean().item()
+        ),
+        "auxiliary_loss": float(auxiliary_per_image.detach().mean().item()),
+        "total_loss": float(total_loss.detach().item()),
+    }
+    return total_loss, stats
+
+
+def build_gbsp_confidence_bce_weight_map(
+    score,
+    hard_target,
+    threshold,
+    cfg,
+    eps=1e-6,
+):
+    """Build detached GBSP-confidence weights without changing class mass."""
+
+    if tuple(score.shape) != tuple(hard_target.shape):
+        raise RuntimeError(
+            "GBSP confidence score/target shape mismatch: "
+            f"{list(score.shape)} != {list(hard_target.shape)}."
+        )
+    score = score.detach().to(dtype=hard_target.dtype)
+    hard_target = hard_target.detach()
+    if score.ndim < 2:
+        raise RuntimeError(
+            f"GBSP confidence tensors must include batch/spatial dims, got {list(score.shape)}."
+        )
+    if not bool(torch.isfinite(score).all().item()) or not bool(
+        ((score >= 0.0) & (score <= 1.0)).all().item()
+    ):
+        raise RuntimeError("GBSP confidence score must be finite and in [0,1].")
+    if not bool(torch.isfinite(hard_target).all().item()) or not torch.equal(
+        hard_target, hard_target.bool().to(dtype=hard_target.dtype)
+    ):
+        raise RuntimeError("GBSP confidence hard target must be finite and binary.")
+
+    threshold_tensor = torch.as_tensor(
+        threshold,
+        device=score.device,
+        dtype=score.dtype,
+    )
+    if threshold_tensor.numel() == 1:
+        threshold_tensor = threshold_tensor.reshape(
+            *([1] * score.ndim)
+        ).expand(score.shape[0], *([1] * (score.ndim - 1)))
+    elif threshold_tensor.numel() == score.shape[0]:
+        threshold_tensor = threshold_tensor.reshape(
+            score.shape[0], *([1] * (score.ndim - 1))
+        )
+    else:
+        raise RuntimeError(
+            "GBSP confidence threshold must be scalar or one value per image, "
+            f"got shape {list(threshold_tensor.shape)} for batch {score.shape[0]}."
+        )
+    if not bool(torch.isfinite(threshold_tensor).all().item()) or not bool(
+        ((threshold_tensor > 0.0) & (threshold_tensor < 1.0)).all().item()
+    ):
+        raise RuntimeError("GBSP confidence threshold must be finite and in (0,1).")
+    expected_hard = (score > threshold_tensor).to(dtype=hard_target.dtype)
+    if not torch.equal(hard_target, expected_hard):
+        raise RuntimeError(
+            "GBSP confidence hard target must exactly equal 1[score > threshold]."
+        )
+
+    floor = float(getattr(cfg, "GBSP_CONFIDENCE_BCE_FLOOR", 0.50))
+    gamma = float(getattr(cfg, "GBSP_CONFIDENCE_BCE_GAMMA", 1.0))
+    if not math.isfinite(floor) or not (0.0 < floor <= 1.0):
+        raise RuntimeError(
+            f"GBSP_CONFIDENCE_BCE_FLOOR must be in (0,1], got {floor}."
+        )
+    if not math.isfinite(gamma) or gamma <= 0.0:
+        raise RuntimeError(
+            f"GBSP_CONFIDENCE_BCE_GAMMA must be finite and positive, got {gamma}."
+        )
+
+    positive_distance = (score - threshold_tensor) / (
+        1.0 - threshold_tensor
+    ).clamp_min(float(eps))
+    negative_distance = (threshold_tensor - score) / threshold_tensor.clamp_min(
+        float(eps)
+    )
+    confidence = torch.where(
+        hard_target > 0.5,
+        positive_distance,
+        negative_distance,
+    ).clamp(0.0, 1.0)
+    raw_weight = floor + (1.0 - floor) * confidence.pow(gamma)
+
+    if bool(
+        getattr(cfg, "GBSP_CONFIDENCE_BCE_CLASSWISE_NORMALIZE", True)
+    ):
+        reduce_dims = tuple(range(1, score.ndim))
+        weight_map = torch.zeros_like(raw_weight)
+        for positive in (False, True):
+            class_mask = (
+                hard_target > 0.5 if positive else hard_target <= 0.5
+            )
+            class_float = class_mask.to(dtype=raw_weight.dtype)
+            class_count = class_float.sum(dim=reduce_dims, keepdim=True)
+            class_mean = (
+                (raw_weight * class_float).sum(dim=reduce_dims, keepdim=True)
+                / class_count.clamp_min(1.0)
+            ).clamp_min(float(eps))
+            weight_map = torch.where(
+                class_mask,
+                raw_weight / class_mean,
+                weight_map,
+            )
+    else:
+        weight_map = raw_weight
+
+    weight_map = weight_map.detach()
+    if weight_map.requires_grad or not bool(torch.isfinite(weight_map).all().item()):
+        raise RuntimeError("GBSP confidence weight map must be finite and detached.")
+    if not bool((weight_map > 0.0).all().item()):
+        raise RuntimeError("GBSP confidence weight map must be strictly positive.")
+    return weight_map
+
+
+def lcic_soft_dice_loss(logits, target, eps=1e-6, sample_weight=None):
+    """Per-image soft Dice loss used only by the declared LCIC ablation."""
+
+    if tuple(logits.shape) != tuple(target.shape):
+        raise RuntimeError(
+            "LCIC soft-Dice logits/target shape mismatch: "
+            f"{list(logits.shape)} != {list(target.shape)}."
+        )
+    prob = torch.sigmoid(logits)
+    reduce_dims = tuple(range(1, logits.ndim))
+    intersection = (prob * target).sum(dim=reduce_dims)
+    denominator = (prob + target).sum(dim=reduce_dims)
+    per_sample = 1.0 - (
+        (2.0 * intersection + float(eps))
+        / (denominator + float(eps))
+    )
+    if sample_weight is None:
+        return per_sample.mean()
+    weight = sample_weight.to(device=logits.device, dtype=logits.dtype)
+    if weight.ndim != 1 or int(weight.shape[0]) != int(logits.shape[0]):
+        raise RuntimeError(
+            "LCIC soft-Dice sample-weight shape mismatch: "
+            f"{list(weight.shape)} for batch {int(logits.shape[0])}."
+        )
+    return (per_sample * weight).sum() / weight.sum().clamp_min(float(eps))
+
+
+def add_lcic_soft_dice_loss(
+    bce_loss,
+    logits,
+    target,
+    cfg,
+    *,
+    eps=1e-6,
+    sample_weight=None,
+):
+    if not bool(getattr(cfg, "LCIC_SOFT_DICE_VARIANT", False)):
+        return bce_loss
+    if not (
+        bool(getattr(cfg, "GBSP_LCIC_V1", False))
+        or bool(getattr(cfg, "GBSP_LINEAR_SOFT_DICE_CONTROL", False))
+    ):
+        raise RuntimeError(
+            "Soft-Dice loss requires either GBSP_LCIC_V1=True or the "
+            "audited GBSP_LINEAR_SOFT_DICE_CONTROL=True."
+        )
+    weight = float(getattr(cfg, "LCIC_SOFT_DICE_WEIGHT", 0.0))
+    if not math.isfinite(weight) or weight <= 0.0:
+        raise RuntimeError(
+            "LCIC_SOFT_DICE_WEIGHT must be finite and positive, "
+            f"got {weight}."
+        )
+    dice = lcic_soft_dice_loss(
+        logits,
+        target,
+        eps=eps,
+        sample_weight=sample_weight,
+    )
+    return bce_loss + weight * dice
+
+
+def dabe_static_bce_with_logits(
+    logits,
+    target,
+    weight_map,
+    cfg,
+    eps=1e-6,
+    sample_weight=None,
+):
+    """Apply the declared Clean/static BCE variant and optional soft Dice."""
     if bool(getattr(cfg, "USE_DABE_CLEAN", False)):
         if str(getattr(cfg, "DABE_CLEAN_VERSION", "")) == "v3_offline_consolidation":
             if weight_map is not None:
                 raise RuntimeError(
                     "Pure-offline DABE-Clean must not construct a static pixel map."
                 )
-            return F.binary_cross_entropy_with_logits(logits, target, reduction="mean")
+            loss_map = F.binary_cross_entropy_with_logits(
+                logits, target, reduction="none"
+            )
+            if sample_weight is None:
+                bce_loss = loss_map.mean()
+            else:
+                per_sample = loss_map.flatten(1).mean(dim=1)
+                weight = sample_weight.to(device=logits.device, dtype=logits.dtype)
+                bce_loss = (per_sample * weight).sum() / weight.sum()
+            return add_lcic_soft_dice_loss(
+                bce_loss,
+                logits,
+                target,
+                cfg,
+                eps=eps,
+                sample_weight=sample_weight,
+            )
         if weight_map is None:
-            raise RuntimeError("DABE-Clean requires an internal all-one diagnostic map.")
+            raise RuntimeError("DABE-Clean requires its declared static weight map.")
         if weight_map.requires_grad:
             raise RuntimeError("DABE-Clean diagnostic weight map must be detached.")
         if tuple(weight_map.shape) != tuple(target.shape):
@@ -5233,9 +6000,61 @@ def dabe_static_bce_with_logits(logits, target, weight_map, cfg, eps=1e-6):
                 "DABE-Clean target/diagnostic-map shape mismatch: "
                 f"{list(target.shape)} != {list(weight_map.shape)}"
             )
-        if not bool(torch.all(weight_map == 1.0).item()):
+        loss_map = F.binary_cross_entropy_with_logits(
+            logits, target, reduction="none"
+        )
+        confidence_bce = use_gbsp_confidence_bce(cfg)
+        if confidence_bce:
+            if not bool(torch.isfinite(weight_map).all().item()) or not bool(
+                (weight_map > 0.0).all().item()
+            ):
+                raise RuntimeError(
+                    "GBSP confidence BCE requires a finite positive weight map."
+                )
+            loss_map = loss_map * weight_map.to(
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+        elif not bool(torch.all(weight_map == 1.0).item()):
             raise RuntimeError("DABE-Clean static BCE must not consume a non-unit map.")
-        return F.binary_cross_entropy_with_logits(logits, target, reduction="mean")
+        if sample_weight is None:
+            return add_lcic_soft_dice_loss(
+                loss_map.mean(),
+                logits,
+                target,
+                cfg,
+                eps=eps,
+            )
+        if sample_weight.requires_grad:
+            raise RuntimeError("LCIC dataset loss weights must be detached.")
+        if sample_weight.ndim != 1 or int(sample_weight.shape[0]) != int(
+            logits.shape[0]
+        ):
+            raise RuntimeError(
+                "LCIC dataset loss weight shape mismatch: "
+                f"{list(sample_weight.shape)} for batch {int(logits.shape[0])}."
+            )
+        weight = sample_weight.to(device=logits.device, dtype=logits.dtype)
+        if not bool(torch.isfinite(weight).all().item()) or not bool(
+            (weight > 0.0).all().item()
+        ):
+            raise RuntimeError(
+                "LCIC dataset loss weights must be finite and positive."
+            )
+        per_sample = loss_map.flatten(1).mean(dim=1)
+        bce_loss = (per_sample * weight).sum() / weight.sum()
+        return add_lcic_soft_dice_loss(
+            bce_loss,
+            logits,
+            target,
+            cfg,
+            eps=eps,
+            sample_weight=weight,
+        )
+    if sample_weight is not None:
+        raise RuntimeError(
+            "Per-dataset sample weighting is implemented only for DABE-Clean BCE."
+        )
     return weighted_bce_with_logits(logits, target, weight_map, eps=eps)
 
 
@@ -14280,9 +15099,19 @@ def log_cache_summary(logger, cfg, train_dataset):
                 f"{getattr(cfg, 'DABE_CLEAN_DABE_V2_SOURCE_KEY', 'p_dabe_68')}"
             )
             logger.log(
-                "DABE-v2 static threshold operator = strict > "
-                f"{float(getattr(cfg, 'DABE_CLEAN_DABE_V2_HARD_THRESHOLD', 0.5)):g}"
+                "DABE-v2 static threshold operator = "
+                f"{format_dabe_clean_hard_thresholds(cfg)}"
             )
+            dataset_thresholds = getattr(
+                cfg,
+                "DABE_CLEAN_DABE_V2_HARD_THRESHOLDS_BY_DATASET",
+                None,
+            )
+            if dataset_thresholds is not None:
+                logger.log(
+                    "DABE-v2 static thresholds by dataset = "
+                    f"{dataset_thresholds}"
+                )
     if getattr(cfg, "USE_TCE", False):
         logger.log(f"TCE cover cache path = {train_dataset.tce_cover_cache_root}")
         logger.log(f"first TCE cover file = {train_dataset.tce_cover_first_cache_path}")
@@ -16185,6 +17014,11 @@ def main():
         raise ValueError("--resume cannot be combined with --debug_loader_only.")
 
     cfg = load_config(args.config)
+    if bool(getattr(cfg, "LCIC_STRUCTURAL_ONLY_E3", False)) and not args.resume:
+        raise RuntimeError(
+            "LCIC structural-only epoch-3 fork is resume-only; pass the "
+            "declared epoch_003.pth checkpoint with --resume."
+        )
     ecst_causal_control_mode = get_ecst_causal_control_mode(cfg)
     if ecst_causal_control_mode != "none":
         causal_baseline_path = Path(__file__).resolve().parent / "configs" / (
@@ -16228,6 +17062,12 @@ def main():
     r1_only_cache_io = bool(getattr(cfg, "R1_ONLY_CACHE_IO", False))
     r1hard_dagp_ndr_pure_student = (
         is_r1hard_dagp_ndr_pure_student_config(cfg)
+    )
+    gbsp_t058_dagp_only_pure_student = (
+        is_gbsp_absmm_t058_dagp_only_pure_student_config(cfg)
+    )
+    gbsp_t058_ndr_only_pure_student = (
+        is_gbsp_absmm_t058_ndr_only_pure_student_config(cfg)
     )
     if pure_student_static_only and dabev2hard_static_only_audit is None:
         raise RuntimeError(
@@ -16866,11 +17706,24 @@ def main():
             "FINETUNE_RESET_EPOCH": (
                 0
                 if bool(getattr(cfg, "R1_FORMAL_ONLINE_V1", False))
+                or bool(
+                    getattr(
+                        cfg,
+                        "PURE_STUDENT_RESET_PERMANENTLY_DISABLED",
+                        False,
+                    )
+                )
                 else 20
             ),
             "FINETUNE_RESET_TIMING": "after_epoch",
             "DABE_PU_DESPL_TEACHER_ONLY_START": 21,
-            "LOSS_SIZE": 68,
+            "LOSS_SIZE": (
+                64
+                if bool(
+                    getattr(cfg, "GBSP512C_T060_NATIVE64_LINEAR", False)
+                )
+                else 68
+            ),
         }
         mismatched_clean = {
             name: getattr(cfg, name, None)
@@ -16908,9 +17761,28 @@ def main():
             )
             expected_hard_threshold = (
                 (
-                    0.58
-                    if bool(getattr(cfg, "GBSP_ABSMM_T058_LINEAR", False))
-                    else 0.63
+                    0.5
+                    if bool(getattr(cfg, "GBSP_ABSMM_T050_LINEAR", False))
+                    else (
+                        0.60
+                        if bool(
+                            getattr(cfg, "GBSP_ABSMM_T060_LINEAR", False)
+                        )
+                        else (
+                            0.58
+                            if (
+                                bool(getattr(cfg, "GBSP_ABSMM_T058_LINEAR", False))
+                                or bool(getattr(cfg, "GBSP_LCIC_V1", False))
+                                or bool(
+                                    getattr(cfg, "GBSP_ABSMM_T058_DAGP_ONLY", False)
+                                )
+                                or bool(
+                                    getattr(cfg, "GBSP_ABSMM_T058_NDR_ONLY", False)
+                                )
+                            )
+                            else 0.63
+                        )
+                    )
                 )
                 if clean_static_target_source == "gbsp_abs_minmax_hard_68"
                 else 0.5
@@ -17406,6 +18278,13 @@ def main():
     reset_epoch = get_reset_epoch(cfg)
     reset_enabled = is_finetune_reset_enabled(cfg)
     default_pre_reset_epochs = reset_epoch - 1 if reset_enabled else max_epoch
+    lean_pure_student_logging = (
+        pure_student_static_only
+        and (
+            use_lcic_experiment(cfg)
+            or bool(getattr(cfg, "LEAN_PURE_STUDENT_LOGGING", False))
+        )
+    )
     set_seed(int(cfg.SEED))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -17455,11 +18334,88 @@ def main():
     ensure_dir(ckpt_dir)
     write_yaml(train_dir / "config.yaml", config_to_dict(cfg))
 
-    with Logger(train_dir / "train.log") as logger:
+    with Logger(train_dir / "train.log") as base_logger:
+        logger = (
+            LeanPureStudentLogger(base_logger)
+            if lean_pure_student_logging
+            else base_logger
+        )
         gkd_mode = get_gkd_mode(cfg)
         logger.log(f"train_start_time = {current_time_text()}")
         logger.log(f"EXP_NAME = {cfg.EXP_NAME}")
         logger.log(f"device = {device}")
+        if lean_pure_student_logging:
+            decoder_name = (
+                (
+                    "dw_lite_c"
+                    f"{int(getattr(cfg, 'LCIC_DWLITE_CHANNELS', 16))}_feature_decoder"
+                    if str(getattr(cfg, "LCIC_VARIANT", "")).lower()
+                    == "e_dwlite"
+                    else "conv3x3_lite_c"
+                    f"{int(getattr(cfg, 'LCIC_CONV3X3_CHANNELS', 16))}_feature_decoder"
+                    if str(getattr(cfg, "LCIC_VARIANT", "")).lower()
+                    == "f_conv3x3"
+                    else f"lcic_{str(getattr(cfg, 'LCIC_VARIANT')).lower()}"
+                )
+                if use_lcic_experiment(cfg)
+                else "single_1x1_conv"
+            )
+            bce_loss_name = (
+                "GBSPConfidenceBCE(classwise_normalized,"
+                f"floor={float(getattr(cfg, 'GBSP_CONFIDENCE_BCE_FLOOR', 0.5)):g},"
+                f"gamma={float(getattr(cfg, 'GBSP_CONFIDENCE_BCE_GAMMA', 1.0)):g})"
+                if use_gbsp_confidence_bce(cfg)
+                else "BCEWithLogits(mean)"
+            )
+            if bool(getattr(cfg, "LCIC_SOFT_DICE_VARIANT", False)):
+                supervision_loss_name = (
+                    f"{bce_loss_name}+"
+                    f"{float(getattr(cfg, 'LCIC_SOFT_DICE_WEIGHT')):g}*SoftDice"
+                )
+            elif bool(
+                getattr(cfg, "LCIC_DATASET_LOSS_WEIGHT_VARIANT", False)
+            ):
+                supervision_loss_name = (
+                    "BCEWithLogits(per_sample_dataset_weighted_mean)"
+                )
+            else:
+                supervision_loss_name = bce_loss_name
+            if use_gbsp_ssboc_loss(cfg):
+                supervision_loss_name = (
+                    "SSBOC[BCEWithLogits(mean)+"
+                    f"{float(getattr(cfg, 'LCIC_SOFT_DICE_WEIGHT')):g}*SoftDice;"
+                    "self_scaled*(1-logit_GBSP_corr);new_hparams=0]"
+                )
+            logger.log(
+                "[Protocol] mode=pure_student | "
+                f"decoder={decoder_name} | "
+                "config_audit=PASS | train_gt=False"
+            )
+            logger.log(
+                "[Supervision] pseudo_source="
+                f"{getattr(cfg, 'DABE_CLEAN_DABE_V2_SOURCE_KEY')} | "
+                f"thresholds={format_dabe_clean_hard_thresholds(cfg)} | "
+                f"target_size={int(getattr(cfg, 'LOSS_SIZE', 68))}x"
+                f"{int(getattr(cfg, 'LOSS_SIZE', 68))} | "
+                f"loss={supervision_loss_name}"
+            )
+            if bool(getattr(cfg, "SIMPLE_FEATURE_L2_NORMALIZE", False)):
+                logger.log(
+                    "[FeatureInput] source=cached_DINOv1-S8_F12 | "
+                    "transform=per_patch_channel_l2_before_resize | "
+                    f"fixed_norm={float(getattr(cfg, 'SIMPLE_FEATURE_L2_SCALE')):g} | "
+                    f"eps={float(getattr(cfg, 'SIMPLE_FEATURE_L2_EPS', 1e-12)):g}"
+                )
+            if bool(
+                getattr(cfg, "LCIC_DATASET_LOSS_WEIGHT_VARIANT", False)
+            ):
+                logger.log(
+                    "[LossWeight] mode=per_sample_normalized | "
+                    "TR-CAMO="
+                    f"{float(getattr(cfg, 'TR_CAMO_LOSS_WEIGHT')):g} | "
+                    "TR-COD10K="
+                    f"{float(getattr(cfg, 'TR_COD10K_LOSS_WEIGHT')):g}"
+                )
         logger.log(
             "ECST_CAUSAL_CONTROL_MODE = "
             f"{ecst_causal_control_mode}"
@@ -17516,8 +18472,7 @@ def main():
                 "source = independent_dabe_v2_p_dabe_68_hard"
             )
             logger.log(
-                "threshold = strict > "
-                f"{float(getattr(cfg, 'DABE_CLEAN_DABE_V2_HARD_THRESHOLD', 0.5)):g}"
+                f"threshold = {format_dabe_clean_hard_thresholds(cfg)}"
             )
             logger.log("target_shape = [B,1,68,68]")
             logger.log("target_min = 0")
@@ -17654,8 +18609,7 @@ def main():
                 )
             )
             logger.log(
-                "threshold = strict > "
-                f"{float(getattr(cfg, 'DABE_CLEAN_DABE_V2_HARD_THRESHOLD', 0.5)):g}"
+                f"threshold = {format_dabe_clean_hard_thresholds(cfg)}"
             )
             if use_dba_head(cfg):
                 logger.log("target_shape = [B,1,68,68]")
@@ -17683,8 +18637,33 @@ def main():
                     f"mode={getattr(cfg, 'SCALE_LIFT_SUPERVISION_MODE', getattr(cfg, 'BCRD_SUPERVISION_MODE', 'final_only'))}"
                 )
             else:
-                logger.log("target_shape = [B,1,68,68]")
-                logger.log("static_loss = direct mean BCEWithLogits")
+                static_loss_size = int(getattr(cfg, "LOSS_SIZE", 68))
+                logger.log(
+                    f"target_shape = [B,1,{static_loss_size},{static_loss_size}]"
+                )
+                if use_gbsp_ssboc_loss(cfg):
+                    logger.log(
+                        "static_loss = per-image BCEWithLogits + "
+                        f"{float(getattr(cfg, 'LCIC_SOFT_DICE_WEIGHT', 0.0)):g}*SoftDice + "
+                        "stopgrad(base)*(1-Pearson(centered_logit,continuous_GBSP))"
+                    )
+                    logger.log(
+                        "SSBOC = bias_orthogonal + scale_invariant + "
+                        "self_scaled | new_tunable_hyperparameters=0"
+                    )
+                elif use_gbsp_confidence_bce(cfg):
+                    logger.log(
+                        "static_loss = classwise-normalized GBSP "
+                        "confidence-weighted mean BCEWithLogits + "
+                        f"{float(getattr(cfg, 'LCIC_SOFT_DICE_WEIGHT', 0.0)):g}*SoftDice"
+                    )
+                    logger.log(
+                        "static_weight = distance_from_pseudo_threshold | "
+                        f"floor={float(getattr(cfg, 'GBSP_CONFIDENCE_BCE_FLOOR', 0.5)):g} | "
+                        f"gamma={float(getattr(cfg, 'GBSP_CONFIDENCE_BCE_GAMMA', 1.0)):g}"
+                    )
+                else:
+                    logger.log("static_loss = direct mean BCEWithLogits")
             logger.log("effective_schedule_epoch_1_45 = static/teacher 1.0/0.0")
             logger.log("teacher_loss_final/coarse/base = exact graph zero")
             logger.log("teacher_target_used_for_gradient = False")
@@ -17731,12 +18710,25 @@ def main():
                                     "bcrd_sem_v1"
                                     if use_bcrd_sem_decoder(cfg)
                                     else (
-                                        "dagp_safe_plus_ndr_v1"
-                                        if r1hard_dagp_ndr_pure_student
+                                        "ndr_v1_only"
+                                        if gbsp_t058_ndr_only_pure_student
                                         else (
-                                            "single_1x1_conv"
-                                            if pure_student_static_only
-                                            else "unchanged_DAGP_NDR"
+                                            "dagp_safe_only"
+                                            if gbsp_t058_dagp_only_pure_student
+                                            else (
+                                                "dagp_safe_plus_ndr_v1"
+                                                if r1hard_dagp_ndr_pure_student
+                                                else (
+                                                (
+                                                    "lcic_"
+                                                    + str(getattr(cfg, "LCIC_VARIANT", "unknown"))
+                                                )
+                                                if use_lcic_experiment(cfg)
+                                                else "single_1x1_conv"
+                                                if pure_student_static_only
+                                                else "unchanged_DAGP_NDR"
+                                                )
+                                            )
                                         )
                                     )
                                 )
@@ -17846,8 +18838,20 @@ def main():
         if use_linear_floor_two_stage_lr(cfg):
             logger.log("scheduler = manual linear_floor_two_stage (StepLR object retained for checkpoint)")
             logger.log("scheduler_step = manual_iter")
+        elif use_step_then_floor_lr(cfg):
+            step_lr_size, step_lr_gamma = get_step_lr_params(cfg)
+            logger.log(
+                "scheduler = StepLR("
+                f"step_size={step_lr_size}, gamma={step_lr_gamma:g}) for first "
+                f"{get_step_then_floor_epochs(cfg)} epochs, then constant floor"
+            )
+            logger.log("scheduler_step = iter_then_floor")
         else:
-            logger.log("scheduler = StepLR(step_size=25, gamma=0.95)")
+            step_lr_size, step_lr_gamma = get_step_lr_params(cfg)
+            logger.log(
+                "scheduler = StepLR("
+                f"step_size={step_lr_size}, gamma={step_lr_gamma:g})"
+            )
             logger.log("scheduler_step = iter")
         logger.log(f"lr_policy = {getattr(cfg, 'LR_POLICY', 'step')}")
         logger.log(f"use_lr_floor = {bool(getattr(cfg, 'USE_LR_FLOOR', False))}")
@@ -19424,7 +20428,7 @@ def main():
                             "STATIC_TARGET_SINGLE_VARIABLE = "
                             "Clean-DP_68 -> 1[independent "
                             f"{getattr(cfg, 'DABE_CLEAN_DABE_V2_SOURCE_KEY', 'p_dabe_68')} "
-                            "> 0.5]; "
+                            f"with {format_dabe_clean_hard_thresholds(cfg)}]; "
                             + (
                                 "A1 Clean-ECST-v5 routing evidence/cache unchanged; "
                                 "schedule, Teacher, reset, DAGP and NDR unchanged"
@@ -19683,7 +20687,8 @@ def main():
                                 "p_init_formula = direct mean BCE("
                                 "1[independent "
                                 f"{getattr(cfg, 'DABE_CLEAN_DABE_V2_SOURCE_KEY', 'p_dabe_68')} "
-                                "> 0.5]); Teacher BCE disabled"
+                                f"with {format_dabe_clean_hard_thresholds(cfg)}]); "
+                                "Teacher BCE disabled"
                             )
                     elif dabev2hard_clean_ecst_v5_audit is not None:
                         logger.log(
@@ -20157,6 +21162,26 @@ def main():
         train_dataset, train_loader, train_loader_generator = build_loaders(
             cfg, max_train_samples=sample_limit
         )
+        if lean_pure_student_logging:
+            feature_root = (
+                ml_feature_cache_dir(cfg)
+                if use_multi_level_feature(cfg)
+                else Path(cfg.CACHE_ROOT) / "features_cache" / cfg.BACKBONE_KEY
+            )
+            logger.log(
+                "[Data] datasets="
+                f"{'+'.join(cfg.TRAIN_DATASETS)} | "
+                f"samples={len(train_dataset)} | "
+                f"batch_size={int(getattr(cfg, 'BATCH_SIZE'))} | "
+                f"num_workers={int(getattr(cfg, 'NUM_WORKERS'))}"
+            )
+            logger.log(
+                f"[Cache] active | feature_root={feature_root.resolve()} | "
+                "pseudo_root="
+                f"{Path(train_dataset.dabe_clean_dabe_v2_cache_root).resolve()} | "
+                "pseudo_source_key="
+                f"{getattr(cfg, 'DABE_CLEAN_DABE_V2_SOURCE_KEY')}"
+            )
         log_cache_summary(logger, cfg, train_dataset)
         log_first_batch_pseudo(logger, cfg, train_dataset)
         if use_bitc_train:
@@ -20180,6 +21205,94 @@ def main():
 
         in_channels = train_dataset.in_channels
         student = build_seg_head(in_channels, cfg).to(device)
+        if use_lcic_experiment(cfg):
+            lcic_variant = str(getattr(cfg, "LCIC_VARIANT", "")).lower()
+            lcic_trainable_params = sum(
+                parameter.numel()
+                for parameter in student.parameters()
+                if parameter.requires_grad
+            )
+            expected_lcic_params = {
+                "a_linear": 385,
+                "b_consensus": 386,
+                "c_innovation": 770,
+                "d_full": (
+                    827
+                    if bool(
+                        getattr(cfg, "LCIC_ADAPTIVE_GATE_VARIANT", False)
+                    )
+                    else 771
+                ),
+                "e_dwlite": 6337,
+                "f_conv3x3": 8497,
+            }
+            if lcic_variant not in expected_lcic_params:
+                raise RuntimeError(f"Unsupported LCIC_VARIANT={lcic_variant!r}.")
+            if lcic_trainable_params != expected_lcic_params[lcic_variant]:
+                raise RuntimeError(
+                    f"LCIC parameter count mismatch for {lcic_variant}: "
+                    f"{lcic_trainable_params} != {expected_lcic_params[lcic_variant]}."
+                )
+            init_log_prefix = (
+                "[DWLite Init]"
+                if lcic_variant == "e_dwlite"
+                else "[Conv3x3 Init]"
+                if lcic_variant == "f_conv3x3"
+                else "[LCIC Init]"
+            )
+            logger.log(
+                f"{init_log_prefix} variant={lcic_variant} | "
+                f"decoder_trainable_params={lcic_trainable_params} | "
+                f"total_trainable_params={lcic_trainable_params} | "
+                "frozen_backbone_trainable_params=0 | "
+                "decoder_input=single_cached_DINO_F12_384x37x37 | "
+                "GBSP_decoder_input=False | RGB_input=False | Sobel_input=False | "
+                f"consensus_gain={float(getattr(student, 'consensus_gain', 1.0)):g} | "
+                f"innovation_gain={float(getattr(student, 'innovation_gain', 1.0)):g} | "
+                "adaptive_gate="
+                f"{bool(getattr(student, 'adaptive_gate_enabled', False))} | "
+                "adaptive_gate_hidden="
+                f"{int(getattr(student, 'adaptive_gate_hidden', 0))} | "
+                "adaptive_gate_weight_decay=0"
+            )
+            if hasattr(student, "anchor"):
+                synthetic = torch.linspace(
+                    -1.0,
+                    1.0,
+                    steps=int(in_channels) * 25,
+                    device=device,
+                ).reshape(1, int(in_channels), 5, 5)
+                was_training = student.training
+                student.eval()
+                with torch.no_grad():
+                    lcic_initial = student(synthetic)
+                    anchor_initial = student.anchor(synthetic)
+                    init_error = float(
+                        (lcic_initial - anchor_initial).abs().max().item()
+                    )
+                student.train(was_training)
+                if init_error >= 1e-6:
+                    raise RuntimeError(
+                        "LCIC initialization equivalence failed: "
+                        f"max_abs_error={init_error:.9g}."
+                    )
+                logger.log(
+                    "LCIC_initialization_equivalence_max_abs_error = "
+                    f"{init_error:.9g}"
+                )
+            structural_only_report = apply_lcic_structural_only_freeze(
+                cfg, student
+            )
+            if structural_only_report is not None:
+                logger.log(
+                    "[LCIC StructuralOnly] anchor_frozen=True | "
+                    "frozen=anchor.weight,anchor.bias | "
+                    "active=alpha,beta,innovation_head.weight | "
+                    f"frozen_params={structural_only_report['frozen_params']} | "
+                    f"active_trainable_params="
+                    f"{structural_only_report['active_params']} | "
+                    "resume_epoch=3 | train_epoch=4_only"
+                )
         online_dino = None
         if use_online_dino_last4(cfg):
             online_dino = FrozenDINOv1Last4Extractor(cfg).to(device).eval()
@@ -20752,6 +21865,7 @@ def main():
                     )
 
             checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
+            validate_lcic_structural_only_resume_checkpoint(cfg, checkpoint)
             required_keys = {
                 "epoch",
                 "backbone_key",
@@ -21006,16 +22120,28 @@ def main():
                 global_step = int(scheduler.state_dict().get("last_epoch", 0))
                 global_step_source = "scheduler.last_epoch"
 
-            logger.log(
-                f"[Resume] checkpoint={resume_path} | "
-                f"saved_epoch={saved_epoch} | "
-                f"start_epoch={start_epoch} | "
-                f"global_step={global_step} | "
-                f"global_step_source={global_step_source} | "
-                f"lr={current_lr(optimizer):.8f} | "
-                "student_restored=True | teacher_restored=True | "
-                "optimizer_restored=True | scheduler_restored=True"
-            )
+            if lean_pure_student_logging:
+                logger.log(
+                    f"[Resume] checkpoint={resume_path} | "
+                    f"saved_epoch={saved_epoch} | "
+                    f"start_epoch={start_epoch} | "
+                    f"global_step={global_step} | "
+                    f"global_step_source={global_step_source} | "
+                    f"lr={current_lr(optimizer):.8f} | "
+                    "student_restored=True | optimizer_restored=True | "
+                    "scheduler_restored=True"
+                )
+            else:
+                logger.log(
+                    f"[Resume] checkpoint={resume_path} | "
+                    f"saved_epoch={saved_epoch} | "
+                    f"start_epoch={start_epoch} | "
+                    f"global_step={global_step} | "
+                    f"global_step_source={global_step_source} | "
+                    f"lr={current_lr(optimizer):.8f} | "
+                    "student_restored=True | teacher_restored=True | "
+                    "optimizer_restored=True | scheduler_restored=True"
+                )
             if use_cvsa_train:
                 logger.log(
                     "[CVSA Resume] "
@@ -21692,6 +22818,7 @@ def main():
                     lr_floor_activated_logged,
                 )
             apply_complex_head_lr_policy(optimizer, epoch, cfg)
+            apply_step_then_floor_lr(optimizer, epoch, cfg)
 
             set_model_epoch(student, epoch)
             if teacher is not None:
@@ -21700,6 +22827,8 @@ def main():
                 get_eaogp_scale(cfg, epoch) if use_eaogp_train else 0.0
             )
             student.train()
+            if use_lcic_experiment(cfg):
+                reset_lcic_epoch_diagnostics(student)
             if teacher is not None:
                 teacher.eval()
             if cvsa_router is not None:
@@ -21809,6 +22938,10 @@ def main():
             dabe_pu_teacher_fg_ratio_sum = 0.0
             dabe_pu_teacher_bg_ratio_sum = 0.0
             dabe_pu_stat_batches = 0
+            ssboc_correlation_sum = 0.0
+            ssboc_valid_ratio_sum = 0.0
+            ssboc_base_loss_sum = 0.0
+            ssboc_auxiliary_loss_sum = 0.0
             static_weight_epoch_accumulator = (
                 new_static_weight_audit_accumulator()
                 if static_weight_audit_enabled
@@ -22540,7 +23673,9 @@ def main():
                 pu_weight_map = None
                 pu_static_target = None
                 pu_static_weight_map = None
+                selected_clean_static_source_68 = None
                 static_weight_region_masks = None
+                ssboc_batch_stats = None
                 pu_target_hard = None
                 pu_fg_core = None
                 pu_bg_core = None
@@ -22619,6 +23754,7 @@ def main():
                         pu_static_target = pu_target_soft
                     else:
                         selected_clean_static_source_68 = pu_target_soft
+                        selected_clean_hard_threshold = None
                         if uses_independent_dabe_v2_hard_source(
                             dabe_clean_static_target_source
                         ):
@@ -22626,6 +23762,7 @@ def main():
                                 {
                                     "dabe_clean_dabe_v2_soft_68",
                                     "dabe_clean_static_target_68",
+                                    "dabe_clean_dabe_v2_hard_threshold",
                                 }.difference(batch)
                             )
                             if missing_dabe_v2_fields:
@@ -22636,10 +23773,14 @@ def main():
                             selected_clean_static_source_68 = batch[
                                 "dabe_clean_dabe_v2_soft_68"
                             ].to(device, non_blocking=True).float().detach()
+                            selected_clean_hard_threshold = batch[
+                                "dabe_clean_dabe_v2_hard_threshold"
+                            ].to(device, non_blocking=True).float()
                         pu_static_target = build_dabe_clean_static_target(
                             cfg,
                             pu_target_soft,
                             selected_clean_static_source_68,
+                            hard_threshold=selected_clean_hard_threshold,
                         )
                         if uses_independent_dabe_v2_hard_source(
                             dabe_clean_static_target_source
@@ -22662,6 +23803,37 @@ def main():
                     if dabe_clean_offline_enabled:
                         pu_static_weight_map = None
                         batch_static_weight_mode = "pure_offline_no_static_map"
+                    elif use_gbsp_confidence_bce(cfg):
+                        if not uses_independent_dabe_v2_hard_source(
+                            dabe_clean_static_target_source
+                        ):
+                            raise RuntimeError(
+                                "GBSP confidence BCE requires the independent "
+                                "GBSP continuous-score source."
+                            )
+                        if selected_clean_hard_threshold is None:
+                            raise RuntimeError(
+                                "GBSP confidence BCE requires the cached hard "
+                                "threshold for every image."
+                            )
+                        pu_static_weight_map = (
+                            build_gbsp_confidence_bce_weight_map(
+                                selected_clean_static_source_68,
+                                pu_static_target,
+                                selected_clean_hard_threshold,
+                                cfg,
+                                eps=float(
+                                    getattr(
+                                        cfg,
+                                        "DABE_PU_WEIGHTED_BCE_EPS",
+                                        1e-6,
+                                    )
+                                ),
+                            )
+                        )
+                        batch_static_weight_mode = (
+                            "gbsp_confidence_classwise_normalized"
+                        )
                     else:
                         # Legacy Clean diagnostic only. It is not read from
                         # cache/batch, and the loss remains direct mean BCE.
@@ -22883,7 +24055,7 @@ def main():
                     image_136=image_136,
                     sobel_68=sobel_68,
                     image_148=image_148,
-                    return_aux=use_dagp_safe_head(cfg) or use_csd_head(cfg) or use_csd_v1r_head(cfg) or use_cacd(cfg),
+                    return_aux=use_dagp_safe_head(cfg) or use_ndr_only_head(cfg) or use_csd_head(cfg) or use_csd_v1r_head(cfg) or use_cacd(cfg),
                     bg_reliable_68=csd_bg_reliable_68,
                     pa_compare_original=pa_compare_original,
                 )
@@ -26708,17 +27880,37 @@ def main():
                         )
                     elif use_dabe_pu_despl_sched:
                         eps = float(getattr(cfg, "DABE_PU_WEIGHTED_BCE_EPS", 1e-6))
-                        loss_pu_static_final = (
-                            zero_loss
-                            if teacher_only_no_offline_pseudo
-                            else dabe_static_bce_with_logits(
+                        if teacher_only_no_offline_pseudo:
+                            loss_pu_static_final = zero_loss
+                        elif use_gbsp_ssboc_loss(cfg):
+                            loss_pu_static_final, ssboc_batch_stats = (
+                                gbsp_ssboc_static_loss(
+                                    student_logits,
+                                    pu_static_target,
+                                    selected_clean_static_source_68,
+                                    pu_static_weight_map,
+                                    cfg,
+                                    eps=eps,
+                                    sample_weight=build_lcic_dataset_loss_weight(
+                                        cfg,
+                                        batch["dataset"],
+                                        student_logits,
+                                    ),
+                                )
+                            )
+                        else:
+                            loss_pu_static_final = dabe_static_bce_with_logits(
                                 student_logits,
                                 pu_static_target,
                                 pu_static_weight_map,
                                 cfg,
                                 eps=eps,
+                                sample_weight=build_lcic_dataset_loss_weight(
+                                    cfg,
+                                    batch["dataset"],
+                                    student_logits,
+                                ),
                             )
-                        )
                         if use_source_arbiter_train:
                             if teacher_source_weight is None:
                                 raise RuntimeError(
@@ -28618,26 +29810,55 @@ def main():
                                 cfg, batch, device
                             )
                         else:
-                            threshold = float(
-                                getattr(
-                                    cfg,
-                                    "DABE_CLEAN_DABE_V2_HARD_THRESHOLD",
-                                )
-                            )
+                            threshold = batch[
+                                "dabe_clean_dabe_v2_hard_threshold"
+                            ].to(
+                                device,
+                                non_blocking=True,
+                            ).float().view(-1, 1, 1, 1)
                             source_soft = batch[
                                 "dabe_clean_dabe_v2_soft_68"
                             ].to(device, non_blocking=True).float().detach()
                             expected_hard = (
                                 source_soft > threshold
                             ).float().detach()
-                        if (
-                            pu_static_target.requires_grad
-                            or not torch.equal(pu_static_target, expected_hard)
-                            or not torch.equal(
+                        target_invariant_ok = (
+                            not pu_static_target.requires_grad
+                            and torch.equal(pu_static_target, expected_hard)
+                        )
+                        if use_gbsp_confidence_bce(cfg):
+                            expected_weight_map = (
+                                build_gbsp_confidence_bce_weight_map(
+                                    source_soft,
+                                    expected_hard,
+                                    threshold,
+                                    cfg,
+                                    eps=float(
+                                        getattr(
+                                            cfg,
+                                            "DABE_PU_WEIGHTED_BCE_EPS",
+                                            1e-6,
+                                        )
+                                    ),
+                                )
+                            )
+                            weight_invariant_ok = (
+                                not pu_static_weight_map.requires_grad
+                                and torch.equal(
+                                    pu_static_weight_map,
+                                    expected_weight_map,
+                                )
+                            )
+                            first_batch_weight_mode = (
+                                "gbsp_confidence_classwise_normalized"
+                            )
+                        else:
+                            weight_invariant_ok = torch.equal(
                                 pu_static_weight_map,
                                 torch.ones_like(pu_static_weight_map),
                             )
-                        ):
+                            first_batch_weight_mode = "ones"
+                        if not target_invariant_ok or not weight_invariant_ok:
                             raise RuntimeError(
                                 "DABE-v2-hard static-only first-batch target/map "
                                 "invariant failed."
@@ -28651,6 +29872,11 @@ def main():
                             f"{teacher_loss_values['base']:.1f}/"
                             f"{teacher_loss_values['group']:.1f} | "
                             "loss_equals_static_group=True | "
+                            f"static_weight_mode={first_batch_weight_mode} | "
+                            f"static_weight_min/mean/max="
+                            f"{float(pu_static_weight_map.min().item()):.6f}/"
+                            f"{float(pu_static_weight_map.mean().item()):.6f}/"
+                            f"{float(pu_static_weight_map.max().item()):.6f} | "
                             f"teacher_forward={'False' if pure_student_static_only else 'diagnostic_only'} | "
                             f"ema_update={'False' if pure_student_static_only else 'diagnostic_only'} | "
                             "teacher_target_used_for_gradient=False"
@@ -29228,6 +30454,24 @@ def main():
                     dabe_pu_teacher_conf_ratio_sum += float(pu_teacher_stats["teacher_conf_ratio"])
                     dabe_pu_teacher_fg_ratio_sum += float(pu_teacher_stats["teacher_fg_ratio"])
                     dabe_pu_teacher_bg_ratio_sum += float(pu_teacher_stats["teacher_bg_ratio"])
+                    if use_gbsp_ssboc_loss(cfg):
+                        if ssboc_batch_stats is None:
+                            raise RuntimeError(
+                                "SSBOC batch diagnostics are missing from the "
+                                "effective final-head loss."
+                            )
+                        ssboc_correlation_sum += float(
+                            ssboc_batch_stats["correlation_mean"]
+                        )
+                        ssboc_valid_ratio_sum += float(
+                            ssboc_batch_stats["valid_ratio"]
+                        )
+                        ssboc_base_loss_sum += float(
+                            ssboc_batch_stats["base_loss"]
+                        )
+                        ssboc_auxiliary_loss_sum += float(
+                            ssboc_batch_stats["auxiliary_loss"]
+                        )
                     if static_weight_audit_enabled:
                         if (
                             static_weight_epoch_accumulator is None
@@ -29954,7 +31198,12 @@ def main():
                 if cvsa_epoch_accumulator is None:
                     raise RuntimeError("CVSA epoch accumulator was not initialized.")
                 cvsa_epoch_row = finalize_cvsa_epoch(cvsa_epoch_accumulator)
-            if use_cvsa_train:
+            if lean_pure_student_logging:
+                logger.log(
+                    f"[Train] epoch={epoch:03d}/{max_epoch:03d} | "
+                    f"loss={avg_loss:.6f} | lr={current_lr(optimizer):.8f}"
+                )
+            elif use_cvsa_train:
                 logger.log(
                     f"[Train] Epoch {epoch:03d}/{max_epoch:03d} | "
                     f"avg_train_loss={cvsa_epoch_row['loss_seg']:.6f} | "
@@ -30003,6 +31252,121 @@ def main():
                     f"dabe_weight={effective_despl_weight:.2f} | "
                     f"schedule_dabe_weight={fixed_weight:.2f}"
                 )
+            stat_batches = max(num_batches, 1)
+            if lean_pure_student_logging:
+                if dabe_pu_stat_batches <= 0:
+                    raise RuntimeError(
+                        "LCIC pure-Student area logging received no effective "
+                        "pseudo-target batches."
+                    )
+                train_area_message = (
+                    f"[TrainArea] epoch={epoch:03d} | "
+                    "train_pseudo_fg_area="
+                    f"{dabe_pu_target_mean_sum / dabe_pu_stat_batches:.6f} | "
+                    "student_mean_prob="
+                    f"{student_prob_mean_sum / stat_batches:.6f} | "
+                    "student_fg_area@0.5="
+                    f"{student_pred_area_sum / stat_batches:.6f}"
+                )
+                if use_gbsp_ssboc_loss(cfg):
+                    train_area_message += (
+                        " | logit_gbsp_corr="
+                        f"{ssboc_correlation_sum / dabe_pu_stat_batches:.6f} | "
+                        "corr_valid_ratio="
+                        f"{ssboc_valid_ratio_sum / dabe_pu_stat_batches:.6f} | "
+                        "loss_base/ssboc_aux="
+                        f"{ssboc_base_loss_sum / dabe_pu_stat_batches:.6f}/"
+                        f"{ssboc_auxiliary_loss_sum / dabe_pu_stat_batches:.6f}"
+                    )
+                logger.log(train_area_message)
+            if use_lcic_experiment(cfg):
+                lcic_epoch = get_lcic_epoch_diagnostics(student)
+                if str(getattr(cfg, "LCIC_VARIANT", "")).lower() == "e_dwlite":
+                    dwlite_params = sum(
+                        parameter.numel()
+                        for parameter in student.parameters()
+                        if parameter.requires_grad
+                    )
+                    logger.log(
+                        f"[DWLite] epoch={epoch:03d} | "
+                        "operation_space=feature | logit_refinement=False | "
+                        f"hidden_channels={int(getattr(cfg, 'LCIC_DWLITE_CHANNELS', 16))} | "
+                        f"decoder_params={dwlite_params}"
+                    )
+                elif str(getattr(cfg, "LCIC_VARIANT", "")).lower() == "f_conv3x3":
+                    conv3x3_params = sum(
+                        parameter.numel()
+                        for parameter in student.parameters()
+                        if parameter.requires_grad
+                    )
+                    logger.log(
+                        f"[Conv3x3] epoch={epoch:03d} | "
+                        "operation_space=feature | logit_refinement=False | "
+                        "kernel=3x3 | groups=1 | "
+                        f"hidden_channels={int(getattr(cfg, 'LCIC_CONV3X3_CHANNELS', 16))} | "
+                        f"decoder_params={conv3x3_params}"
+                    )
+                elif lcic_epoch["adaptive_gate_enabled"]:
+                    logger.log(
+                        f"[LCIC] epoch={epoch:03d} | "
+                        "gate_mode=image_adaptive_normalized | "
+                        "consensus_gate_mean="
+                        f"{lcic_epoch['consensus_gate_mean']:.9f} | "
+                        "consensus_gate_std="
+                        f"{lcic_epoch['consensus_gate_std']:.9f} | "
+                        "consensus_gate_min="
+                        f"{lcic_epoch['consensus_gate_min']:.9f} | "
+                        "consensus_gate_max="
+                        f"{lcic_epoch['consensus_gate_max']:.9f} | "
+                        "innovation_gate_mean="
+                        f"{lcic_epoch['innovation_gate_mean']:.9f} | "
+                        "innovation_gate_std="
+                        f"{lcic_epoch['innovation_gate_std']:.9f} | "
+                        "innovation_gate_min="
+                        f"{lcic_epoch['innovation_gate_min']:.9f} | "
+                        "innovation_gate_max="
+                        f"{lcic_epoch['innovation_gate_max']:.9f} | "
+                        "consensus_abs="
+                        f"{lcic_epoch['weighted_consensus_abs_mean']:.9f} | "
+                        "innovation_abs="
+                        f"{lcic_epoch['weighted_innovation_abs_mean']:.9f}"
+                    )
+                elif lean_pure_student_logging:
+                    logger.log(
+                        f"[LCIC] epoch={epoch:03d} | "
+                        f"alpha={lcic_epoch['alpha']:.9f} | "
+                        f"beta={lcic_epoch['beta']:.9f} | "
+                        f"effective_alpha={lcic_epoch['effective_alpha']:.9f} | "
+                        f"effective_beta={lcic_epoch['effective_beta']:.9f} | "
+                        "consensus_abs="
+                        f"{lcic_epoch['weighted_consensus_abs_mean']:.9f} | "
+                        "innovation_abs="
+                        f"{lcic_epoch['weighted_innovation_abs_mean']:.9f}"
+                    )
+                else:
+                    lcic_params = sum(
+                        parameter.numel()
+                        for parameter in student.parameters()
+                        if parameter.requires_grad
+                    )
+                    logger.log(
+                        f"[LCIC] epoch={epoch:03d} | "
+                        f"variant={getattr(cfg, 'LCIC_VARIANT')} | "
+                        f"train_loss={avg_loss:.8f} | "
+                        f"alpha={lcic_epoch['alpha']:.9f} | "
+                        f"beta={lcic_epoch['beta']:.9f} | "
+                        f"decoder_params={lcic_params} | "
+                        f"batches={int(lcic_epoch['batches'])} | "
+                        f"mean_abs_anchor={lcic_epoch['anchor_abs_mean']:.9f} | "
+                        "mean_abs_consensus_delta="
+                        f"{lcic_epoch['consensus_delta_abs_mean']:.9f} | "
+                        "mean_abs_innovation_logit="
+                        f"{lcic_epoch['innovation_logit_abs_mean']:.9f} | "
+                        "mean_abs_weighted_consensus="
+                        f"{lcic_epoch['weighted_consensus_abs_mean']:.9f} | "
+                        "mean_abs_weighted_innovation="
+                        f"{lcic_epoch['weighted_innovation_abs_mean']:.9f}"
+                    )
             if oed_enabled:
                 if oed_epoch_accumulator is None:
                     raise RuntimeError("OED epoch accumulator is unavailable.")
@@ -30070,24 +31434,24 @@ def main():
                     f"{oed_epoch_row['baseline_logit_grad_norm']:.8f}/"
                     f"{oed_epoch_row['oed_to_baseline_grad_ratio']:.8f}"
                 )
-            stat_batches = max(num_batches, 1)
-            if pure_student_static_only:
-                logger.log(
-                    f"[PredArea PureStudent] epoch={epoch:03d} | "
-                    f"student_prob_mean={student_prob_mean_sum / stat_batches:.6f} | "
-                    f"student_pred_area_mean={student_pred_area_sum / stat_batches:.6f} | "
-                    f"static_target_area_mean={mixed_target_area_sum / stat_batches:.6f} | "
-                    "teacher_instantiated=False | teacher_forward=False"
-                )
-            else:
-                logger.log(
-                    f"[PredArea] epoch={epoch:03d} | "
-                    f"student_prob_mean={student_prob_mean_sum / stat_batches:.6f} | "
-                    f"teacher_prob_mean={teacher_prob_mean_sum / stat_batches:.6f} | "
-                    f"student_pred_area_mean={student_pred_area_sum / stat_batches:.6f} | "
-                    f"teacher_pred_area_mean={teacher_pred_area_sum / stat_batches:.6f} | "
-                    f"mixed_target_area_mean={mixed_target_area_sum / stat_batches:.6f}"
-                )
+            if not lean_pure_student_logging:
+                if pure_student_static_only:
+                    logger.log(
+                        f"[PredArea PureStudent] epoch={epoch:03d} | "
+                        f"student_prob_mean={student_prob_mean_sum / stat_batches:.6f} | "
+                        f"student_pred_area_mean={student_pred_area_sum / stat_batches:.6f} | "
+                        f"static_target_area_mean={mixed_target_area_sum / stat_batches:.6f} | "
+                        "teacher_instantiated=False | teacher_forward=False"
+                    )
+                else:
+                    logger.log(
+                        f"[PredArea] epoch={epoch:03d} | "
+                        f"student_prob_mean={student_prob_mean_sum / stat_batches:.6f} | "
+                        f"teacher_prob_mean={teacher_prob_mean_sum / stat_batches:.6f} | "
+                        f"student_pred_area_mean={student_pred_area_sum / stat_batches:.6f} | "
+                        f"teacher_pred_area_mean={teacher_pred_area_sum / stat_batches:.6f} | "
+                        f"mixed_target_area_mean={mixed_target_area_sum / stat_batches:.6f}"
+                    )
             if decoder_supervision_batches > 0:
                 if use_dba_head(cfg):
                     decoder_source = "r1_hard_68"
@@ -31149,7 +32513,8 @@ def main():
                         f"teacher_conf_ratio={dabe_pu_teacher_conf_ratio_sum / stat_batches:.6f} | "
                         f"teacher_fg_ratio={dabe_pu_teacher_fg_ratio_sum / stat_batches:.6f} | "
                         f"teacher_bg_ratio={dabe_pu_teacher_bg_ratio_sum / stat_batches:.6f} | "
-                        f"static_loss_unweighted_mean_bce={use_dabe_clean} | "
+                        "static_loss_mode="
+                        f"{'ssboc_parameter_free' if use_gbsp_ssboc_loss(cfg) else ('gbsp_confidence_classwise_normalized_bce' if use_gbsp_confidence_bce(cfg) else 'unweighted_mean_bce')} | "
                         "fixed_used_for_training=False"
                     )
                 if use_dabe_pu_despl_sched:
@@ -33831,7 +35196,7 @@ def main():
             logger.log(f"best MAE so far = {best_metric:.6f}")
             logger.log(f"best epoch = {best_epoch}")
 
-            if should_save_epoch_checkpoint(
+            save_epoch_checkpoint = should_save_epoch_checkpoint(
                 epoch,
                 max_epoch,
                 cfg.SAVE_INTERVAL,
@@ -33839,9 +35204,11 @@ def main():
                 save_every_epoch=bool(getattr(cfg, "SAVE_EVERY_EPOCH", False)),
             ) or (
                 stop_after_epoch > 0 and int(epoch) == int(stop_after_epoch)
-            ):
+            )
+            if save_epoch_checkpoint:
+                epoch_checkpoint_path = ckpt_dir / f"epoch_{epoch:03d}.pth"
                 save_checkpoint(
-                    ckpt_dir / f"epoch_{epoch:03d}.pth",
+                    epoch_checkpoint_path,
                     epoch,
                     cfg,
                     student,
@@ -33851,6 +35218,19 @@ def main():
                     best_metric,
                     best_epoch,
                     extra_state=epoch_checkpoint_extra,
+                )
+                if lean_pure_student_logging:
+                    logger.log(
+                        f"[Checkpoint] epoch={epoch:03d} | "
+                        f"path={epoch_checkpoint_path.resolve()} | "
+                        f"best_updated={improved} | best_epoch={best_epoch}"
+                    )
+            elif improved and lean_pure_student_logging:
+                logger.log(
+                    f"[Checkpoint] epoch={epoch:03d} | "
+                    f"path={(ckpt_dir / 'best.pth').resolve()} | "
+                    "kind=best_only | best_updated=True | "
+                    f"best_epoch={best_epoch}"
                 )
 
             if r2b_stop_reasons:

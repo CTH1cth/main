@@ -207,6 +207,8 @@ def metric_value(metrics, key):
         "WFM": "WFM",
         "F_beta^m": "F_MEAN",
         "F_MEAN": "F_MEAN",
+        "E_phi^adp": "E_ADP",
+        "E_ADP": "E_ADP",
         "E_phi^m": "E_MEAN",
         "E_MEAN": "E_MEAN",
         "M": "MAE",
@@ -219,16 +221,16 @@ def metric_value(metrics, key):
 
 
 def format_metric_table(metrics):
-    # 按固定顺序格式化 COD 指标，保持 train/eval 日志可读。
-    headers = ["S_m ↑", "F_beta^w↑", "F_beta^m↑", "E_phi^m↑", "M ↓"]
+    # 主表统一显示 adaptive E；E_MEAN/E_MAX 仅保留为辅助字段。
+    headers = ["S_m ↑", "F_beta^w↑", "F_beta^m↑", "adp E↑", "M ↓"]
     values = [
         float(metrics["SMeasure"]),
         float(metrics["WFM"]),
         float(metrics["F_MEAN"]),
-        float(metrics["E_MEAN"]),
+        float(metrics["E_ADP"]),
         float(metrics["MAE"]),
     ]
-    widths = [7, 10, 10, 9, 7]
+    widths = [7, 10, 10, 11, 7]
     sep = "+" + "+".join("-" * w for w in widths) + "+"
     header_line = "|" + "|".join(h.center(w) for h, w in zip(headers, widths)) + "|"
     value_line = "|" + "|".join(f"{v:.4f}".center(w) for v, w in zip(values, widths)) + "|"
@@ -1815,7 +1817,17 @@ def check_r1_only_static_cache(cfg, max_samples=None, payload_samples=2):
         "dabe_v2_r1_hard_68": "residual_pass1_37",
         "cvbr_v1_second_ring_hard_68": "v1_cvbr_second_ring_37",
         "rpr_p1_second_ring_hard_68": "p1_rpr_secondring_37",
-        "gbsp_abs_minmax_hard_68": "gbsp_abs_minmax_37",
+        "gbsp_abs_minmax_hard_68": str(
+            getattr(
+                cfg,
+                "DABE_CLEAN_GBSP_SOURCE_KEY",
+                getattr(
+                    cfg,
+                    "DABE_CLEAN_DABE_V2_SOURCE_KEY",
+                    "gbsp_abs_minmax_37",
+                ),
+            )
+        ).strip(),
     }
     if static_source not in source_keys:
         raise RuntimeError(
@@ -1907,7 +1919,10 @@ def check_r1_only_static_cache(cfg, max_samples=None, payload_samples=2):
                     f"GBSP manifest version mismatch for {key}: "
                     f"{row.get('gbsp_version')} != {expected_gbsp_version}."
                 )
-            if list(row.get("shape", [])) != [1, 37, 37]:
+            expected_grid = int(
+                getattr(cfg, "DABE_CLEAN_GBSP_SOURCE_GRID", 37)
+            )
+            if list(row.get("shape", [])) != [1, expected_grid, expected_grid]:
                 raise RuntimeError(
                     f"GBSP manifest shape mismatch for {key}: {row.get('shape')}."
                 )
@@ -1947,10 +1962,55 @@ def check_r1_only_static_cache(cfg, max_samples=None, payload_samples=2):
                 raise RuntimeError(
                     f"GBSP payload reports GT use during generation: {cache_path}"
                 )
+            expected_rank_mode = str(
+                getattr(cfg, "DABE_CLEAN_GBSP_PCA_RANK_MODE", "")
+            ).strip().lower()
+            if expected_rank_mode:
+                actual_rank_mode = str(
+                    payload.get("pca_rank_mode", "")
+                ).strip().lower()
+                if actual_rank_mode != expected_rank_mode:
+                    raise RuntimeError(
+                        "GBSP payload PCA rank-mode mismatch: "
+                        f"{actual_rank_mode!r} != {expected_rank_mode!r} | "
+                        f"{cache_path}"
+                    )
+                if expected_rank_mode == "fixed":
+                    expected_rank = int(
+                        getattr(cfg, "DABE_CLEAN_GBSP_FIXED_PCA_RANK", -1)
+                    )
+                    selected = payload.get("selected_ranks")
+                    selected_rank = (
+                        int(selected.detach().cpu().reshape(-1)[0])
+                        if torch.is_tensor(selected) and selected.numel() == 1
+                        else -1
+                    )
+                    if (
+                        expected_rank <= 0
+                        or int(payload.get("fixed_pca_rank", -1)) != expected_rank
+                        or int(payload.get("pca_max_rank", -1)) != expected_rank
+                        or selected_rank != expected_rank
+                        or bool(payload.get("fallback_used", False))
+                    ):
+                        raise RuntimeError(
+                            "GBSP payload fixed-PCA rank contract mismatch: "
+                            f"expected={expected_rank}, selected={selected_rank}, "
+                            f"fallback={payload.get('fallback_used')} | {cache_path}"
+                        )
         source = payload.get(source_key)
-        if not torch.is_tensor(source) or tuple(source.shape) != (1, 37, 37):
+        expected_source_grid = (
+            int(getattr(cfg, "DABE_CLEAN_GBSP_SOURCE_GRID", 37))
+            if static_source == "gbsp_abs_minmax_hard_68"
+            else 37
+        )
+        if not torch.is_tensor(source) or tuple(source.shape) != (
+            1,
+            expected_source_grid,
+            expected_source_grid,
+        ):
             raise RuntimeError(
-                f"R1 source {source_key} must be [1,37,37]: {cache_path}"
+                f"R1 source {source_key} must be "
+                f"[1,{expected_source_grid},{expected_source_grid}]: {cache_path}"
             )
         source = source.detach().cpu().float()
         if not torch.isfinite(source).all() or float(source.min()) < 0.0 or float(
